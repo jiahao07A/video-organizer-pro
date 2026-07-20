@@ -254,6 +254,19 @@ class DatabaseManager:
                     )
                 """)
 
+                # 待审词（封闭组库外词，ADR-0004）
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_tags (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        raw_text TEXT NOT NULL,
+                        group_id TEXT,
+                        status TEXT DEFAULT 'pending',
+                        source_path TEXT,
+                        created_at TEXT,
+                        UNIQUE(raw_text, group_id, status)
+                    )
+                """)
+
                 # 物理迁移日志表 (V4.0)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS migration_history (
@@ -345,7 +358,7 @@ class DatabaseManager:
             1 if video_data.get("manual_override") else 0,
             1 if video_data.get("metadata_injected") else 0,
             metadata_str,
-            video_data.get("emotion"),
+            None,  # emotion 硬删（ADR-0003 并入氛围标签）
             None,  # composition 硬删
             0,  # rating
             None,  # quality_score
@@ -387,6 +400,7 @@ class DatabaseManager:
         except Exception:
             d["tag_groups"] = {}
         # 产品层不再暴露已删分析结果字段
+        d["emotion"] = None
         d["composition"] = None
         d["rating"] = 0
         d["quality_score"] = None
@@ -432,6 +446,7 @@ class DatabaseManager:
                 d["tag_groups"] = {}
 
             # 硬删字段：读出时清空，避免 UI/导出继续依赖
+            d["emotion"] = None
             d["composition"] = None
             d["rating"] = 0
             d["quality_score"] = None
@@ -534,14 +549,16 @@ class DatabaseManager:
                 conn.commit()
 
     def bulk_replace_tags(self, old_tag: str, new_tag: str):
-        """数据库级批量替换视频标签"""
+        """数据库级批量替换视频标签（替换后走别名归一，落库写标准词）。"""
+        from core.tag_normalize import normalize_flat_tags
+
+        alias_map = self.get_synonyms()
         videos = self.get_all_videos()
         for video in videos:
             tags = video.get("tags", [])
             if old_tag in tags:
                 new_tags = [new_tag if t == old_tag else t for t in tags]
-                # 去重
-                new_tags = list(dict.fromkeys(new_tags))
+                new_tags = normalize_flat_tags(new_tags, alias_map)
                 video["tags"] = new_tags
                 self.upsert_video(video)
 
@@ -556,6 +573,41 @@ class DatabaseManager:
 
     def remove_synonym(self, alias: str):
         self.execute_non_query("DELETE FROM synonyms WHERE alias = ?", (alias,))
+
+    # --- 待审词 (ADR-0004) ---
+    def add_pending_tag(
+        self,
+        raw_text: str,
+        group_id: Optional[str] = None,
+        source_path: Optional[str] = None,
+        status: str = "pending",
+    ):
+        raw = (raw_text or "").strip()
+        if not raw:
+            return
+        from datetime import datetime as _dt
+
+        self.execute_non_query(
+            """
+            INSERT OR IGNORE INTO pending_tags (raw_text, group_id, status, source_path, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (raw, group_id or "", status, source_path, _dt.now().isoformat()),
+        )
+
+    def list_pending_tags(self, status: Optional[str] = "pending") -> List[Dict]:
+        if status:
+            return self.execute_query(
+                "SELECT * FROM pending_tags WHERE status = ? ORDER BY id DESC",
+                (status,),
+            )
+        return self.execute_query("SELECT * FROM pending_tags ORDER BY id DESC")
+
+    def update_pending_tag_status(self, pending_id: int, status: str):
+        self.execute_non_query(
+            "UPDATE pending_tags SET status = ? WHERE id = ?",
+            (status, pending_id),
+        )
 
 class SettingsManager:
     """管理配置信息，支持从 SQLite 数据库或 settings.json 加载，支持嵌套键名访问"""
@@ -874,7 +926,13 @@ class AIHandler:
         """
         组装主分析真正发给模型的 system / user 提示词（不含视频帧）。
         供 analyze_video 与设置页预览共用。
+        使用精瘦分析用词表子集（标准词；排除别名/待审/占位）。
         """
+        from core.tag_vocab import (
+            build_analysis_vocab_subset,
+            standards_map_from_tag_config,
+        )
+
         global_settings = self.tag_config.get("global_settings", {}) if self.tag_config else {}
         default_header = "你是一个资深的影视后期素材整理专家。请通过观察视频帧，提取精准的元数据。"
         system_prompt_header = (
@@ -890,12 +948,53 @@ class AIHandler:
             categories_list = self.settings.get("categories", [])
 
         tag_groups = (self.tag_config or {}).get("tag_groups", [])
+        # 标准词：配置 + DB；排除别名键与待审原文
+        standards_map = standards_map_from_tag_config(self.tag_config)
+        usage_counts: Dict[str, int] = {}
+        exclude_aliases: Set[str] = set()
+        exclude_pending: Set[str] = set()
+        if self.db:
+            try:
+                for row in self.db.get_tags_detail() or []:
+                    name = row.get("tag_name")
+                    dim = row.get("dimension")
+                    if name and dim:
+                        standards_map.setdefault(dim, [])
+                        if name not in standards_map[dim]:
+                            standards_map[dim].append(name)
+                        usage_counts[name] = int(row.get("usage_count") or 0)
+            except Exception:
+                pass
+            try:
+                exclude_aliases = set((self.db.get_synonyms() or {}).keys())
+            except Exception:
+                pass
+            try:
+                for p in self.db.list_pending_tags(status="pending") or []:
+                    if p.get("raw_text"):
+                        exclude_pending.add(p["raw_text"])
+            except Exception:
+                pass
+
+        group_meta = {}
+        for group in tag_groups:
+            gid = group.get("id")
+            if gid:
+                group_meta[gid] = group.get("rules") or {}
+
+        subset = build_analysis_vocab_subset(
+            standards_map,
+            group_meta=group_meta,
+            usage_counts=usage_counts,
+            exclude_aliases=exclude_aliases,
+            exclude_pending=exclude_pending,
+        )
+
         dimension_rules = []
-        # ADR-0002：分析结果只保留分类/摘要/情绪/标签，不再要求评分类字段
+        # ADR-0002/0003：分析结果只保留分类/摘要/标签；情绪并入氛围标签组
         expected_json_structure = {
             "category": f"从 {categories_list} 中选择一个最合适的视频大类",
             "summary": "50字以内的核心内容摘要",
-            "emotion": "识别视频的情感基调",
         }
 
         for i, group in enumerate(tag_groups, 1):
@@ -906,26 +1005,23 @@ class AIHandler:
             max_count = rules.get("max_count", 1)
             expandable = rules.get("ai_expandable", False)
             local_prompt = rules.get("local_prompt", "")
-            tags_pool = group.get("tags", [])
-            pool_names = []
-            for t in tags_pool:
-                if isinstance(t, dict):
-                    n = str(t.get("name", "")).strip()
-                else:
-                    n = str(t).strip()
-                if n:
-                    pool_names.append(n)
+            pool_names = list(subset.by_group.get(dim_id) or [])
 
             rule = f"{i}. **{name}** ({dim_id}): {local_prompt}\n"
             mode_desc = "单选" if selection_mode == "single" else "多选"
             rule += f"   - 约束：{mode_desc}，最大数量 {max_count}。\n"
-            if pool_names:
-                if not expandable:
-                    rule += f"   - 库约束：必须严格从以下预设库中选择：[{', '.join(pool_names)}]\n"
+            if not expandable:
+                rule += "   - 选词模式：封闭组，必须且只能从下列标准词中精确选择；禁止自造、禁止近义猜测。\n"
+                if pool_names:
+                    rule += f"   - 标准词候选（分析用词表子集）：[{', '.join(pool_names)}]\n"
                 else:
-                    rule += f"   - 库参考：优先从预设库选择，也可自行补充：[{', '.join(pool_names)}]\n"
+                    rule += "   - 标准词候选：空（该组暂无可用标准词，请留空该字段）。\n"
             else:
-                rule += "   - 约束：请根据视频内容自由生成。\n"
+                rule += f"   - 选词模式：建议组，可少量自造细节词，总数不超过 {max_count}；不必写入正式标签库。\n"
+                if pool_names:
+                    rule += f"   - 参考标准词（可选）：[{', '.join(pool_names)}]\n"
+                else:
+                    rule += "   - 无预设参考词，可按画面自由补充细节。\n"
             dimension_rules.append(rule)
 
             if selection_mode == "single" and max_count == 1:
@@ -934,10 +1030,13 @@ class AIHandler:
                 expected_json_structure[dim_id] = ["选中的标签列表"]
 
         rules_str = "\n".join(dimension_rules) if dimension_rules else "（当前未配置任何标签组；请到标签库添加 tag_groups）"
+        warn_block = ""
+        if subset.warnings:
+            warn_block = "\n### 0. 词表提示\n" + "\n".join(f"- {w}" for w in subset.warnings) + "\n"
         json_template = json.dumps(expected_json_structure, ensure_ascii=False, indent=2)
         system_prompt = f"{system_prompt_header.strip()}\n你必须返回一个严格符合给定结构的有效 JSON 对象。"
         user_prompt = f"""请通过观察视频帧分析其内容，并严格遵守以下规则输出 JSON：
-
+{warn_block}
 ### 1. 分类与标签规则
 {rules_str}
 
@@ -947,15 +1046,76 @@ class AIHandler:
 
 ### 3. 注意事项
 1. 结果必须是合法 JSON 格式，不要包含 Markdown 代码块标记（除非接口要求）。
-2. 对于禁止新增标签的组，若库中无完全匹配项，请选择语意最接近的一个。
+2. 对于禁止新增标签的封闭组：必须且只能从给定预设库中精确选择；若无一匹配则该组留空，禁止编造近义词或猜测最接近项。
 3. 摘要需客观描述画面，避免主观臆断。
-4. 不要输出构图、星级、质量分、代理建议或标签权重等字段。
+4. 不要输出构图、星级、质量分、代理建议、标签权重或独立情绪字段。
 """
         return {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "system_prompt_header": system_prompt_header.strip(),
+            "vocab_subset": subset.by_group,
+            "vocab_warnings": list(subset.warnings),
+            "vocab_is_thin": subset.is_thin,
         }
+
+    def apply_tag_normalization(
+        self,
+        data: Dict,
+        *,
+        source_path: Optional[str] = None,
+        persist_pending: bool = True,
+    ) -> Dict:
+        """
+        对 AI/人工原始分组标签做标签归一（半封闭 + 别名 + 待审）。
+        不自动把建议组新词写入标签库；不使用模糊近邻贴词。
+        """
+        from core.tag_normalize import GroupSpec, group_specs_from_tag_config, normalize_grouped_tags
+
+        if not data:
+            return data
+        specs = group_specs_from_tag_config(self.tag_config)
+        # 合并标签库中的标准词（配置 + DB）
+        if self.db and specs:
+            merged_specs = []
+            for s in specs:
+                try:
+                    db_names = set(self.db.get_tags(s.id) or [])
+                except Exception:
+                    db_names = set()
+                merged_specs.append(
+                    GroupSpec(
+                        id=s.id,
+                        max_count=s.max_count,
+                        ai_expandable=s.ai_expandable,
+                        standards=frozenset(set(s.standards) | db_names),
+                    )
+                )
+            specs = merged_specs
+        alias_map: Dict[str, str] = {}
+        if self.db:
+            alias_map.update(self.db.get_synonyms())
+        # 兼容 AI 返回扁平 dim 字段或已有 tag_groups
+        raw_by_group: Dict[str, Any] = {}
+        existing_groups = data.get("tag_groups") if isinstance(data.get("tag_groups"), dict) else {}
+        for spec in specs:
+            if spec.id in existing_groups and existing_groups[spec.id]:
+                raw_by_group[spec.id] = existing_groups[spec.id]
+            elif spec.id in data:
+                raw_by_group[spec.id] = data.get(spec.id)
+
+        result = normalize_grouped_tags(raw_by_group, specs, alias_map)
+        data["tags"] = result.tags
+        data["tag_groups"] = result.tag_groups
+        data["tags_zh"] = result.tags
+        if persist_pending and self.db:
+            for p in result.pending:
+                self.db.add_pending_tag(p.raw_text, p.group_id, source_path=source_path)
+        data["_pending_tags"] = [
+            {"raw_text": p.raw_text, "group_id": p.group_id, "status": p.status}
+            for p in result.pending
+        ]
+        return data
 
     def analyze_video(self, base64_frames: List[str], cache_key: Optional[str] = None) -> Optional[Dict]:
         if not base64_frames:
@@ -971,7 +1131,6 @@ class AIHandler:
         prompts = self.build_analysis_prompts()
         system_prompt = prompts["system_prompt"]
         user_prompt = prompts["user_prompt"]
-        tag_groups = (self.tag_config or {}).get("tag_groups", [])
 
         content_parts = [{"type": "text", "text": user_prompt}]
         for b64_img in base64_frames:
@@ -987,64 +1146,8 @@ class AIHandler:
         data = self._get_api_response(model_name, system_prompt, content_parts)
         
         if data:
-            # 4. 结果校验与清洗 (V6.0)
-            final_tags = []
-            final_tag_groups = {}
-            
-            for group in tag_groups:
-                dim_id = group.get("id")
-                rules = group.get("rules", {})
-                selection_mode = rules.get("selection_mode", "single")
-                max_count = rules.get("max_count", 1)
-                tags_pool = group.get("tags", [])
-                expandable = rules.get("ai_expandable", False)
-                
-                val = data.get(dim_id)
-                if not val:
-                    continue
-                
-                # 统一转为列表处理
-                if isinstance(val, str):
-                    current_tags = [val]
-                elif isinstance(val, list):
-                    current_tags = val
-                else:
-                    current_tags = []
-                
-                valid_tags = []
-                for t in current_tags:
-                    t = str(t).strip()
-                    if not t: continue
-                    
-                    if not expandable and tags_pool:
-                        # 必须在库中 (模糊匹配)
-                        if t not in tags_pool:
-                            best_match = self._simple_fuzzy_match(t, tags_pool)
-                            if best_match:
-                                t = best_match
-                            else:
-                                continue # 跳过不合规标签
-                    valid_tags.append(t)
-                
-                # 强制执行单选/多选及数量限制
-                if selection_mode == "single":
-                    valid_tags = valid_tags[:1]
-                else:
-                    valid_tags = valid_tags[:max_count]
-                
-                # 存入结果
-                final_tag_groups[dim_id] = valid_tags
-                final_tags.extend(valid_tags)
-                
-                # AI 扩展逻辑
-                if expandable and self.db:
-                    for t in valid_tags:
-                        if t not in tags_pool:
-                            self.db.add_tag(dim_id, t, is_learned=1)
-
-            data["tags"] = final_tags
-            data["tag_groups"] = final_tag_groups
-            data["tags_zh"] = final_tags # 保持向后兼容
+            # 4. 标签归一（半封闭硬过滤 + 别名；禁止模糊贴词；建议组不自动入库）
+            data = self.apply_tag_normalization(data, persist_pending=True)
 
             if self.db and cache_key:
                 self.db.set_cache(cache_key, data)
@@ -1082,17 +1185,6 @@ class AIHandler:
         if data and "recommendations" in data:
             return data["recommendations"]
         return []
-
-    def _simple_fuzzy_match(self, tag: str, pool: List[str]) -> Optional[str]:
-        """简单的字符串模糊匹配"""
-        if not pool: return None
-        # 1. 精确匹配
-        if tag in pool: return tag
-        # 2. 包含匹配
-        for p in pool:
-            if tag in p or p in tag:
-                return p
-        return None
 
 class TagProcessor:
     """标签预处理与分类联动逻辑"""
@@ -1538,7 +1630,6 @@ class VideoOrganizerService:
                     "tags": [],
                     "category": None,
                     "summary": None,
-                    "emotion": None,
                     "tag_groups": {},
                 }
                 if self.db.insert_video_if_absent(record):
@@ -1741,7 +1832,7 @@ class VideoOrganizerService:
                     "filename_pattern": "{category}-{tags}-{summary}",
                     "xmp_hierarchical": True,
                     "xmp_prefix_category": True,
-                    "ale_columns": ["Name", "Keywords", "Category", "Summary", "Emotion"]
+                    "ale_columns": ["Name", "Keywords", "Category", "Summary"]
                 }
             },
             "categories": [
@@ -1807,6 +1898,111 @@ class VideoOrganizerService:
                 self.ai.tag_config = config
         except Exception as e:
             logger.error(f"保存标签配置失败: {e}")
+
+    def build_cold_start_draft(
+        self,
+        draft_lines: List[str],
+        *,
+        cluster_fn=None,
+    ):
+        """从草稿行生成词表冷启动草案（不写库）。cluster_fn 可注入以便测试。"""
+        from core.tag_vocab import build_cold_start_draft
+
+        return build_cold_start_draft(draft_lines, cluster_fn=cluster_fn)
+
+    def commit_cold_start_draft(
+        self,
+        draft,
+        *,
+        replace_placeholders: bool = True,
+        replace_all_group_tags: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        终审写入：合并草案到 tag_config + 标签库 + 别名表。
+        replace_all_group_tags=False 时与现有非占位标准词合并，不静默清空用户词。
+        """
+        from core.tag_vocab import commit_plan_summary, merge_draft_into_tag_config
+
+        if draft is None:
+            return {"ok": False, "error": "empty draft"}
+        cfg = merge_draft_into_tag_config(
+            self.tag_config or {},
+            draft,
+            replace_placeholders=replace_placeholders,
+            replace_all_group_tags=replace_all_group_tags,
+        )
+        self.save_tag_config(cfg)
+        # 同步标准词入库
+        for group in cfg.get("tag_groups") or []:
+            gid = group.get("id")
+            for t in group.get("tags") or []:
+                name = t if isinstance(t, str) else (t.get("name") if isinstance(t, dict) else None)
+                if name and gid:
+                    self.db.add_tag(gid, str(name).strip(), is_learned=0)
+        # 别名
+        for alias, standard in (draft.alias_map or {}).items():
+            if alias and standard:
+                self.db.add_synonym(standard, alias)
+        # 刷新 AI 侧标签库
+        if hasattr(self, "ai") and hasattr(self.ai, "init_tag_libraries"):
+            try:
+                self.ai.init_tag_libraries()
+            except Exception:
+                pass
+        summary = commit_plan_summary(draft)
+        summary["ok"] = True
+        return summary
+
+    def resolve_pending_tag(
+        self,
+        pending_id: int,
+        action: str,
+        *,
+        group_id: Optional[str] = None,
+        standard_tag: Optional[str] = None,
+    ) -> bool:
+        """
+        处理待审词：approve_standard | link_alias | discard
+        """
+        rows = self.db.execute_query("SELECT * FROM pending_tags WHERE id = ?", (pending_id,))
+        if not rows:
+            return False
+        row = rows[0]
+        raw = (row.get("raw_text") or "").strip()
+        if action == "discard":
+            self.db.update_pending_tag_status(pending_id, "discarded")
+            return True
+        if action == "link_alias":
+            std = (standard_tag or "").strip()
+            if not std or not raw:
+                return False
+            self.db.add_synonym(std, raw)
+            self.db.update_pending_tag_status(pending_id, "linked_as_alias")
+            return True
+        if action == "approve_standard":
+            gid = (group_id or row.get("group_id") or "custom").strip()
+            if not raw:
+                return False
+            self.db.add_tag(gid, raw, is_learned=0)
+            # 写入 tag_config 对应组
+            cfg = self.tag_config or {}
+            for group in cfg.get("tag_groups") or []:
+                if group.get("id") == gid:
+                    tags = group.get("tags") or []
+                    names = []
+                    for t in tags:
+                        if isinstance(t, dict):
+                            names.append(t.get("name"))
+                        else:
+                            names.append(t)
+                    if raw not in names:
+                        tags.append(raw)
+                        group["tags"] = tags
+                    break
+            self.save_tag_config(cfg)
+            self.db.update_pending_tag_status(pending_id, "approved_as_standard")
+            return True
+        return False
 
     def check_spelling(self, tags: List[str]) -> Dict[str, str]:
         """详情面板等 GUI 入口：委托 TagProcessor，失败时降级为空建议。"""
@@ -1963,23 +2159,29 @@ class VideoOrganizerService:
             
             if not ai_data: return None
 
-            # 标签预处理与分类联动 (V5.0)
-            # 优先使用 AIHandler 已经校验和分组好的数据
+            # 标签预处理与分类联动；最终再走标签归一，保证落库标准词
             processed_tags = ai_data.get("tags", [])
             tag_groups = ai_data.get("tag_groups", {})
             raw_category = ai_data.get("category", "Unknown")
-            
-            # 使用 TagProcessor 进行同义词清理和分类建议 (不再次调用智能分组，因为 AIHandler 已经分好组了)
+
             processed_tags, suggested_category = self.tag_processor.process(processed_tags, raw_category)
-            
-            # 同步更新 tag_groups (V5.0 修复: 确保分组内的标签也是清洗过的)
+
             synced_tag_groups = {}
             for dim_id, group_tags in tag_groups.items():
                 clean_group, _ = self.tag_processor.process(group_tags, suggested_category)
                 synced_tag_groups[dim_id] = clean_group
             tag_groups = synced_tag_groups
-            
-            # 更新标签频次 (V5.0)
+
+            ai_data = dict(ai_data)
+            ai_data["tag_groups"] = tag_groups
+            ai_data["tags"] = processed_tags
+            # 分类建议后再次归一（别名/封闭组）；待审已在 analyze 阶段记过，此处仍可补记
+            ai_data = self.ai.apply_tag_normalization(
+                ai_data, source_path=video_path, persist_pending=True
+            )
+            processed_tags = ai_data.get("tags", [])
+            tag_groups = ai_data.get("tag_groups", {})
+
             for tag in processed_tags:
                 self.db.increment_tag_usage(tag)
 
@@ -2008,7 +2210,6 @@ class VideoOrganizerService:
                 "metadata_injected": metadata_injected,
                 "thumbnail_path": thumbnail_path,
                 "raw_metadata": ai_data,
-                "emotion": ai_data.get("emotion"),
                 "face_clusters": ai_data.get("characters", []),
                 "vector_id": ai_data.get("vector_id"),
                 "tag_groups": tag_groups,
@@ -2069,9 +2270,6 @@ class VideoOrganizerService:
             tags = item.get("tags", ["无"]*5)
             tags_str = "_".join(tags)
             
-            # V4.0: 增强型智能重命名 (V2)
-            emotion = item.get("emotion") or ""
-            
             # V6.0: 优先级：custom_pattern > 全局设置 > 默认设置
             pattern = custom_pattern
             if not pattern:
@@ -2087,11 +2285,11 @@ class VideoOrganizerService:
             # V6.0: 新增日期变量
             current_date = datetime.now().strftime("%Y%m%d")
 
-            # {composition} 已下线：替换为空，避免旧模板残留脏值
+            # {emotion}/{composition} 已下线：替换为空，避免旧模板残留脏值
             new_fn = pattern.replace("{category}", str(category))\
                             .replace("{tags}", str(tags_str))\
                             .replace("{summary}", str(summary_safe))\
-                            .replace("{emotion}", str(emotion))\
+                            .replace("{emotion}", "")\
                             .replace("{composition}", "")\
                             .replace("{date}", current_date)\
                             .replace("{original_name}", str(original_suffix))
@@ -2243,7 +2441,7 @@ class VideoOrganizerService:
             "FPS\t25", # 默认为 25，实际导入时达芬奇会根据文件名匹配
             "",
             "Column",
-            "Name\tDescription\tKeywords\tCategory\tEmotion\tSummary"
+            "Name\tDescription\tKeywords\tCategory\tSummary"
         ]
         
         lines.append("Data")
@@ -2254,11 +2452,10 @@ class VideoOrganizerService:
             tags = item.get("tags", [])
             keywords = ", ".join(tags)
             category = item.get("category", "")
-            emotion = item.get("emotion", "")
             summary = description  # 重复一遍以防字段映射不同
             
-            # 使用制表符分隔（已去掉 Rating / Composition）
-            row = f"{name}\t{description}\t{keywords}\t{category}\t{emotion}\t{summary}"
+            # 使用制表符分隔（已去掉 Emotion / Rating / Composition）
+            row = f"{name}\t{description}\t{keywords}\t{category}\t{summary}"
             lines.append(row)
             
         try:

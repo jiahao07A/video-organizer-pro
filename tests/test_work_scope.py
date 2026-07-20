@@ -152,7 +152,6 @@ class TestScanAndRegister:
                 "category": "Aroll",
                 "summary": "原始摘要勿覆盖",
                 "tags": ["保留"],
-                "emotion": "平静",
             }
         )
         result = service.replace_work_scope([str(folder.resolve())], scan=True)
@@ -164,7 +163,7 @@ class TestScanAndRegister:
         assert row["category"] == "Aroll"
         assert row["summary"] == "原始摘要勿覆盖"
         assert row["tags"] == ["保留"]
-        assert row["emotion"] == "平静"
+
 
         # 再次扫盘仍不覆盖
         service.scan_and_register_work_scope()

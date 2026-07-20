@@ -3,12 +3,16 @@
 import json
 from PySide6.QtCore import Qt, QSortFilterProxyModel, QDate
 
+from core.tag_normalize import expand_tags_for_filter
+
 
 def video_matches_filter(video: dict, filter_params: dict) -> bool:
     """
     判断单条视频是否通过高级筛选（次接缝，可单测）。
     filter_params 键：text, categories, tags, date_start, date_end, only_dup,
-    emotions, analysis_statuses, tag_match_mode (any|all), summary_empty (any|empty|nonempty)
+    analysis_statuses, tag_match_mode (any|all), summary_empty (any|empty|nonempty),
+    alias_map（可选，{别名: 标准词}，用于扩展命中）
+    基调通过标签（含氛围标准词）筛选，不再提供独立 emotions 维。
     """
     if not video:
         return False
@@ -21,7 +25,6 @@ def video_matches_filter(video: dict, filter_params: dict) -> bool:
             + str(video.get("category", "")).lower()
             + str(video.get("tags", "")).lower()
             + str(video.get("summary", "")).lower()
-            + str(video.get("emotion", "")).lower()
         )
         if text not in content:
             return False
@@ -39,20 +42,18 @@ def video_matches_filter(video: dict, filter_params: dict) -> bool:
             except Exception:
                 video_tags = []
         vset = set(video_tags or [])
-        tset = set(target_tags)
+        alias_map = params.get("alias_map") or {}
+        tset = expand_tags_for_filter(target_tags, alias_map)
         mode = params.get("tag_match_mode") or "any"
         if mode == "all":
-            if not tset.issubset(vset):
-                return False
+            # all：每个筛选词在扩展后须能命中视频上的某个标签（视频侧亦按标准词）
+            for t in target_tags:
+                one = expand_tags_for_filter([t], alias_map)
+                if not vset.intersection(one):
+                    return False
         else:
             if not vset.intersection(tset):
                 return False
-
-    emotions = params.get("emotions") or []
-    if emotions:
-        emo = video.get("emotion") or ""
-        if emo not in emotions:
-            return False
 
     statuses = params.get("analysis_statuses") or []
     if statuses:
@@ -119,7 +120,6 @@ class AdvancedSortFilterProxyModel(QSortFilterProxyModel):
             "date_start": None,
             "date_end": None,
             "only_dup": False,
-            "emotions": [],
             "analysis_statuses": [],
             "tag_match_mode": "any",
             "summary_empty": "any",

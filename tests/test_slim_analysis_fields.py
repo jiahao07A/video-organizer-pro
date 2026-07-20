@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""分析结果字段瘦身（ticket 01）— 服务层接缝。"""
+"""分析结果字段瘦身 + 去情绪（ADR-0002/0003）— 服务层接缝。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,8 +14,9 @@ REMOVED_KEYS = (
     "quality_score",
     "is_proxy_needed",
     "tag_weights",
+    "emotion",
 )
-KEPT_KEYS = ("category", "summary", "emotion")
+KEPT_KEYS = ("category", "summary")
 
 
 @pytest.fixture
@@ -44,7 +45,7 @@ def test_build_analysis_prompts_json_structure_keys(service: VideoOrganizerServi
     prompts = service.ai.build_analysis_prompts()
     blob = prompts["user_prompt"] + prompts["system_prompt"]
     for key in REMOVED_KEYS:
-        assert f'"{key}"' not in blob, f"提示词仍含 \"{key}\""
+        assert f'"{key}"' not in blob, f'提示词仍含 "{key}"'
     for key in KEPT_KEYS:
         assert key in blob
 
@@ -59,9 +60,8 @@ def test_upsert_and_read_strips_removed_fields(service: VideoOrganizerService, t
             "category": "生活",
             "summary": "摘要",
             "tags": ["治愈"],
-            "emotion": "平静",
+            "emotion": "平静",  # 故意传入，写入后应被硬清
             "status": "analyzed",
-            # 故意传入已删字段，写入后应被清空/忽略
             "composition": "对称",
             "rating": 5,
             "quality_score": 9.9,
@@ -74,9 +74,8 @@ def test_upsert_and_read_strips_removed_fields(service: VideoOrganizerService, t
     row = rows[0]
     assert row.get("category") == "生活"
     assert row.get("summary") == "摘要"
-    assert row.get("emotion") == "平静"
     assert row.get("tags") == ["治愈"]
-    # 产品层不应再暴露有效的已删字段
+    # 产品层不应再暴露有效的已删字段（含 emotion）
     for key in REMOVED_KEYS:
         val = row.get(key)
         if key == "tag_weights":
@@ -89,30 +88,48 @@ def test_upsert_and_read_strips_removed_fields(service: VideoOrganizerService, t
             assert not val, f"{key} 应为空: {val}"
 
 
-def test_rename_pattern_ignores_composition(service: VideoOrganizerService, tmp_path: Path):
-    """重命名替换不再依赖 composition；占位符若残留应变成空串而非旧值。"""
+def test_rename_pattern_ignores_emotion_and_composition(service: VideoOrganizerService, tmp_path: Path):
+    """重命名替换不再依赖 emotion/composition；占位符残留应变成空串。"""
     from core.video_organizer_service import FileManager
 
     item = {
         "category": "A",
         "tags": ["t1"],
         "summary": "s",
-        "emotion": "e",
-        "composition": "SHOULD_NOT_APPEAR",
+        "emotion": "SHOULD_NOT_APPEAR_E",
+        "composition": "SHOULD_NOT_APPEAR_C",
         "filename": "orig.mp4",
     }
     pattern = "{category}-{emotion}-{composition}-{original_name}"
-    # 通过 batch_rename 的替换逻辑：直接复现 sanitize 后的模式
-    emotion = item.get("emotion") or ""
-    composition = ""  # 瘦身后固定空
     tags_str = "_".join(item["tags"])
     summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
     new_fn = (
         pattern.replace("{category}", str(item["category"]))
         .replace("{tags}", tags_str)
         .replace("{summary}", str(summary_safe))
-        .replace("{emotion}", str(emotion))
-        .replace("{composition}", str(composition))
+        .replace("{emotion}", "")
+        .replace("{composition}", "")
         .replace("{original_name}", "orig.mp4")
     )
     assert "SHOULD_NOT_APPEAR" not in new_fn
+    assert new_fn == "A---orig.mp4"
+
+
+def test_export_ale_has_no_emotion_column(service: VideoOrganizerService, tmp_path: Path):
+    path = str((tmp_path / "b.mp4").resolve())
+    Path(path).write_bytes(b"")
+    service.db.upsert_video(
+        {
+            "path": path,
+            "filename": "b.mp4",
+            "category": "生活",
+            "summary": "摘要行",
+            "tags": ["氛围词"],
+            "status": "analyzed",
+        }
+    )
+    out = tmp_path / "out.ale"
+    assert service.export_to_ale(str(out)) is True
+    text = out.read_text(encoding="utf-8-sig")
+    assert "Emotion" not in text
+    assert "Name\tDescription\tKeywords\tCategory\tSummary" in text

@@ -346,7 +346,7 @@ class SettingsView(QWidget):
         pattern = SettingsManager.get_setting(self.settings, "rename_pattern", "{category}-{tags}-{summary}-{original_name}")
         self.filename_tmpl.setText(pattern)
         
-        vars_hint = QLabel("变量: {date}, {category}, {tags}, {summary}, {emotion}, {original_name}")
+        vars_hint = QLabel("变量: {date}, {category}, {tags}, {summary}, {original_name}")
         vars_hint.setStyleSheet("color: #888; font-size: 11px;")
         
         rename_form.addRow("模式:", self.filename_tmpl)
@@ -376,7 +376,7 @@ class SettingsView(QWidget):
         # 3. ALE 导出列定义 (预览)
         ale_group = QGroupBox("ALE 导出列定义 (CSV 格式)")
         ale_layout = QVBoxLayout(ale_group)
-        self.ale_columns_edit = QLineEdit(", ".join(SettingsManager.get_setting(self.settings, "global_settings.export_schemes.ale_columns", ["Name", "Keywords", "Category", "Summary", "Emotion"])))
+        self.ale_columns_edit = QLineEdit(", ".join(SettingsManager.get_setting(self.settings, "global_settings.export_schemes.ale_columns", ["Name", "Keywords", "Category", "Summary"])))
         ale_layout.addWidget(QLabel("字段列表 (逗号分隔):"))
         ale_layout.addWidget(self.ale_columns_edit)
         form.addRow(ale_group)

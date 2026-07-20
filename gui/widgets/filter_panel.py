@@ -11,9 +11,10 @@ class FilterPanel(QFrame):
     """高级筛选面板 — 跟随全局 light/dark 主题；工作台与素材库共用。"""
     filterChanged = Signal(dict)
 
-    def __init__(self, settings, parent=None):
+    def __init__(self, settings, parent=None, service=None):
         super().__init__(parent)
         self.settings = settings
+        self.service = service
         self.setObjectName("FilterPanel")
         self.setup_ui()
         self.apply_theme()
@@ -37,12 +38,6 @@ class FilterPanel(QFrame):
         for tag in sorted(list(all_tags)):
             self.tag_combo.add_item(tag)
         self.tag_combo.itemsChanged.connect(self.emit_filter)
-
-        self.emotion_combo = CheckableComboBox()
-        self.emotion_combo.setPlaceholderText("筛选情绪...")
-        for emo in ["平静", "悲伤", "喜悦", "治愈", "震撼", "唯美", "紧张", "庄重", "科技感", "艺术感", "宁静"]:
-            self.emotion_combo.add_item(emo)
-        self.emotion_combo.itemsChanged.connect(self.emit_filter)
 
         self.status_combo = CheckableComboBox()
         self.status_combo.setPlaceholderText("分析状态...")
@@ -89,17 +84,16 @@ class FilterPanel(QFrame):
         layout.addWidget(self.tag_combo, 0, 3)
         layout.addWidget(self.dup_cb, 0, 4)
 
-        layout.addWidget(QLabel("情绪:"), 1, 0)
-        layout.addWidget(self.emotion_combo, 1, 1)
-        layout.addWidget(QLabel("状态:"), 1, 2)
-        layout.addWidget(self.status_combo, 1, 3)
-        layout.addWidget(self.tag_mode_combo, 1, 4)
+        # 基调通过标签（含氛围）筛选，不再提供独立情绪维
+        layout.addWidget(QLabel("状态:"), 1, 0)
+        layout.addWidget(self.status_combo, 1, 1)
+        layout.addWidget(self.tag_mode_combo, 1, 2)
+        layout.addWidget(self.summary_combo, 1, 3)
 
         layout.addWidget(self.date_check, 2, 0)
         layout.addWidget(self.date_start, 2, 1)
         layout.addWidget(QLabel("至"), 2, 2, alignment=Qt.AlignCenter)
         layout.addWidget(self.date_end, 2, 3)
-        layout.addWidget(self.summary_combo, 2, 4)
 
         reset_btn = QPushButton("重置")
         reset_btn.clicked.connect(self.reset_filter)
@@ -165,9 +159,6 @@ class FilterPanel(QFrame):
             all_tags.update(tags)
         for tag in sorted(list(all_tags)):
             self.tag_combo.add_item(tag)
-        self.emotion_combo.clear_items()
-        for emo in ["平静", "悲伤", "喜悦", "治愈", "震撼", "唯美", "紧张", "庄重", "科技感", "艺术感", "宁静"]:
-            self.emotion_combo.add_item(emo)
         self.status_combo.clear_items()
         for s in ["未分析", "已分析", "未命名", "已重命名"]:
             self.status_combo.add_item(s)
@@ -186,15 +177,21 @@ class FilterPanel(QFrame):
         self.emit_filter()
 
     def emit_filter(self):
+        alias_map = {}
+        if self.service is not None and getattr(self.service, "db", None) is not None:
+            try:
+                alias_map = self.service.db.get_synonyms() or {}
+            except Exception:
+                alias_map = {}
         params = {
             "categories": self.cat_combo.get_checked_items(),
             "tags": self.tag_combo.get_checked_items(),
-            "emotions": self.emotion_combo.get_checked_items(),
             "analysis_statuses": self.status_combo.get_checked_items(),
             "tag_match_mode": self.tag_mode_combo.currentData() or "any",
             "summary_empty": self.summary_combo.currentData() or "any",
             "only_dup": self.dup_cb.isChecked(),
             "date_start": self.date_start.date() if self.date_check.isChecked() else None,
             "date_end": self.date_end.date() if self.date_check.isChecked() else None,
+            "alias_map": alias_map,
         }
         self.filterChanged.emit(params)

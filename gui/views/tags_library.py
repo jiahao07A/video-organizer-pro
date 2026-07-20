@@ -185,6 +185,14 @@ class TagsView(QWidget):
         
         prompt_config_btn = QPushButton("Prompt 配置")
         prompt_config_btn.clicked.connect(self.open_prompt_config)
+
+        pending_btn = QPushButton("待审词")
+        pending_btn.setToolTip("处理标签归一时产生的待审词：批准标准词 / 挂别名 / 丢弃")
+        pending_btn.clicked.connect(self.open_pending_tags_dialog)
+
+        cold_start_btn = QPushButton("词表冷启动")
+        cold_start_btn.setToolTip("从草稿词表生成标准词草案，人工终审后写入标签库")
+        cold_start_btn.clicked.connect(self.open_cold_start_dialog)
         
         save_btn = QPushButton("保存所有更改")
         save_btn.setObjectName("primary_button")
@@ -194,6 +202,8 @@ class TagsView(QWidget):
         header_layout.addStretch()
         header_layout.addWidget(group_edit_btn)
         header_layout.addWidget(prompt_config_btn)
+        header_layout.addWidget(pending_btn)
+        header_layout.addWidget(cold_start_btn)
         header_layout.addWidget(import_btn)
         header_layout.addWidget(save_btn)
         self.main_layout.addLayout(header_layout)
@@ -615,7 +625,7 @@ class TagsView(QWidget):
                 act.triggered.connect(lambda checked=False, tag=current_tag, p_id=c.id: self.set_tag_parent(tag, p_id))
 
             # 同义词管理
-            synonym_act = menu.addAction("管理同义词 (别名)...")
+            synonym_act = menu.addAction("管理别名…")
             synonym_act.triggered.connect(lambda: self.manage_tag_synonyms(current_tag))
             
             # 人脸识别联动：标记为人物 (V6.0)
@@ -626,9 +636,8 @@ class TagsView(QWidget):
             
             menu.addSeparator()
 
-        # 批量删除
+        # 批量删除（QAction 无 setStyleSheet，勿调用）
         delete_act = menu.addAction("批量删除")
-        delete_act.setStyleSheet("color: #FF4D4F;")
         delete_act.triggered.connect(lambda: self.batch_delete_tags(list_view))
 
         menu.exec(list_view.mapToGlobal(pos))
@@ -711,7 +720,7 @@ class TagsView(QWidget):
             self.save_config(silent=True)
 
     def manage_tag_synonyms(self, tag):
-        """弹出对话框管理同义词"""
+        """弹出对话框管理别名（标准词的其它写法）。"""
         from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
         
         # 获取当前同义词
@@ -719,8 +728,8 @@ class TagsView(QWidget):
         current_syns = [alias for alias, std in all_syns.items() if std == tag.name]
         
         syn_str = ", ".join(current_syns)
-        text, ok = QInputDialog.getText(self, "管理同义词", 
-                                       f"标准标签: {tag.name}\n请输入同义词（别名），以逗号分隔:",
+        text, ok = QInputDialog.getText(self, "管理别名", 
+                                       f"标准词: {tag.name}\n请输入别名，以逗号分隔:",
                                        QLineEdit.Normal, syn_str)
         
         if ok:
@@ -736,7 +745,201 @@ class TagsView(QWidget):
                 except Exception as e:
                     QMessageBox.warning(self, "警告", f"别名 '{s}' 已存在或添加失败: {e}")
             
-            QMessageBox.information(self, "成功", f"标签 '{tag.name}' 的同义词已更新。")
+            QMessageBox.information(self, "成功", f"标准词 '{tag.name}' 的别名已更新。")
+
+    def open_pending_tags_dialog(self):
+        """待审词运营：批准标准词 / 挂别名 / 丢弃。"""
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
+            QPushButton, QLabel, QComboBox, QMessageBox, QInputDialog,
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("待审词")
+        dlg.resize(520, 420)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("以下词在封闭组被硬过滤，尚未进入标准词库。待审词 ≠ 已入库标准词。"))
+        lst = QListWidget()
+        layout.addWidget(lst)
+
+        def reload_list():
+            lst.clear()
+            for row in self.service.db.list_pending_tags(status="pending") or []:
+                item = QListWidgetItem(
+                    f"[{row.get('group_id') or '?'}] {row.get('raw_text')}  (#{row.get('id')})"
+                )
+                item.setData(Qt.UserRole, row)
+                lst.addItem(item)
+
+        reload_list()
+        btn_row = QHBoxLayout()
+        btn_std = QPushButton("批准为标准词")
+        btn_alias = QPushButton("挂为别名")
+        btn_discard = QPushButton("丢弃")
+        btn_close = QPushButton("关闭")
+        btn_row.addWidget(btn_std)
+        btn_row.addWidget(btn_alias)
+        btn_row.addWidget(btn_discard)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        group_ids = [g.get("id") for g in self.tag_config.get("tag_groups", []) if g.get("id")]
+
+        def current_row():
+            item = lst.currentItem()
+            return item.data(Qt.UserRole) if item else None
+
+        def on_approve():
+            row = current_row()
+            if not row:
+                return
+            gid, ok = QInputDialog.getItem(
+                dlg, "批准为标准词", "选择标签组:", group_ids or ["mood"], 0, False
+            )
+            if not ok:
+                return
+            if self.service.resolve_pending_tag(row["id"], "approve_standard", group_id=gid):
+                QMessageBox.information(dlg, "完成", f"已将「{row.get('raw_text')}」批准为标准词（组 {gid}）")
+                reload_list()
+                self.load_data()
+            else:
+                QMessageBox.warning(dlg, "失败", "无法批准该待审词")
+
+        def on_alias():
+            row = current_row()
+            if not row:
+                return
+            std, ok = QInputDialog.getText(dlg, "挂为别名", f"将「{row.get('raw_text')}」挂到哪个标准词？")
+            if not ok or not std.strip():
+                return
+            if self.service.resolve_pending_tag(row["id"], "link_alias", standard_tag=std.strip()):
+                QMessageBox.information(dlg, "完成", f"已将「{row.get('raw_text')}」设为「{std.strip()}」的别名")
+                reload_list()
+            else:
+                QMessageBox.warning(dlg, "失败", "挂别名失败")
+
+        def on_discard():
+            row = current_row()
+            if not row:
+                return
+            if self.service.resolve_pending_tag(row["id"], "discard"):
+                reload_list()
+
+        btn_std.clicked.connect(on_approve)
+        btn_alias.clicked.connect(on_alias)
+        btn_discard.clicked.connect(on_discard)
+        btn_close.clicked.connect(dlg.accept)
+        dlg.exec()
+
+    def open_cold_start_dialog(self):
+        """词表冷启动：导入草稿 → 预览草案 → 终审 commit。"""
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
+            QLabel, QMessageBox, QFileDialog, QCheckBox,
+        )
+        from core.tag_vocab import commit_plan_summary
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("词表冷启动")
+        dlg.resize(640, 520)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            "从草稿词表（每行一词）生成标准词 + 别名草案。\n"
+            "预览阶段不会写入标签库；只有点击「终审写入」才会保存。"
+        ))
+        draft_edit = QTextEdit()
+        draft_edit.setPlaceholderText("每行一个词，例如：\n治愈\n开心\n男性\n男人")
+        layout.addWidget(draft_edit)
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        preview.setPlaceholderText("草案预览将显示在这里…")
+        layout.addWidget(QLabel("草案预览（标准词 / 别名 / 分组）"))
+        layout.addWidget(preview)
+
+        chk_replace_ph = QCheckBox("写入时清除占位测试词（如「测试氛围1」）")
+        chk_replace_ph.setChecked(True)
+        chk_replace_all = QCheckBox("整组替换为草案（危险：会去掉该组原有非占位标准词）")
+        chk_replace_all.setChecked(False)
+        layout.addWidget(chk_replace_ph)
+        layout.addWidget(chk_replace_all)
+
+        state = {"draft": None}
+
+        def load_file():
+            path, _ = QFileDialog.getOpenFileName(dlg, "选择草稿词表", "", "Text (*.txt);;All (*.*)")
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    draft_edit.setPlainText(f.read())
+            except Exception as e:
+                QMessageBox.critical(dlg, "错误", str(e))
+
+        def do_preview():
+            lines = draft_edit.toPlainText().splitlines()
+            draft = self.service.build_cold_start_draft(lines)
+            state["draft"] = draft
+            summary = commit_plan_summary(draft)
+            lines_out = ["## 各组标准词", ""]
+            for gid, tags in summary["groups"].items():
+                lines_out.append(f"- {gid}: {', '.join(tags) if tags else '（空）'}")
+            lines_out.append("")
+            lines_out.append(f"## 别名数量: {summary['alias_count']}")
+            for a, s in list(summary["aliases"].items())[:40]:
+                lines_out.append(f"  {a} → {s}")
+            if summary.get("skipped_placeholders"):
+                lines_out.append("")
+                lines_out.append("## 跳过的占位词")
+                lines_out.append(", ".join(summary["skipped_placeholders"][:30]))
+            if summary.get("notes"):
+                lines_out.append("")
+                lines_out.append("## 备注")
+                lines_out.extend(summary["notes"])
+            preview.setPlainText("\n".join(lines_out))
+
+        def do_commit():
+            if state["draft"] is None:
+                do_preview()
+            if state["draft"] is None:
+                QMessageBox.warning(dlg, "提示", "请先生成草案预览")
+                return
+            reply = QMessageBox.question(
+                dlg, "确认终审",
+                "确定将草案写入标签库与别名表？此操作会修改配置。",
+            )
+            if reply != QMessageBox.Yes:
+                return
+            result = self.service.commit_cold_start_draft(
+                state["draft"],
+                replace_placeholders=chk_replace_ph.isChecked(),
+                replace_all_group_tags=chk_replace_all.isChecked(),
+            )
+            if result.get("ok"):
+                QMessageBox.information(dlg, "完成", "词表冷启动已终审写入。")
+                self.tag_config = self.service.tag_config
+                self.load_data()
+                self.refresh_columns()
+                dlg.accept()
+            else:
+                QMessageBox.warning(dlg, "失败", str(result.get("error") or "写入失败"))
+
+        btn_row = QHBoxLayout()
+        btn_file = QPushButton("从文件加载…")
+        btn_preview = QPushButton("生成草案预览")
+        btn_commit = QPushButton("终审写入")
+        btn_commit.setObjectName("primary_button")
+        btn_cancel = QPushButton("取消（不写库）")
+        btn_file.clicked.connect(load_file)
+        btn_preview.clicked.connect(do_preview)
+        btn_commit.clicked.connect(do_commit)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_file)
+        btn_row.addWidget(btn_preview)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_commit)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     def toggle_tag_person_status(self, tag, is_person):
         """将标签标记为人物并同步到数据库"""

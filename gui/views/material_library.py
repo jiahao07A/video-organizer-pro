@@ -61,7 +61,7 @@ class MaterialLibraryView(QWidget):
         toolbar.addWidget(self.add_scope_btn)
         layout.addLayout(toolbar)
 
-        self.filter_panel = FilterPanel(self.settings)
+        self.filter_panel = FilterPanel(self.settings, service=self.service)
         self.filter_panel.setVisible(False)
         self.filter_panel.filterChanged.connect(self.apply_advanced_filter)
         layout.addWidget(self.filter_panel)

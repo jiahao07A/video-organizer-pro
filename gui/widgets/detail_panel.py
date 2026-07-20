@@ -73,12 +73,7 @@ class DetailPanel(QWidget):
         form_layout.addRow("文件名:", self.filename_label)
         form_layout.addRow("分类:", self.category_input)
         form_layout.addRow("标签:", self.tags_widget)
-        
-        # V4.0: 情感氛围（构图/星级/代理已按 ADR-0002 移除）
-        self.emotion_label = QLabel("-")
-        
-        form_layout.addRow("情感氛围:", self.emotion_label)
-        
+        # 基调由氛围标签表达，不再展示独立情绪字段（ADR-0003）
         form_layout.addRow("摘要:", self.summary_input)
         form_layout.addRow("转录:", self.transcript_input)
         
@@ -338,8 +333,7 @@ class DetailPanel(QWidget):
         self.ai_rec_btn.setEnabled(True)
         self.storyboard_btn.setEnabled(True)
 
-        # 展示分析结果（瘦身后：分类/标签/摘要/情绪）
-        self.emotion_label.setText(video_data.get("emotion") or "未分析")
+        # 展示分析结果（分类/标签/摘要；情绪已并入氛围标签）
         
         # 加载缩略图
         thumb_path = video_data.get("thumbnail_path") or video_data.get("thumbnail")

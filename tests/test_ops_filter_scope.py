@@ -32,7 +32,6 @@ def _reg(service, path: Path, status="pending", **extra):
             "tags": extra.get("tags", []),
             "category": extra.get("category"),
             "summary": extra.get("summary"),
-            "emotion": extra.get("emotion"),
         }
     )
     return abs_p
@@ -72,10 +71,12 @@ def test_append_work_scope(service, tmp_path):
     assert normalize_work_path(p2) in paths
 
 
-def test_filter_emotion_and_status():
-    v = {"filename": "x.mp4", "emotion": "治愈", "status": "pending", "tags": ["a"], "summary": ""}
+def test_filter_status_and_ignores_emotions_param():
+    """分析状态可筛；emotions 维已拆除（传入亦忽略，不依赖 emotion 字段）。"""
+    v = {"filename": "x.mp4", "status": "pending", "tags": ["a", "治愈"], "summary": ""}
+    # 旧 emotions 参数不再生效，不应因缺失 emotion 字段而误杀
     assert video_matches_filter(v, {"emotions": ["治愈"]})
-    assert not video_matches_filter(v, {"emotions": ["悲伤"]})
+    assert video_matches_filter(v, {"emotions": ["悲伤"]})
     assert video_matches_filter(v, {"analysis_statuses": ["未分析"]})
     assert not video_matches_filter(v, {"analysis_statuses": ["已分析"]})
     assert video_matches_filter(v, {"analysis_statuses": ["未命名"]})
@@ -94,3 +95,12 @@ def test_filter_tag_all_and_summary():
     assert not video_matches_filter(v, {"summary_empty": "empty"})
     v2 = {"tags": [], "summary": "  ", "status": "analyzed"}
     assert video_matches_filter(v2, {"summary_empty": "empty"})
+
+
+def test_filter_mood_via_tags_any_all():
+    """基调通过标签（含氛围标准词）收窄，any/all 不回归。"""
+    v = {"tags": ["紧张", "纪实", "室内"], "summary": "s", "status": "analyzed"}
+    assert video_matches_filter(v, {"tags": ["紧张"], "tag_match_mode": "any"})
+    assert video_matches_filter(v, {"tags": ["紧张", "纪实"], "tag_match_mode": "all"})
+    assert not video_matches_filter(v, {"tags": ["紧张", "治愈"], "tag_match_mode": "all"})
+    assert video_matches_filter(v, {"tags": ["紧张", "治愈"], "tag_match_mode": "any"})

@@ -55,7 +55,7 @@ class BatchRenameDialog(QDialog):
         regex_layout.addWidget(self.regex_replace)
         config_layout.addLayout(regex_layout)
 
-        help_label = QLabel("变量支持: {category}, {tags}, {summary}, {emotion}, {original_name}")
+        help_label = QLabel("变量支持: {category}, {tags}, {summary}, {original_name}")
         help_label.setStyleSheet("color: #888; font-size: 11px;")
         config_layout.addWidget(help_label)
 
@@ -95,17 +95,17 @@ class BatchRenameDialog(QDialog):
         tags = item.get("tags", [])
         tags_str = "_".join(tags)
         summary_safe = FileManager.sanitize_filename(item.get("summary", ""), max_len=50)
-        emotion = item.get("emotion") or ""
         
         # 处理原始文件名后缀
         current_fn = item.get("filename", "")
         raw_parts = current_fn.split("-")
         original_suffix = raw_parts[-1] if len(raw_parts) > 1 else current_fn
         
+        # {emotion}/{composition} 已下线：替换为空
         new_fn = pattern.replace("{category}", str(category))\
                         .replace("{tags}", str(tags_str))\
                         .replace("{summary}", str(summary_safe))\
-                        .replace("{emotion}", str(emotion))\
+                        .replace("{emotion}", "")\
                         .replace("{composition}", "")\
                         .replace("{original_name}", str(original_suffix))
         
