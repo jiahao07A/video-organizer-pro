@@ -817,25 +817,26 @@ class AIHandler:
             logger.error(f"AI API 调用出错: {e}")
             return None
 
-    def analyze_video(self, base64_frames: List[str], cache_key: Optional[str] = None) -> Optional[Dict]:
-        if not base64_frames:
-            return None
+    def build_analysis_prompts(self, system_prompt_override: Optional[str] = None) -> Dict[str, str]:
+        """
+        组装主分析真正发给模型的 system / user 提示词（不含视频帧）。
+        供 analyze_video 与设置页预览共用。
+        """
+        global_settings = self.tag_config.get("global_settings", {}) if self.tag_config else {}
+        default_header = "你是一个资深的影视后期素材整理专家。请通过观察视频帧，提取精准的元数据。"
+        system_prompt_header = (
+            system_prompt_override
+            if system_prompt_override is not None
+            else global_settings.get("system_prompt", default_header)
+        )
+        if not (system_prompt_header or "").strip():
+            system_prompt_header = default_header
 
-        if self.db and cache_key:
-            cached = self.db.get_cache(cache_key)
-            if cached:
-                logger.info("使用 API 响应缓存")
-                return cached
-
-        # 1. 获取全局配置 (V6.0)
-        global_settings = self.tag_config.get("global_settings", {})
-        system_prompt_header = global_settings.get("system_prompt", "你是一个资深的影视后期素材整理专家。")
-        categories_list = [c.get("display_name") for c in self.tag_config.get("categories", [])]
+        categories_list = [c.get("display_name") for c in (self.tag_config or {}).get("categories", [])]
         if not categories_list:
             categories_list = self.settings.get("categories", [])
 
-        # 2. 动态构建标签组约束
-        tag_groups = self.tag_config.get("tag_groups", [])
+        tag_groups = (self.tag_config or {}).get("tag_groups", [])
         dimension_rules = []
         expected_json_structure = {
             "category": f"从 {categories_list} 中选择一个最合适的视频大类",
@@ -845,7 +846,7 @@ class AIHandler:
             "rating": "1-5 整数评分",
             "quality_score": "0.0-10.0 质量评分",
             "is_proxy_needed": "true/false, 画面是否复杂需要代理",
-            "tag_weights": {"标签名": "0.0-1.0 的相关度权重"}
+            "tag_weights": {"标签名": "0.0-1.0 的相关度权重"},
         }
 
         for i, group in enumerate(tag_groups, 1):
@@ -857,33 +858,35 @@ class AIHandler:
             expandable = rules.get("ai_expandable", False)
             local_prompt = rules.get("local_prompt", "")
             tags_pool = group.get("tags", [])
-            
+            pool_names = []
+            for t in tags_pool:
+                if isinstance(t, dict):
+                    n = str(t.get("name", "")).strip()
+                else:
+                    n = str(t).strip()
+                if n:
+                    pool_names.append(n)
+
             rule = f"{i}. **{name}** ({dim_id}): {local_prompt}\n"
             mode_desc = "单选" if selection_mode == "single" else "多选"
             rule += f"   - 约束：{mode_desc}，最大数量 {max_count}。\n"
-            
-            if tags_pool:
+            if pool_names:
                 if not expandable:
-                    rule += f"   - 库约束：必须严格从以下预设库中选择：[{', '.join(tags_pool)}]\n"
+                    rule += f"   - 库约束：必须严格从以下预设库中选择：[{', '.join(pool_names)}]\n"
                 else:
-                    rule += f"   - 库参考：优先从预设库选择，也可自行补充：[{', '.join(tags_pool)}]\n"
+                    rule += f"   - 库参考：优先从预设库选择，也可自行补充：[{', '.join(pool_names)}]\n"
             else:
-                rule += f"   - 约束：请根据视频内容自由生成。\n"
-            
+                rule += "   - 约束：请根据视频内容自由生成。\n"
             dimension_rules.append(rule)
-            
-            # 动态添加 JSON 字段定义
+
             if selection_mode == "single" and max_count == 1:
                 expected_json_structure[dim_id] = "选中的单个标签字符串"
             else:
                 expected_json_structure[dim_id] = ["选中的标签列表"]
 
-        rules_str = "\n".join(dimension_rules)
+        rules_str = "\n".join(dimension_rules) if dimension_rules else "（当前未配置任何标签组；请到标签库添加 tag_groups）"
         json_template = json.dumps(expected_json_structure, ensure_ascii=False, indent=2)
-
-        # 3. 组装最终 Prompt
-        system_prompt = f"{system_prompt_header}\n你必须返回一个严格符合给定结构的有效 JSON 对象。"
-        
+        system_prompt = f"{system_prompt_header.strip()}\n你必须返回一个严格符合给定结构的有效 JSON 对象。"
         user_prompt = f"""请通过观察视频帧分析其内容，并严格遵守以下规则输出 JSON：
 
 ### 1. 分类与标签规则
@@ -899,6 +902,28 @@ class AIHandler:
 3. 摘要需客观描述画面，避免主观臆断。
 4. **务必为生成的每个标签提供 0.0-1.0 的权重 (tag_weights)**。
 """
+        return {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "system_prompt_header": system_prompt_header.strip(),
+        }
+
+    def analyze_video(self, base64_frames: List[str], cache_key: Optional[str] = None) -> Optional[Dict]:
+        if not base64_frames:
+            return None
+
+        if self.db and cache_key:
+            cached = self.db.get_cache(cache_key)
+            if cached:
+                logger.info("使用 API 响应缓存")
+                return cached
+
+        # 与设置页预览共用同一条组装链路
+        prompts = self.build_analysis_prompts()
+        system_prompt = prompts["system_prompt"]
+        user_prompt = prompts["user_prompt"]
+        tag_groups = (self.tag_config or {}).get("tag_groups", [])
+
         content_parts = [{"type": "text", "text": user_prompt}]
         for b64_img in base64_frames:
             content_parts.append({
@@ -1502,6 +1527,44 @@ class VideoOrganizerService:
                 self.ai.tag_config = config
         except Exception as e:
             logger.error(f"保存标签配置失败: {e}")
+
+    def check_spelling(self, tags: List[str]) -> Dict[str, str]:
+        """详情面板等 GUI 入口：委托 TagProcessor，失败时降级为空建议。"""
+        if not tags:
+            return {}
+        try:
+            return self.tag_processor.check_spelling(tags)
+        except Exception as e:
+            logger.warning(f"拼写检查失败，已降级: {e}")
+            return {}
+
+    def get_system_prompt(self) -> str:
+        """主分析实际使用的全局 system_prompt（来自 tag_config）。"""
+        global_settings = self.tag_config.get("global_settings", {}) if self.tag_config else {}
+        return global_settings.get(
+            "system_prompt",
+            "你是一个资深的影视后期素材整理专家。请通过观察视频帧，提取精准的元数据。",
+        )
+
+    def set_system_prompt(self, text: str) -> None:
+        """写入并持久化全局 system_prompt，与 AI 分析链路对齐。"""
+        if not self.tag_config:
+            self.tag_config = {}
+        global_settings = self.tag_config.setdefault("global_settings", {})
+        global_settings["system_prompt"] = (text or "").strip()
+        self.save_tag_config(self.tag_config)
+
+    def preview_analysis_prompts(self, system_prompt_override: Optional[str] = None) -> Dict[str, str]:
+        """预览主分析将发给模型的完整 system/user 提示词（不含视频帧）。"""
+        if hasattr(self, "ai") and self.ai is not None:
+            self.ai.tag_config = self.tag_config
+            self.ai.settings = self.settings
+            return self.ai.build_analysis_prompts(system_prompt_override)
+        return {
+            "system_prompt": "",
+            "user_prompt": "",
+            "system_prompt_header": system_prompt_override or "",
+        }
 
     def get_all_videos(self) -> List[Dict]:
         """V4.0: 获取所有视频，优先使用 L1 内存缓存"""

@@ -322,8 +322,15 @@ class DetailPanel(QWidget):
             colors[t] = cat_color_map.get(cat_id, "#757575")
             icons[t] = lib_icons.get(t)
         
-        # 拼写检查 (V6.0 MEGA UPDATE)
-        misspelled_suggestions = self.service.ai.check_spelling(tags)
+        # 拼写检查：经 service 门面委托 TagProcessor，失败不阻断详情加载
+        misspelled_suggestions = {}
+        if hasattr(self.service, "check_spelling"):
+            misspelled_suggestions = self.service.check_spelling(tags) or {}
+        elif hasattr(self.service, "tag_processor"):
+            try:
+                misspelled_suggestions = self.service.tag_processor.check_spelling(tags) or {}
+            except Exception:
+                misspelled_suggestions = {}
         
         self.tags_widget.set_tags(tags, colors=colors, weights=video_data.get("tag_weights", {}), 
                                  misspelled_tags=list(misspelled_suggestions.keys()),

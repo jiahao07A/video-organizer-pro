@@ -153,6 +153,7 @@ class SettingsView(QWidget):
         return tab
 
     def create_prompts_tab(self):
+        """编辑全局 system 角色头，并预览分析时真正发出的完整提示词。"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
@@ -162,31 +163,99 @@ class SettingsView(QWidget):
         
         container = QWidget()
         vbox = QVBoxLayout(container)
-        
-        # 分类 Prompt
-        vbox.addWidget(QLabel("<b>视频分类任务 Prompt:</b>"))
-        self.cls_prompt_edit = QPlainTextEdit()
-        self.cls_prompt_edit.setPlainText(SettingsManager.get_setting(self.settings, "prompts.video_classification", ""))
-        self.cls_prompt_edit.setMinimumHeight(120)
-        vbox.addWidget(self.cls_prompt_edit)
-        
-        # 标签 Prompt
-        vbox.addWidget(QLabel("<b>标签生成任务 Prompt:</b>"))
-        self.tag_prompt_edit = QPlainTextEdit()
-        self.tag_prompt_edit.setPlainText(SettingsManager.get_setting(self.settings, "prompts.tag_generation", ""))
-        self.tag_prompt_edit.setMinimumHeight(120)
-        vbox.addWidget(self.tag_prompt_edit)
-        
-        # 描述 Prompt
-        vbox.addWidget(QLabel("<b>内容描述任务 Prompt:</b>"))
-        self.desc_prompt_edit = QPlainTextEdit()
-        self.desc_prompt_edit.setPlainText(SettingsManager.get_setting(self.settings, "prompts.content_description", ""))
-        self.desc_prompt_edit.setMinimumHeight(120)
-        vbox.addWidget(self.desc_prompt_edit)
+        vbox.setSpacing(12)
+
+        hint = QLabel(
+            "<b>提示词由两层组成，不是只有下面这一句：</b>"
+            "<br>① <b>全局角色头（可编辑）</b>：你在下方写的 system 开头；"
+            "<br>② <b>自动组装正文（只读预览）</b>：分类列表、各标签组 local_prompt、"
+            "标签库约束、JSON 输出结构——分析时由程序拼进 user 消息，并附上视频帧。"
+            "<br>标签组局部说明请到「标签库 → 组规则 / Prompt 配置」维护。"
+            "<br><span style='color:#888;'>旧版三份任务 Prompt 已废弃，不再参与分析。</span>"
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.RichText)
+        vbox.addWidget(hint)
+
+        vbox.addWidget(QLabel("<b>① 全局角色头（写入 tag_config.global_settings.system_prompt）:</b>"))
+        self.system_prompt_edit = QPlainTextEdit()
+        default_system = (
+            "你是一个资深的影视后期素材整理专家。请通过观察视频帧，提取精准的元数据。"
+        )
+        current = ""
+        if hasattr(self.service, "get_system_prompt"):
+            current = self.service.get_system_prompt()
+        else:
+            current = (self.service.tag_config or {}).get("global_settings", {}).get("system_prompt", "")
+        if not (current or "").strip():
+            legacy_parts = [
+                SettingsManager.get_setting(self.settings, "prompts.video_classification", ""),
+                SettingsManager.get_setting(self.settings, "prompts.tag_generation", ""),
+                SettingsManager.get_setting(self.settings, "prompts.content_description", ""),
+            ]
+            legacy = "\n\n".join(p for p in legacy_parts if p)
+            current = legacy or default_system
+        self.system_prompt_edit.setPlainText(current)
+        self.system_prompt_edit.setMinimumHeight(100)
+        self.system_prompt_edit.setPlaceholderText(
+            "例如角色、风格偏好、禁止事项。不必重复写 JSON 字段——下方预览会自动带上。"
+        )
+        vbox.addWidget(self.system_prompt_edit)
+
+        preview_header = QHBoxLayout()
+        preview_header.addWidget(QLabel("<b>② 完整提示词预览（与真实分析同一套组装逻辑）:</b>"))
+        preview_header.addStretch()
+        refresh_btn = QPushButton("刷新预览")
+        refresh_btn.clicked.connect(self.refresh_prompt_preview)
+        preview_header.addWidget(refresh_btn)
+        vbox.addLayout(preview_header)
+
+        self.prompt_preview_edit = QPlainTextEdit()
+        self.prompt_preview_edit.setReadOnly(True)
+        self.prompt_preview_edit.setMinimumHeight(280)
+        self.prompt_preview_edit.setPlaceholderText("点击「刷新预览」查看将发给模型的 system + user 全文。")
+        vbox.addWidget(self.prompt_preview_edit)
+
+        note = QLabel(
+            "预览不含视频帧图片。若标签库仍是「测试氛围1」这类占位标签，"
+            "预览正文也会偏薄——那是标签库数据问题，不是提示词引擎只有一句话。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888; font-size: 12px;")
+        vbox.addWidget(note)
+        vbox.addStretch()
         
         scroll.setWidget(container)
         layout.addWidget(scroll)
+
+        # 进入页面即展示一次真实拼装结果
+        self.refresh_prompt_preview()
         return tab
+
+    def refresh_prompt_preview(self):
+        """按当前编辑框中的角色头 + 现有 tag_config 刷新完整提示词预览。"""
+        if not hasattr(self, "prompt_preview_edit"):
+            return
+        header = ""
+        if hasattr(self, "system_prompt_edit"):
+            header = self.system_prompt_edit.toPlainText()
+        try:
+            if hasattr(self.service, "preview_analysis_prompts"):
+                prompts = self.service.preview_analysis_prompts(header)
+            elif hasattr(self.service, "ai") and hasattr(self.service.ai, "build_analysis_prompts"):
+                self.service.ai.tag_config = self.service.tag_config
+                prompts = self.service.ai.build_analysis_prompts(header)
+            else:
+                prompts = {"system_prompt": header, "user_prompt": "（无法生成预览）"}
+            text = (
+                "======== [system] 发给模型的系统消息 ========\n"
+                f"{prompts.get('system_prompt', '')}\n\n"
+                "======== [user] 发给模型的用户消息（另附视频帧） ========\n"
+                f"{prompts.get('user_prompt', '')}"
+            )
+            self.prompt_preview_edit.setPlainText(text)
+        except Exception as e:
+            self.prompt_preview_edit.setPlainText(f"预览失败: {e}")
 
     def create_interface_tab(self):
         tab = QWidget()
@@ -300,10 +369,14 @@ class SettingsView(QWidget):
         SettingsManager.update_setting(self.settings, "processing.enable_scene_detection", self.scene_detect_cb.isChecked())
         SettingsManager.update_setting(self.settings, "processing.enable_audio_transcription", self.audio_cb.isChecked())
         
-        # Prompts
-        SettingsManager.update_setting(self.settings, "prompts.video_classification", self.cls_prompt_edit.toPlainText().strip())
-        SettingsManager.update_setting(self.settings, "prompts.tag_generation", self.tag_prompt_edit.toPlainText().strip())
-        SettingsManager.update_setting(self.settings, "prompts.content_description", self.desc_prompt_edit.toPlainText().strip())
+        # 全局 system_prompt → tag_config（主分析真实入口）；旧 prompts.* 不再写入
+        if hasattr(self, "system_prompt_edit"):
+            system_prompt = self.system_prompt_edit.toPlainText().strip()
+            if hasattr(self.service, "set_system_prompt"):
+                self.service.set_system_prompt(system_prompt)
+            else:
+                self.service.tag_config.setdefault("global_settings", {})["system_prompt"] = system_prompt
+                self.service.save_tag_config(self.service.tag_config)
         
         # UI & Others
         SettingsManager.update_setting(self.settings, "ui_preferences.font_size", self.font_spin.value())

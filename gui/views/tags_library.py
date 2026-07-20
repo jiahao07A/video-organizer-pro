@@ -5,38 +5,85 @@ from PySide6.QtWidgets import (
     QFileDialog, QProgressDialog, QListView, QScrollArea, QFrame,
     QSplitter, QDialog
 )
-from PySide6.QtGui import QColor, QAction, QIcon, QDragEnterEvent, QDropEvent
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QColor, QAction, QIcon, QDragEnterEvent, QDropEvent, QPalette
+from PySide6.QtCore import Qt, QSize, Slot
 import json
-from core.video_organizer_service import VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from core.tag_import_service import TagImportService
 from gui.models.tag_model import TagListModel, TagFilterProxyModel
 from gui.widgets.delegates import TagChipDelegate
 from gui.widgets.import_wizard import TagImportWizard
 from gui.views.tags_library_editors import TagGroupEditor, PromptConfigCenter
 
+
+def tags_library_palette(theme: str = "dark") -> dict:
+    """标签库局部色板：跟随全局 light/dark，避免硬编码深色导致浅色主题下全黑不可读。"""
+    if theme == "light":
+        return {
+            "panel_bg": "#ffffff",
+            "panel_border": "#d0d0d0",
+            "input_bg": "#f3f3f3",
+            "input_text": "#222222",
+            "title": "#b45309",
+            "muted": "#666666",
+            "heatmap_bg": "#f7f7f7",
+            "heatmap_border": "#e0e0e0",
+            "heatmap_title": "#cf1322",
+            "chip_bg": "#ebebeb",
+            "chip_text": "#1a1a1a",
+            "chip_border": "#c0c0c0",
+            "list_bg": "#fafafa",
+            "splitter": "#dddddd",
+            "accent": "#0078d4",
+            "danger": "#cf1322",
+        }
+    return {
+        "panel_bg": "#262626",
+        "panel_border": "#3a3a3a",
+        "input_bg": "#1f1f1f",
+        "input_text": "#d4d4d4",
+        "title": "#FFB300",
+        "muted": "#8C8C8C",
+        "heatmap_bg": "#1a1a1a",
+        "heatmap_border": "#333333",
+        "heatmap_title": "#ff4d4f",
+        "chip_bg": "#3a3a3a",
+        "chip_text": "#e8e8e8",
+        "chip_border": "#555555",
+        "list_bg": "#1f1f1f",
+        "splitter": "#3a3a3a",
+        "accent": "#ce9178",
+        "danger": "#ff4d4f",
+    }
+
+
 class TagHeatmapWidget(QFrame):
     """标签热力图仪表盘"""
-    def __init__(self, model: TagListModel, parent=None):
+    def __init__(self, model: TagListModel, colors: dict = None, parent=None):
         super().__init__(parent)
         self.model = model
+        self.colors = colors or tags_library_palette("dark")
         self.setFixedHeight(100)
-        self.setStyleSheet("""
-            TagHeatmapWidget {
-                background-color: #1a1a1a;
-                border-radius: 10px;
-                border: 1px solid #333;
-            }
-        """)
+        self._apply_frame_style()
         self.setup_ui()
+
+    def _apply_frame_style(self):
+        c = self.colors
+        self.setStyleSheet(f"""
+            TagHeatmapWidget {{
+                background-color: {c["heatmap_bg"]};
+                border-radius: 10px;
+                border: 1px solid {c["heatmap_border"]};
+            }}
+        """)
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 10, 15, 10)
         
         header = QHBoxLayout()
-        title = QLabel("🔥 标签热力图看板 (Top 10)")
-        title.setStyleSheet("font-weight: bold; color: #ff4d4f; font-size: 14px;")
+        title = QLabel("标签热力图看板 (Top 10)")
+        title.setStyleSheet(f"font-weight: bold; color: {self.colors['heatmap_title']}; font-size: 14px;")
         header.addWidget(title)
         header.addStretch()
         layout.addLayout(header)
@@ -45,6 +92,11 @@ class TagHeatmapWidget(QFrame):
         self.content_layout.setSpacing(10)
         layout.addLayout(self.content_layout)
         
+        self.update_data()
+
+    def set_colors(self, colors: dict):
+        self.colors = colors
+        self._apply_frame_style()
         self.update_data()
 
     def update_data(self):
@@ -64,7 +116,7 @@ class TagHeatmapWidget(QFrame):
         
         if not sorted_tags:
             empty = QLabel("暂无使用数据")
-            empty.setStyleSheet("color: #666; font-style: italic;")
+            empty.setStyleSheet(f"color: {self.colors['muted']}; font-style: italic;")
             self.content_layout.addWidget(empty)
             return
 
@@ -88,11 +140,11 @@ class TagHeatmapWidget(QFrame):
             
             name_label = QLabel(tag.name)
             name_label.setAlignment(Qt.AlignCenter)
-            name_label.setStyleSheet("font-size: 11px; color: #ccc;")
+            name_label.setStyleSheet(f"font-size: 11px; color: {self.colors['input_text']};")
             
             count_label = QLabel(str(tag.usage_count))
             count_label.setAlignment(Qt.AlignCenter)
-            count_label.setStyleSheet("font-size: 10px; color: #888; font-weight: bold;")
+            count_label.setStyleSheet(f"font-size: 10px; color: {self.colors['muted']}; font-weight: bold;")
             
             v_layout.addWidget(bar)
             v_layout.addWidget(name_label)
@@ -109,6 +161,7 @@ class TagsView(QWidget):
         self.service = service
         self.tag_config = service.tag_config
         self.import_service = TagImportService(service.ai)
+        self.ui_colors = self._resolve_colors()
         
         # 初始化模型
         self.model = TagListModel(self)
@@ -117,15 +170,23 @@ class TagsView(QWidget):
         self.setup_ui()
         self.load_data()
 
+    def _resolve_colors(self) -> dict:
+        theme = SettingsManager.get_setting(self.service.settings, "ui_preferences.theme", "dark")
+        # get_main_style 把非 dark 都当 light；amber_gold 等历史值按 dark 处理更安全
+        if theme not in ("light", "dark"):
+            theme = "dark" if theme != "light" else "light"
+        return tags_library_palette(theme)
+
     def setup_ui(self):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(15, 15, 15, 15)
         self.main_layout.setSpacing(15)
+        c = self.ui_colors
 
         # Header
         header_layout = QHBoxLayout()
         title = QLabel("标签库管理 V2")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #FFB300;")
+        title.setStyleSheet(f"font-size: 24px; font-weight: bold; color: {c['title']};")
         
         import_btn = QPushButton("导入标签")
         import_btn.clicked.connect(self.import_from_txt)
@@ -149,7 +210,7 @@ class TagsView(QWidget):
         self.main_layout.addLayout(header_layout)
 
         # 标签热力图看板
-        self.heatmap_widget = TagHeatmapWidget(self.model)
+        self.heatmap_widget = TagHeatmapWidget(self.model, self.ui_colors)
         self.main_layout.addWidget(self.heatmap_widget)
 
         # 6 分栏布局容器
@@ -163,7 +224,7 @@ class TagsView(QWidget):
         
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.setHandleWidth(2)
-        self.splitter.setStyleSheet("QSplitter::handle { background-color: #3a3a3a; }")
+        self.splitter.setStyleSheet(f"QSplitter::handle {{ background-color: {c['splitter']}; }}")
 
         # 动态分栏布局
         self.refresh_columns()
@@ -173,14 +234,15 @@ class TagsView(QWidget):
         self.main_layout.addWidget(scroll_area)
 
     def create_column(self, dim_id, dim_name, color):
+        c = self.ui_colors
         col_widget = QFrame()
         col_widget.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
         col_widget.setMinimumWidth(260)
         col_widget.setStyleSheet(f"""
             QFrame {{
-                background-color: #262626;
+                background-color: {c["panel_bg"]};
                 border-radius: 8px;
-                border: 1px solid #3a3a3a;
+                border: 1px solid {c["panel_border"]};
             }}
         """)
         
@@ -195,7 +257,7 @@ class TagsView(QWidget):
         
         config_btn = QPushButton("⚙")
         config_btn.setFixedSize(24, 24)
-        config_btn.setStyleSheet("border: none; color: #8C8C8C; font-size: 16px;")
+        config_btn.setStyleSheet(f"border: none; color: {c['muted']}; font-size: 16px;")
         config_btn.setToolTip("配置属性")
         config_btn.clicked.connect(lambda _, d=dim_id, b=config_btn: self.show_dim_config(d, b))
         
@@ -208,7 +270,10 @@ class TagsView(QWidget):
         # Search Bar
         search_edit = QLineEdit()
         search_edit.setPlaceholderText("过滤标签...")
-        search_edit.setStyleSheet("background-color: #1f1f1f; border-radius: 4px; height: 24px;")
+        search_edit.setStyleSheet(
+            f"background-color: {c['input_bg']}; color: {c['input_text']}; "
+            f"border: 1px solid {c['panel_border']}; border-radius: 4px; height: 24px; padding: 2px 6px;"
+        )
         layout.addWidget(search_edit)
 
         # List View
@@ -225,6 +290,20 @@ class TagsView(QWidget):
         list_view.setResizeMode(QListView.Adjust)
         list_view.setWordWrap(True)
         list_view.setMovement(QListView.Static) # 禁用视图内的自由拖动，仅允许跨列拖拽
+        list_view.setStyleSheet(
+            f"QListView {{ background-color: {c['list_bg']}; border: none; color: {c['chip_text']}; }}"
+        )
+        # 让 TagChipDelegate 从 palette 取到与分栏一致的可读颜色
+        pal = list_view.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(c["chip_bg"]))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(c["chip_text"]))
+        pal.setColor(QPalette.ColorRole.Base, QColor(c["list_bg"]))
+        pal.setColor(QPalette.ColorRole.Text, QColor(c["chip_text"]))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(c["accent"]))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        pal.setColor(QPalette.ColorRole.Mid, QColor(c["chip_border"]))
+        list_view.setPalette(pal)
+        list_view.setAutoFillBackground(True)
         
         # 启用右键菜单
         list_view.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -258,7 +337,10 @@ class TagsView(QWidget):
         footer = QHBoxLayout()
         quick_add = QLineEdit()
         quick_add.setPlaceholderText("+ 快速添加...")
-        quick_add.setStyleSheet("background-color: #1f1f1f; border-radius: 4px; height: 24px;")
+        quick_add.setStyleSheet(
+            f"background-color: {c['input_bg']}; color: {c['input_text']}; "
+            f"border: 1px solid {c['panel_border']}; border-radius: 4px; height: 24px; padding: 2px 6px;"
+        )
         quick_add.returnPressed.connect(lambda d=dim_id, q=quick_add: self.add_tag_to_dim(d, q))
         
         footer.addWidget(quick_add)
@@ -278,9 +360,12 @@ class TagsView(QWidget):
         
         # 预定义颜色方案
         colors = ["#FADB14", "#1890FF", "#52C41A", "#722ED1", "#EB2F96", "#FA8C16", "#13C2C2", "#722ED1"]
+        # light 主题下部分亮色标题对比不足时加深
+        if SettingsManager.get_setting(self.service.settings, "ui_preferences.theme", "dark") == "light":
+            colors = ["#ad8b00", "#096dd9", "#389e0d", "#531dab", "#c41d7f", "#d46b08", "#08979c", "#531dab"]
         
         # 1. 中转池
-        pool_column = self.create_column("pool", "中转池 (All)", "#8C8C8C")
+        pool_column = self.create_column("pool", "中转池 (All)", self.ui_colors["muted"])
         self.splitter.addWidget(pool_column)
         
         # 2. 动态组
@@ -355,6 +440,7 @@ class TagsView(QWidget):
             
         threading.Thread(target=run, daemon=True).start()
 
+    @Slot()
     def load_data_silent(self):
         """悄悄更新模型数据而不重置滚动位置（部分更新）"""
         tags_detail = self.service.db.get_tags_detail()
