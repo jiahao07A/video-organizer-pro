@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from .views.workstation import WorkstationView
 from .views.tags_library import TagsView
 from .views.settings import SettingsView
-from .styles import get_main_style
+from .styles import get_main_style, normalize_theme
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 
 class MainWindow(QMainWindow):
@@ -24,10 +24,24 @@ class MainWindow(QMainWindow):
         self.refresh_style()
         
     def refresh_style(self):
-        """刷新 UI 样式"""
+        """刷新主窗 QSS，并广播主题到已创建的子视图。"""
         font_size = SettingsManager.get_setting(self.settings, "ui_preferences.font_size", 14)
-        theme = SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
+        raw_theme = SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
+        theme = normalize_theme(raw_theme)
+        # 写回规范值，避免 amber_gold 等历史值导致各处映射不一致
+        if raw_theme != theme:
+            SettingsManager.update_setting(self.settings, "ui_preferences.theme", theme)
+            SettingsManager.save_settings(self.settings)
         self.setStyleSheet(get_main_style(font_size, theme))
+        self._propagate_theme(theme)
+
+    def _propagate_theme(self, theme: str):
+        """主题变更汇合点：子视图即时 apply，无需重启。"""
+        theme = normalize_theme(theme)
+        if hasattr(self, "workstation_page") and hasattr(self.workstation_page, "apply_theme"):
+            self.workstation_page.apply_theme(theme)
+        if hasattr(self, "tags_page") and hasattr(self.tags_page, "apply_theme"):
+            self.tags_page.apply_theme(theme)
 
     def setup_ui(self):
         """初始化主界面布局"""
@@ -192,7 +206,9 @@ class MainWindow(QMainWindow):
 
     def toggle_theme(self):
         """切换深色/浅色模式"""
-        current_theme = SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
+        current_theme = normalize_theme(
+            SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
+        )
         new_theme = "light" if current_theme == "dark" else "dark"
         SettingsManager.update_setting(self.settings, "ui_preferences.theme", new_theme)
         SettingsManager.save_settings(self.settings)

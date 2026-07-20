@@ -2,19 +2,22 @@
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QDateEdit, QCheckBox, QPushButton
 from PySide6.QtCore import Qt, Signal, QDate
 from .checkable_combo_box import CheckableComboBox
+from gui.styles import normalize_theme, get_theme_colors
+
 
 class FilterPanel(QFrame):
-    """高级筛选面板"""
+    """高级筛选面板 — 跟随全局 light/dark 主题"""
     filterChanged = Signal(dict)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.setObjectName("FilterPanel")
         self.setup_ui()
+        self.apply_theme()
 
     def setup_ui(self):
         self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet("background-color: #252526; border-radius: 8px;")
         
         layout = QGridLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -73,6 +76,41 @@ class FilterPanel(QFrame):
         reset_btn = QPushButton("重置")
         reset_btn.clicked.connect(self.reset_filter)
         layout.addWidget(reset_btn, 1, 4)
+
+    def apply_theme(self, theme=None):
+        """按全局主题重涂筛选面板（去掉写死深色底）。"""
+        if theme is None:
+            theme = self.settings.get("ui_preferences", {}).get("theme", "dark")
+        theme = normalize_theme(theme)
+        c = get_theme_colors(theme)
+        self.setStyleSheet(f"""
+            #FilterPanel {{
+                background-color: {c["filter_bg"]};
+                border: 1px solid {c["border"]};
+                border-radius: 8px;
+                color: {c["text"]};
+            }}
+            #FilterPanel QLabel {{
+                color: {c["text"]};
+                background: transparent;
+            }}
+            #FilterPanel QCheckBox {{
+                color: {c["text"]};
+                background: transparent;
+            }}
+            #FilterPanel QLineEdit, #FilterPanel QComboBox, #FilterPanel QDateEdit {{
+                background-color: {c["item_bg"]};
+                color: {c["text"]};
+                border: 1px solid {c["border"]};
+                border-radius: 4px;
+            }}
+            #FilterPanel QPushButton {{
+                background-color: {c["item_bg"]};
+                color: {c["text"]};
+                border: 1px solid {c["border"]};
+                border-radius: 4px;
+            }}
+        """)
 
     def toggle_date_filter(self, state):
         enabled = state == Qt.Checked

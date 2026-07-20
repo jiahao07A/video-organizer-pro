@@ -17,6 +17,8 @@ from ..workers.analysis_worker import AnalysisWorker
 from ..workers.rename_worker import RenameWorker
 from ..widgets.rename_dialog import BatchRenameDialog
 from core.video_organizer_service import VideoOrganizerService
+from gui.styles import normalize_theme
+
 
 class WorkstationView(QWidget):
     """工作台视图 - 核心视频处理区域"""
@@ -201,6 +203,14 @@ class WorkstationView(QWidget):
 
     def toggle_filter_panel(self):
         self.filter_panel.setVisible(self.filter_btn.isChecked())
+
+    def apply_theme(self, theme=None):
+        """主窗主题变更时刷新高级筛选等局部面板。"""
+        if theme is None:
+            theme = self.settings.get("ui_preferences", {}).get("theme", "dark")
+        theme = normalize_theme(theme)
+        if hasattr(self, "filter_panel") and hasattr(self.filter_panel, "apply_theme"):
+            self.filter_panel.apply_theme(theme)
 
     def toggle_view_mode(self):
         if self.view_switch_btn.isChecked():
