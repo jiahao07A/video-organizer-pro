@@ -3,6 +3,12 @@
 .env.*
 !.env.example
 settings.json
+# 标签库/分析规则的本机运行时配置（含用户自定义组与预设，勿入库）
+tag_config.json
+
+# 尚未纳入版本库的本地文档草稿（需要发布时用 git add -f 显式加入）
+CONTEXT.md
+README.md
 
 # Runtime data and local state
 *.db
