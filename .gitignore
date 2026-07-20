@@ -1,0 +1,29 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+settings.json
+
+# Runtime data and local state
+*.db
+*.db-shm
+*.db-wal
+video_analysis_results.json
+video_analysis_results.csv
+backups/*
+!backups/obsolete_20260211/
+!backups/obsolete_20260211/*.py
+
+# Generated application artifacts
+.thumbnails/
+build/
+dist/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Local tooling and editor files
+.vscode/
+.idea/
+*.log
