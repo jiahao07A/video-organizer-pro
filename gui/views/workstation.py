@@ -2,10 +2,10 @@
 import os
 import sys
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, 
-    QLabel, QSplitter, QStackedWidget, QTableView, QListView, 
+    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
+    QLabel, QSplitter, QStackedWidget, QTableView, QListView,
     QHeaderView, QAbstractItemView, QProgressBar, QMessageBox, QMenu,
-    QDialog
+    QDialog, QFileDialog, QTreeView, QListView as QtListView,
 )
 from PySide6.QtCore import Qt, Signal, QItemSelectionModel
 from ..widgets.filter_panel import FilterPanel
@@ -21,7 +21,7 @@ from gui.styles import normalize_theme
 
 
 class WorkstationView(QWidget):
-    """工作台视图 - 核心视频处理区域"""
+    """工作台视图 - 核心视频处理区域（仅呈现当前工作范围）"""
     video_selected = Signal(dict) # 选中视频信号
     status_message = Signal(str)  # 状态栏消息信号
     progress_updated = Signal(int) # 进度值信号
@@ -32,6 +32,7 @@ class WorkstationView(QWidget):
         self.settings = service.settings
         self.worker = None
         self.setup_ui()
+        self._refresh_scope_path_ui()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -42,10 +43,17 @@ class WorkstationView(QWidget):
         toolbar = QHBoxLayout()
         
         self.path_input = QLineEdit()
-        self.path_input.setPlaceholderText("选择视频目录或文件...")
+        self.path_input.setReadOnly(True)
+        self.path_input.setPlaceholderText("尚未设定工作范围 — 请点「浏览」选择文件/文件夹")
+        self.path_input.setToolTip("当前工作范围路径（由「浏览」整份替换设定）")
         
         browse_btn = QPushButton("浏览")
+        browse_btn.setToolTip("多选文件与文件夹，确认为整份替换工作范围")
         browse_btn.clicked.connect(self.browse_path)
+
+        accumulate_btn = QPushButton("累加")
+        accumulate_btn.setToolTip("再选文件/文件夹，追加进当前工作范围")
+        accumulate_btn.clicked.connect(self.accumulate_path)
         
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索视频...")
@@ -72,6 +80,7 @@ class WorkstationView(QWidget):
         toolbar.addWidget(QLabel("路径:"))
         toolbar.addWidget(self.path_input)
         toolbar.addWidget(browse_btn)
+        toolbar.addWidget(accumulate_btn)
         toolbar.addSpacing(20)
         toolbar.addWidget(self.search_input)
         toolbar.addWidget(self.filter_btn)
@@ -212,6 +221,17 @@ class WorkstationView(QWidget):
         if hasattr(self, "filter_panel") and hasattr(self.filter_panel, "apply_theme"):
             self.filter_panel.apply_theme(theme)
 
+    def apply_default_view(self):
+        mode = self.settings.get("ui_preferences", {}).get("default_view", "list")
+        if mode == "card":
+            self.view_switch_btn.setChecked(True)
+            self.view_stack.setCurrentWidget(self.card_view)
+            self.view_switch_btn.setText("切换列表")
+        else:
+            self.view_switch_btn.setChecked(False)
+            self.view_stack.setCurrentIndex(0)
+            self.view_switch_btn.setText("切换视图")
+
     def toggle_view_mode(self):
         if self.view_switch_btn.isChecked():
             # 同步选择到卡片视图
@@ -236,15 +256,134 @@ class WorkstationView(QWidget):
     def apply_advanced_filter(self, params):
         self.proxy_model.set_filter_params(params)
 
+    def _collect_dialog_paths(self, dialog: QFileDialog) -> list:
+        """从非原生文件对话框收集多选路径（文件 + 文件夹）。"""
+        found = []
+        seen = set()
+
+        def add(p):
+            if not p:
+                return
+            key = os.path.normcase(os.path.abspath(p))
+            if key in seen:
+                return
+            seen.add(key)
+            found.append(os.path.abspath(p))
+
+        for p in dialog.selectedFiles():
+            add(p)
+
+        views = list(dialog.findChildren(QListView)) + list(dialog.findChildren(QTreeView))
+        for view in views:
+            model = view.model()
+            sm = view.selectionModel()
+            if model is None or sm is None:
+                continue
+            for idx in sm.selectedIndexes():
+                if idx.column() != 0:
+                    continue
+                path = None
+                if hasattr(model, "filePath"):
+                    try:
+                        path = model.filePath(idx)
+                    except Exception:
+                        path = None
+                if not path:
+                    data = model.data(idx, Qt.DisplayRole)
+                    # 回退：相对名不可靠，跳过
+                    if data and os.path.isabs(str(data)):
+                        path = str(data)
+                add(path)
+        return found
+
+    def _refresh_scope_path_ui(self):
+        """根据服务层工作范围刷新路径区摘要（多项显示数量 + tooltip 列表）。"""
+        paths = self.service.get_work_scope_paths()
+        if not paths:
+            self.path_input.setText("")
+            self.path_input.setPlaceholderText("尚未设定工作范围 — 请点「浏览」选择文件/文件夹")
+            self.path_input.setToolTip("当前无工作范围")
+            return
+        if len(paths) == 1:
+            self.path_input.setText(paths[0])
+        else:
+            self.path_input.setText(f"{len(paths)} 项已选")
+        self.path_input.setToolTip("\n".join(paths))
+
     def browse_path(self):
-        path = QFileDialog.getExistingDirectory(self, "选择视频目录")
-        if path:
-            self.path_input.setText(path)
+        """多选文件与文件夹，确认后整份替换工作范围并扫盘入库。"""
+        dialog = QFileDialog(self, "选择工作范围（可多选文件与文件夹，确认后整份替换）")
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        # Directory 模式 + 显示文件：便于一次多选文件夹；文件亦可选
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, False)
+        dialog.setNameFilters([
+            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v *.flv *.wmv)",
+            "所有文件 (*.*)",
+        ])
+        for view in dialog.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for view in dialog.findChildren(QtListView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = self._collect_dialog_paths(dialog)
+        if not selected:
+            return
+
+        result = self.service.replace_work_scope(selected, scan=True)
+        self._refresh_scope_path_ui()
+        self.load_data()
+        n_paths = len(result.get("paths") or [])
+        n_reg = len(result.get("registered") or [])
+        self.status_label.setText(
+            f"工作范围已替换为 {n_paths} 项；新入库未分析 {n_reg} 个"
+        )
+        self.status_message.emit(self.status_label.text())
+
+    def accumulate_path(self):
+        """多选路径并累加进当前工作范围。"""
+        dialog = QFileDialog(self, "累加到工作范围（可多选文件与文件夹）")
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, False)
+        dialog.setNameFilters([
+            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v *.flv *.wmv)",
+            "所有文件 (*.*)",
+        ])
+        for view in dialog.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for view in dialog.findChildren(QtListView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = self._collect_dialog_paths(dialog)
+        if not selected:
+            return
+
+        result = self.service.append_work_scope(selected, scan=True)
+        self._refresh_scope_path_ui()
+        self.load_data()
+        n_paths = len(result.get("paths") or [])
+        n_reg = len(result.get("registered") or [])
+        self.status_label.setText(
+            f"工作范围已累加，现共 {n_paths} 项；新入库未分析 {n_reg} 个"
+        )
+        self.status_message.emit(self.status_label.text())
 
     def load_data(self):
-        """从服务层加载数据"""
-        videos = self.service.get_all_videos()
+        """从服务层加载「工作范围内」的已入库视频；空范围显示空列表与提示。"""
+        scope = self.service.get_work_scope_paths()
+        videos = self.service.get_videos_in_work_scope()
         self.model.update_data(videos)
+        self._refresh_scope_path_ui()
+        if not scope:
+            self.status_label.setText("请先设定工作范围：点击「浏览」选择文件或文件夹")
+            self.status_message.emit(self.status_label.text())
+        else:
+            self.status_label.setText(f"工作范围内共 {len(videos)} 个已入库视频")
 
     def on_selection_changed(self, selected, deselected):
         if self.view_stack.currentWidget() == self.card_view:
@@ -391,37 +530,40 @@ class WorkstationView(QWidget):
         self.path_input.setEnabled(enabled)
 
     def start_analysis(self):
-        path = self.path_input.text().strip()
-        if not path or not os.path.exists(path):
-            QMessageBox.warning(self, "警告", "请输入有效的视频路径或文件夹。")
+        """分析当前工作范围内的视频（有勾选则仅勾选；未勾选则范围全部）。"""
+        scope = self.service.get_work_scope_paths()
+        if not scope:
+            QMessageBox.warning(self, "警告", "请先通过「浏览」设定工作范围。")
+            return
+
+        paths = self.service.resolve_operation_target_paths(list(self.model.checked_items) or None)
+        if not paths:
+            QMessageBox.warning(self, "警告", "工作范围内没有可分析的视频。")
             return
 
         self.set_ui_enabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        
-        self.worker = AnalysisWorker(self.service, path)
+
+        self.worker = AnalysisWorker(self.service, paths)
         self.worker.progress_updated.connect(self.update_status)
         self.worker.task_finished.connect(self.on_task_finished)
         self.worker.start()
 
     def start_rename(self, dry_run=True):
-        selected_paths = list(self.model.checked_items)
-        
-        # 获取选中的视频数据
-        all_videos = self.service.get_all_videos()
-        selected_videos = [v for v in all_videos if v.get("path") in selected_paths]
-        
-        if not selected_videos:
-            # 如果没勾选，则针对所有视频
-            selected_videos = all_videos
-            selected_paths = None
-
-        if not selected_videos:
-            QMessageBox.warning(self, "警告", "没有可重命名的视频。")
+        scope = self.service.get_work_scope_paths()
+        if not scope:
+            QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
 
-        # 弹出高级重命名对话框
+        checked = list(self.model.checked_items) or None
+        selected_paths = self.service.resolve_operation_target_paths(checked)
+        selected_videos = self.service.get_videos_for_operation(checked)
+
+        if not selected_videos:
+            QMessageBox.warning(self, "警告", "工作范围内没有可重命名的视频。")
+            return
+
         dialog = BatchRenameDialog(self.service, selected_videos, self)
         if dialog.exec() != QDialog.Accepted:
             return
@@ -457,25 +599,50 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "错误", "没有可回滚的记录。")
 
     def export_fcpx(self):
+        scope = self.service.get_work_scope_paths()
+        if not scope:
+            QMessageBox.warning(self, "警告", "请先设定工作范围。")
+            return
+        selected_paths = self.service.resolve_operation_target_paths(
+            list(self.model.checked_items) or None
+        )
+        if not selected_paths:
+            QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
+            return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出 FCPX XML", "", "FCPXML Files (*.fcpxml)")
         if file_path:
-            self.service.export_to_fcpx_xml(file_path)
+            self.service.export_to_fcpx_xml(file_path, selected_paths)
             QMessageBox.information(self, "成功", f"FCPX XML 已导出至: {file_path}")
 
     def export_ale(self):
-        selected_paths = list(self.model.checked_items)
+        scope = self.service.get_work_scope_paths()
+        if not scope:
+            QMessageBox.warning(self, "警告", "请先设定工作范围。")
+            return
+        selected_paths = self.service.resolve_operation_target_paths(
+            list(self.model.checked_items) or None
+        )
+        if not selected_paths:
+            QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
+            return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出 ALE (达芬奇)", "", "ALE Files (*.ale)")
         if file_path:
-            success = self.service.export_to_ale(file_path, selected_paths if selected_paths else None)
+            success = self.service.export_to_ale(file_path, selected_paths)
             if success:
                 QMessageBox.information(self, "成功", f"ALE 文件已导出至: {file_path}\n请在达芬奇中使用 'File -> Import -> Metadata from ALE...' 导入。")
             else:
                 QMessageBox.warning(self, "失败", "导出 ALE 文件失败。")
 
     def sync_metadata(self):
-        selected_paths = list(self.model.checked_items)
+        scope = self.service.get_work_scope_paths()
+        if not scope:
+            QMessageBox.warning(self, "警告", "请先设定工作范围。")
+            return
+        selected_paths = self.service.resolve_operation_target_paths(
+            list(self.model.checked_items) or None
+        )
         if not selected_paths:
-            QMessageBox.warning(self, "警告", "请先勾选需要同步元数据的视频。")
+            QMessageBox.warning(self, "警告", "工作范围内没有可同步的视频。")
             return
             
         count = self.service.sync_metadata_to_xmp(selected_paths)
@@ -483,16 +650,22 @@ class WorkstationView(QWidget):
 
     def start_auto_organize(self):
         """V4.0: 触发物理迁移自动整理"""
-        selected_paths = list(self.model.checked_items)
+        scope = self.service.get_work_scope_paths()
+        if not scope:
+            QMessageBox.warning(self, "警告", "请先设定工作范围。")
+            return
+        selected_paths = self.service.resolve_operation_target_paths(
+            list(self.model.checked_items) or None
+        )
         if not selected_paths:
-            QMessageBox.warning(self, "警告", "请先勾选需要整理的视频。")
+            QMessageBox.warning(self, "警告", "工作范围内没有可整理的视频。")
             return
             
         target_root = QFileDialog.getExistingDirectory(self, "选择整理后的目标根目录")
         if not target_root:
             return
             
-        reply = QMessageBox.question(self, "确认整理", f"确定要将选中的 {len(selected_paths)} 个文件移动到分类目录吗？\n目标: {target_root}",
+        reply = QMessageBox.question(self, "确认整理", f"确定要将 {len(selected_paths)} 个文件移动到分类目录吗？\n目标: {target_root}",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             count = self.service.execute_physical_migration(target_root, selected_paths)
@@ -511,4 +684,3 @@ class WorkstationView(QWidget):
             QMessageBox.information(self, "任务完成", message)
         else:
             QMessageBox.critical(self, "错误", message)
-from PySide6.QtWidgets import QFileDialog

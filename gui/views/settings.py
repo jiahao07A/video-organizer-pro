@@ -281,6 +281,33 @@ class SettingsView(QWidget):
         self.thumb_h_spin = QSpinBox()
         self.thumb_h_spin.setRange(45, 300)
         self.thumb_h_spin.setValue(SettingsManager.get_setting(self.settings, "ui_preferences.thumbnail_size", [160, 90])[1])
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("深色", "dark")
+        self.theme_combo.addItem("浅色", "light")
+        cur_theme = SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
+        idx = 0 if str(cur_theme).lower() in ("dark", "amber_gold") else 1
+        self.theme_combo.setCurrentIndex(idx)
+
+        self.default_view_combo = QComboBox()
+        self.default_view_combo.addItem("列表", "list")
+        self.default_view_combo.addItem("卡片", "card")
+        dv = SettingsManager.get_setting(self.settings, "ui_preferences.default_view", "list")
+        self.default_view_combo.setCurrentIndex(0 if dv != "card" else 1)
+
+        self.sidebar_spin = QSpinBox()
+        self.sidebar_spin.setRange(160, 360)
+        self.sidebar_spin.setValue(int(SettingsManager.get_setting(self.settings, "ui_preferences.sidebar_width", 220) or 220))
+
+        self.detail_expanded_cb = QCheckBox("详情面板默认展开")
+        self.detail_expanded_cb.setChecked(
+            bool(SettingsManager.get_setting(self.settings, "ui_preferences.detail_panel_expanded", True))
+        )
+
+        self.remember_scope_cb = QCheckBox("记住上次工作范围（启动时恢复）")
+        self.remember_scope_cb.setChecked(
+            bool(SettingsManager.get_setting(self.settings, "ui_preferences.remember_work_scope", False))
+        )
         
         layout.addRow("全局字体大小:", self.font_spin)
         
@@ -289,6 +316,11 @@ class SettingsView(QWidget):
         thumb_layout.addWidget(QLabel("x"))
         thumb_layout.addWidget(self.thumb_h_spin)
         layout.addRow("缩略图尺寸 (WxH):", thumb_layout)
+        layout.addRow("主题:", self.theme_combo)
+        layout.addRow("默认视图:", self.default_view_combo)
+        layout.addRow("侧边栏宽度:", self.sidebar_spin)
+        layout.addRow(self.detail_expanded_cb)
+        layout.addRow(self.remember_scope_cb)
         
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
@@ -314,7 +346,7 @@ class SettingsView(QWidget):
         pattern = SettingsManager.get_setting(self.settings, "rename_pattern", "{category}-{tags}-{summary}-{original_name}")
         self.filename_tmpl.setText(pattern)
         
-        vars_hint = QLabel("变量: {date}, {category}, {tags}, {summary}, {emotion}, {composition}, {original_name}")
+        vars_hint = QLabel("变量: {date}, {category}, {tags}, {summary}, {emotion}, {original_name}")
         vars_hint.setStyleSheet("color: #888; font-size: 11px;")
         
         rename_form.addRow("模式:", self.filename_tmpl)
@@ -381,6 +413,29 @@ class SettingsView(QWidget):
         # UI & Others
         SettingsManager.update_setting(self.settings, "ui_preferences.font_size", self.font_spin.value())
         SettingsManager.update_setting(self.settings, "ui_preferences.thumbnail_size", [self.thumb_w_spin.value(), self.thumb_h_spin.value()])
+        if hasattr(self, "theme_combo"):
+            SettingsManager.update_setting(
+                self.settings, "ui_preferences.theme", self.theme_combo.currentData() or "dark"
+            )
+        if hasattr(self, "default_view_combo"):
+            SettingsManager.update_setting(
+                self.settings, "ui_preferences.default_view", self.default_view_combo.currentData() or "list"
+            )
+        if hasattr(self, "sidebar_spin"):
+            SettingsManager.update_setting(
+                self.settings, "ui_preferences.sidebar_width", self.sidebar_spin.value()
+            )
+        if hasattr(self, "detail_expanded_cb"):
+            SettingsManager.update_setting(
+                self.settings, "ui_preferences.detail_panel_expanded", self.detail_expanded_cb.isChecked()
+            )
+        if hasattr(self, "remember_scope_cb"):
+            SettingsManager.update_setting(
+                self.settings, "ui_preferences.remember_work_scope", self.remember_scope_cb.isChecked()
+            )
+            # 立即按开关持久化或清空 last_work_scope 记录策略
+            if self.remember_scope_cb.isChecked():
+                self.service.persist_work_scope_if_enabled()
         
         # V6.0 Export Templates
         SettingsManager.update_setting(self.settings, "rename_pattern", self.filename_tmpl.text().strip())
@@ -393,7 +448,7 @@ class SettingsView(QWidget):
         
         try:
             SettingsManager.save_settings(self.settings, self.service.db)
-            QMessageBox.information(self, "成功", "设置已保存。部分视觉更新可能需要重启应用生效。")
+            QMessageBox.information(self, "成功", "设置已保存，界面偏好将尽量立即生效。")
             self.settings_applied.emit()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存设置失败: {e}")

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from PySide6.QtWidgets import QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QLineEdit, QCompleter
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
 from .flow_layout import FlowLayout
 
 class TagChip(QFrame):
@@ -12,7 +13,8 @@ class TagChip(QFrame):
         super().__init__(parent)
         self.text = text
         self.color = color
-        self.weight = weight or 0.5
+        # 标签权重已下线：统一视觉权重
+        self.weight = 1.0
         self.is_misspelled = is_misspelled
         self.icon = icon
         self.setObjectName("TagChip")
@@ -35,13 +37,12 @@ class TagChip(QFrame):
                 icon_label.setText(self.icon)
             layout.addWidget(icon_label)
 
-        # 根据权重调整字体大小 (0.0-1.0 -> 12-18px)
-        font_size = 12 + int(self.weight * 6)
-        # 根据权重调整边框粗细
-        border_width = 1 + int(self.weight * 2)
+        # 固定字号与边框（不再按权重变化）
+        font_size = 13
+        border_width = 1
 
         label = QLabel(self.text)
-        label.setStyleSheet(f"border: none; background: transparent; font-size: {font_size}px; font-weight: {'bold' if self.weight > 0.7 else 'normal'};")
+        label.setStyleSheet(f"border: none; background: transparent; font-size: {font_size}px; font-weight: normal;")
         
         # 如果拼写错误，文字变为红色或加下划线
         if self.is_misspelled:
@@ -68,23 +69,16 @@ class TagChip(QFrame):
         layout.addWidget(label)
         layout.addWidget(del_btn)
         
-        self.setFixedHeight(28 + int(self.weight * 4))
+        self.setFixedHeight(28)
         
         bg_color = self.color if self.color else "#2b2b2b"
         border_color = self.color if self.color else "#444"
-        
-        # 如果权重高，颜色加深或变亮
-        if self.weight > 0.8:
-            opacity = 1.0
-        else:
-            opacity = 0.6 + (self.weight * 0.4)
             
         self.setStyleSheet(f"""
             #TagChip {{
                 background-color: {bg_color};
                 border: {border_width}px solid {border_color};
                 border-radius: {self.height() // 2}px;
-                opacity: {opacity};
             }}
             #TagChip:hover {{
                 border-color: #3d5afe;
@@ -122,7 +116,7 @@ class TagFlowWidget(QWidget):
         self.main_layout.addLayout(input_layout)
 
     def set_tags(self, tags, colors=None, weights=None, misspelled_tags=None, icons=None):
-        """设置显示的标签列表，支持可选的颜色和权重字典"""
+        """设置显示的标签列表（weights 参数保留兼容，已忽略）。"""
         # 清空现有标签
         while self.flow_layout.count() > 0:
             item = self.flow_layout.takeAt(0)
@@ -131,17 +125,16 @@ class TagFlowWidget(QWidget):
         
         self.tags = []
         self.tag_colors = colors or {}
-        self.tag_weights = weights or {}
+        self.tag_weights = {}
         self.tag_icons = icons or {}
         self.misspelled_tags = misspelled_tags or []
         
         for tag in tags:
             if tag and tag not in self.tags:
                 color = self.tag_colors.get(tag)
-                weight = self.tag_weights.get(tag, 0.5)
                 is_misspelled = tag in self.misspelled_tags
                 icon = self.tag_icons.get(tag)
-                self.add_tag_chip(tag, color, weight, is_misspelled, icon)
+                self.add_tag_chip(tag, color, None, is_misspelled, icon)
         
     def add_tag_from_input(self):
         text = self.input_field.text().strip().replace("，", ",")
@@ -153,14 +146,12 @@ class TagFlowWidget(QWidget):
         for tag in new_tags:
             if tag not in self.tags:
                 color = self.tag_colors.get(tag)
-                weight = self.tag_weights.get(tag, 0.5)
                 icon = self.tag_icons.get(tag)
-                # 新输入的标签如果是拼写错误的也会标记
                 is_misspelled = False
                 if hasattr(self, "misspelled_tags"):
                      is_misspelled = tag in self.misspelled_tags
                 
-                self.add_tag_chip(tag, color, weight, is_misspelled, icon)
+                self.add_tag_chip(tag, color, None, is_misspelled, icon)
         
         self.input_field.clear()
         self.tags_changed.emit(self.tags)
@@ -175,7 +166,7 @@ class TagFlowWidget(QWidget):
         if text in self.tags:
             self.tags.remove(text)
             # 重新渲染所有标签以保持布局正确
-            self.set_tags(list(self.tags), self.tag_colors, self.tag_weights)
+            self.set_tags(list(self.tags), self.tag_colors)
             self.tags_changed.emit(self.tags)
 
     def set_completer(self, words):

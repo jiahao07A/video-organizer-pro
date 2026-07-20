@@ -74,18 +74,10 @@ class DetailPanel(QWidget):
         form_layout.addRow("分类:", self.category_input)
         form_layout.addRow("标签:", self.tags_widget)
         
-        # V4.0: 新增 AI 元数据字段
+        # V4.0: 情感氛围（构图/星级/代理已按 ADR-0002 移除）
         self.emotion_label = QLabel("-")
-        self.composition_label = QLabel("-")
-        self.rating_label = QLabel("-")
-        self.quality_label = QLabel("-")
-        self.proxy_suggest_cb = QCheckBox("建议代理")
-        self.proxy_suggest_cb.setEnabled(False)
         
         form_layout.addRow("情感氛围:", self.emotion_label)
-        form_layout.addRow("摄影构图:", self.composition_label)
-        form_layout.addRow("星级/质量:", self.rating_label)
-        form_layout.addRow("代理建议:", self.proxy_suggest_cb)
         
         form_layout.addRow("摘要:", self.summary_input)
         form_layout.addRow("转录:", self.transcript_input)
@@ -206,10 +198,7 @@ class DetailPanel(QWidget):
             if ok and item:
                 tag_name = item.split(" (")[0]
                 if tag_name not in self.tags_widget.tags:
-                    # 查找权重
-                    weight = next((r['weight'] for r in recs if r['tag'] == tag_name), 0.8)
-                    self.tags_widget.tag_weights[tag_name] = weight
-                    self.tags_widget.add_tag_chip(tag_name, weight=weight)
+                    self.tags_widget.add_tag_chip(tag_name)
                     self.tags_widget.tags_changed.emit(self.tags_widget.tags)
 
         self.worker.finished.connect(on_finished)
@@ -332,7 +321,7 @@ class DetailPanel(QWidget):
             except Exception:
                 misspelled_suggestions = {}
         
-        self.tags_widget.set_tags(tags, colors=colors, weights=video_data.get("tag_weights", {}), 
+        self.tags_widget.set_tags(tags, colors=colors,
                                  misspelled_tags=list(misspelled_suggestions.keys()),
                                  icons=icons)
         
@@ -349,24 +338,8 @@ class DetailPanel(QWidget):
         self.ai_rec_btn.setEnabled(True)
         self.storyboard_btn.setEnabled(True)
 
-        # V4.0: 展示新元数据
+        # 展示分析结果（瘦身后：分类/标签/摘要/情绪）
         self.emotion_label.setText(video_data.get("emotion") or "未分析")
-        self.composition_label.setText(video_data.get("composition") or "未分析")
-        
-        rating = video_data.get("rating")
-        score = video_data.get("quality_score")
-        
-        if rating is None or score is None:
-            self.rating_label.setText("未分析")
-        else:
-            # 确保 rating 是整数以用于字符串乘法
-            try:
-                rating_val = int(rating)
-                self.rating_label.setText(f"{'★' * rating_val}{'☆' * (5-rating_val)} ({float(score):.1f}分)")
-            except (ValueError, TypeError):
-                self.rating_label.setText("数据格式错误")
-                
-        self.proxy_suggest_cb.setChecked(bool(video_data.get("is_proxy_needed")))
         
         # 加载缩略图
         thumb_path = video_data.get("thumbnail_path") or video_data.get("thumbnail")

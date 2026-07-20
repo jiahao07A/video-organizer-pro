@@ -84,7 +84,12 @@ DEFAULT_SETTINGS = {
     "ui_preferences": {
         "font_size": 14,
         "thumbnail_size": [160, 90],
-        "theme": "amber_gold"
+        "theme": "dark",
+        "default_view": "list",
+        "sidebar_width": 220,
+        "detail_panel_expanded": True,
+        "remember_work_scope": False,
+        "last_work_scope": [],
     },
     "processing": {
         "max_workers": 4,
@@ -293,6 +298,7 @@ class DatabaseManager:
         tag_groups = video_data.get("tag_groups", {})
         tag_groups_str = json.dumps(tag_groups, ensure_ascii=False) if isinstance(tag_groups, dict) else tag_groups
         
+        # 已删字段硬清：写入空值，避免旧数据残留被读出
         query = """
             INSERT INTO videos (
                 path, filename, file_hash, phash, category, summary, tags,
@@ -340,20 +346,65 @@ class DatabaseManager:
             1 if video_data.get("metadata_injected") else 0,
             metadata_str,
             video_data.get("emotion"),
-            video_data.get("composition"),
-            video_data.get("rating", 0),
-            video_data.get("quality_score", 0.0),
-            1 if video_data.get("is_proxy_needed") else 0,
+            None,  # composition 硬删
+            0,  # rating
+            None,  # quality_score
+            0,  # is_proxy_needed
             video_data.get("proxy_path"),
             json.dumps(video_data.get("face_clusters", []), ensure_ascii=False),
             video_data.get("vector_id"),
             tag_groups_str,
-            json.dumps(video_data.get("tag_weights", {}), ensure_ascii=False)
+            json.dumps({}, ensure_ascii=False),  # tag_weights 硬删
         )
         self.execute_non_query(query, params)
 
     def delete_video(self, path: str):
         self.execute_non_query("DELETE FROM videos WHERE path = ?", (path,))
+
+    def get_video_by_path(self, path: str) -> Optional[Dict]:
+        """按路径取单条视频记录；不存在则返回 None。"""
+        rows = self.execute_query("SELECT * FROM videos WHERE path = ?", (path,))
+        if not rows:
+            return None
+        return self._row_to_video_dict(rows[0])
+
+    def _row_to_video_dict(self, row) -> Dict:
+        d = dict(row)
+        try:
+            d["tags"] = json.loads(d["tags"]) if d["tags"] else []
+        except Exception:
+            d["tags"] = d["tags"].split(",") if d["tags"] else []
+        try:
+            d["raw_metadata"] = json.loads(d["raw_metadata"]) if d["raw_metadata"] else {}
+        except Exception:
+            d["raw_metadata"] = {}
+        try:
+            d["face_clusters"] = json.loads(d["face_clusters"]) if d["face_clusters"] else []
+        except Exception:
+            d["face_clusters"] = []
+        try:
+            d["tag_groups"] = json.loads(d["tag_groups"]) if d["tag_groups"] else {}
+        except Exception:
+            d["tag_groups"] = {}
+        # 产品层不再暴露已删分析结果字段
+        d["composition"] = None
+        d["rating"] = 0
+        d["quality_score"] = None
+        d["is_proxy_needed"] = 0
+        d["tag_weights"] = {}
+        d["thumbnail_path"] = d["thumbnail"]
+        return d
+
+    def insert_video_if_absent(self, video_data: Dict) -> bool:
+        """仅当路径尚不在库时插入；已存在则不改写任何字段（含分析结果）。"""
+        path = video_data.get("path")
+        if not path:
+            return False
+        rows = self.execute_query("SELECT 1 FROM videos WHERE path = ? LIMIT 1", (path,))
+        if rows:
+            return False
+        self.upsert_video(video_data)
+        return True
 
     def get_all_videos(self) -> List[Dict]:
         rows = self.execute_query("SELECT * FROM videos ORDER BY timestamp DESC")
@@ -380,10 +431,12 @@ class DatabaseManager:
             except:
                 d["tag_groups"] = {}
 
-            try:
-                d["tag_weights"] = json.loads(d["tag_weights"]) if d["tag_weights"] else {}
-            except:
-                d["tag_weights"] = {}
+            # 硬删字段：读出时清空，避免 UI/导出继续依赖
+            d["composition"] = None
+            d["rating"] = 0
+            d["quality_score"] = None
+            d["is_proxy_needed"] = 0
+            d["tag_weights"] = {}
                 
             d["thumbnail_path"] = d["thumbnail"]
             processed_rows.append(d)
@@ -838,15 +891,11 @@ class AIHandler:
 
         tag_groups = (self.tag_config or {}).get("tag_groups", [])
         dimension_rules = []
+        # ADR-0002：分析结果只保留分类/摘要/情绪/标签，不再要求评分类字段
         expected_json_structure = {
             "category": f"从 {categories_list} 中选择一个最合适的视频大类",
             "summary": "50字以内的核心内容摘要",
             "emotion": "识别视频的情感基调",
-            "composition": "识别摄影构图",
-            "rating": "1-5 整数评分",
-            "quality_score": "0.0-10.0 质量评分",
-            "is_proxy_needed": "true/false, 画面是否复杂需要代理",
-            "tag_weights": {"标签名": "0.0-1.0 的相关度权重"},
         }
 
         for i, group in enumerate(tag_groups, 1):
@@ -900,7 +949,7 @@ class AIHandler:
 1. 结果必须是合法 JSON 格式，不要包含 Markdown 代码块标记（除非接口要求）。
 2. 对于禁止新增标签的组，若库中无完全匹配项，请选择语意最接近的一个。
 3. 摘要需客观描述画面，避免主观臆断。
-4. **务必为生成的每个标签提供 0.0-1.0 的权重 (tag_weights)**。
+4. 不要输出构图、星级、质量分、代理建议或标签权重等字段。
 """
         return {
             "system_prompt": system_prompt,
@@ -1274,11 +1323,77 @@ class FileManager:
                     index[f"suffix_{f.split('-')[-1]}"] = os.path.join(root, f)
         return index
 
+# 工作范围：视频扩展名（与 FileManager.scan_videos 保持一致）
+WORK_SCOPE_VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.flv', '.wmv')
+
+
+def normalize_work_path(path: str) -> str:
+    """规范化路径用于比较与去重（绝对路径 + 系统大小写规则）。"""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def is_video_path_in_scope(video_path: str, scope_paths: List[str]) -> bool:
+    """
+    判定视频路径是否属于工作范围。
+    - 范围项为文件：精确匹配
+    - 范围项为文件夹：视频位于其下（含任意层子目录）
+    - 范围项尚不存在时：按「无扩展名 / 像目录」视为文件夹前缀，否则视为文件精确匹配
+    """
+    if not video_path or not scope_paths:
+        return False
+    vp = normalize_work_path(video_path)
+    for raw in scope_paths:
+        if not raw:
+            continue
+        sp = normalize_work_path(raw)
+        if os.path.isfile(raw):
+            if vp == sp:
+                return True
+            continue
+        if os.path.isdir(raw):
+            if vp == sp or vp.startswith(sp + os.sep):
+                return True
+            continue
+        # 路径当前不存在：有视频扩展名则按文件，否则按文件夹前缀
+        _, ext = os.path.splitext(raw)
+        if ext.lower() in WORK_SCOPE_VIDEO_EXTENSIONS:
+            if vp == sp:
+                return True
+        else:
+            if vp == sp or vp.startswith(sp + os.sep):
+                return True
+    return False
+
+
+def dedupe_scope_paths(paths: List[str]) -> List[str]:
+    """去重并规范化工作范围路径列表，保留首次出现顺序与可显示的绝对路径。"""
+    seen: Set[str] = set()
+    result: List[str] = []
+    for p in paths or []:
+        if not p or not str(p).strip():
+            continue
+        abs_p = os.path.abspath(str(p).strip())
+        key = os.path.normcase(abs_p)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(abs_p)
+    return result
+
+
 class VideoOrganizerService:
     """Core Service Layer: 处理所有业务逻辑"""
     
-    def __init__(self, settings: Optional[Dict] = None, on_log: Optional[Callable[[str], None]] = None, on_progress: Optional[Callable[[int, int], None]] = None):
-        self.db = DatabaseManager()
+    def __init__(
+        self,
+        settings: Optional[Dict] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        db_path: Optional[str] = None,
+        results_json: Optional[str] = None,
+        results_csv: Optional[str] = None,
+    ):
+        self.db = DatabaseManager(db_path) if db_path else DatabaseManager()
         self.settings = settings or SettingsManager.load_settings(self.db)
         self.tag_config = self.load_tag_config()
         self.on_log = on_log or (lambda m: print(m))
@@ -1286,11 +1401,176 @@ class VideoOrganizerService:
         self.processor = VideoProcessor()
         self.ai = AIHandler(self.settings, self.db, self.tag_config)
         self.tag_processor = TagProcessor(self.settings, self.db)
-        self.file_manager = FileManager(self.db, RESULTS_FILE_JSON, RESULTS_FILE_CSV)
+        json_path = results_json if results_json is not None else RESULTS_FILE_JSON
+        csv_path = results_csv if results_csv is not None else RESULTS_FILE_CSV
+        self.file_manager = FileManager(self.db, json_path, csv_path)
         
         # V4.0: L1 内存缓存 (三级缓存架构之一)
         self._memory_cache = {}
         self._cache_lock = threading.Lock()
+        # 工作范围：当前工作台呈现与处理的路径集合（文件 + 文件夹）
+        self._work_scope_paths: List[str] = []
+
+    # --- 工作范围 (Work Scope) ---
+
+    def get_work_scope_paths(self) -> List[str]:
+        """返回当前工作范围路径列表（副本）。"""
+        return list(self._work_scope_paths)
+
+    def set_work_scope_paths(self, paths: List[str], *, scan: bool = True) -> Dict[str, Any]:
+        """
+        整份替换工作范围。
+        scan=True 时扫描范围内视频并入库：新文件登记为未分析(pending)，已存在不覆盖分析结果。
+        """
+        self._work_scope_paths = dedupe_scope_paths(paths)
+        registered: List[str] = []
+        if scan:
+            registered = self.scan_and_register_work_scope()
+        self.persist_work_scope_if_enabled()
+        return {
+            "paths": list(self._work_scope_paths),
+            "registered": registered,
+        }
+
+    def replace_work_scope(self, paths: List[str], *, scan: bool = True) -> Dict[str, Any]:
+        """set_work_scope_paths 的别名（语义：浏览确认 = 整份替换）。"""
+        return self.set_work_scope_paths(paths, scan=scan)
+
+    def append_work_scope(self, paths: List[str], *, scan: bool = True) -> Dict[str, Any]:
+        """累加路径到当前工作范围（去重），可选扫盘入库。"""
+        combined = list(self._work_scope_paths) + list(paths or [])
+        return self.set_work_scope_paths(combined, scan=scan)
+
+    def is_path_in_work_scope(self, video_path: str) -> bool:
+        """视频路径是否落在当前工作范围内。"""
+        return is_video_path_in_scope(video_path, self._work_scope_paths)
+
+    def resolve_operation_target_paths(
+        self, checked_paths: Optional[List[str]] = None
+    ) -> List[str]:
+        """
+        解析工作台批量操作目标路径。
+        - 工作范围为空 → []
+        - 有勾选 → 勾选 ∩ 工作范围
+        - 无勾选 → 工作范围内全部已入库路径
+        绝不回退到全库。
+        """
+        if not self._work_scope_paths:
+            return []
+        in_scope = self.get_videos_in_work_scope()
+        scope_paths = [v.get("path") for v in in_scope if v.get("path")]
+        if not checked_paths:
+            return list(scope_paths)
+        scope_norm = {normalize_work_path(p) for p in scope_paths}
+        out: List[str] = []
+        seen = set()
+        for p in checked_paths:
+            if not p:
+                continue
+            np = normalize_work_path(p)
+            if np in scope_norm and np not in seen:
+                # 用库内原始 path 字符串
+                for sp in scope_paths:
+                    if normalize_work_path(sp) == np:
+                        out.append(sp)
+                        seen.add(np)
+                        break
+        return out
+
+    def get_videos_for_operation(
+        self, checked_paths: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """工作台操作目标视频记录（⊆ 工作范围）。"""
+        targets = set(normalize_work_path(p) for p in self.resolve_operation_target_paths(checked_paths))
+        if not targets:
+            return []
+        return [
+            v
+            for v in self.get_videos_in_work_scope()
+            if normalize_work_path(v.get("path", "")) in targets
+        ]
+
+    def persist_work_scope_if_enabled(self) -> None:
+        """若开启「记住上次工作范围」，把当前路径写入 settings。"""
+        prefs = self.settings.setdefault("ui_preferences", {})
+        if not prefs.get("remember_work_scope"):
+            return
+        prefs["last_work_scope"] = list(self._work_scope_paths)
+        try:
+            SettingsManager.save_settings(self.settings, self.db)
+        except Exception as e:
+            logger.warning(f"保存工作范围失败: {e}")
+
+    def restore_work_scope_if_enabled(self) -> bool:
+        """启动时若开启记住范围则恢复；成功返回 True。"""
+        prefs = self.settings.get("ui_preferences", {}) or {}
+        if not prefs.get("remember_work_scope"):
+            return False
+        paths = prefs.get("last_work_scope") or []
+        if not paths:
+            return False
+        self.set_work_scope_paths(list(paths), scan=True)
+        return True
+
+    def scan_and_register_work_scope(self) -> List[str]:
+        """
+        扫描当前工作范围内的视频文件并入库。
+        - 尚不在库：登记为 status=pending（未分析）
+        - 已在库：保留既有分析结果，不覆盖
+        返回本次新登记的路径列表。
+        """
+        registered: List[str] = []
+        if not self._work_scope_paths:
+            return registered
+
+        for scope_path in self._work_scope_paths:
+            try:
+                found = self.file_manager.scan_videos(scope_path)
+            except Exception as e:
+                logger.warning(f"扫描工作范围失败 {scope_path}: {e}")
+                continue
+            for video_path in found:
+                abs_path = os.path.abspath(video_path)
+                record = {
+                    "path": abs_path,
+                    "filename": os.path.basename(abs_path),
+                    "status": "pending",
+                    "tags": [],
+                    "category": None,
+                    "summary": None,
+                    "emotion": None,
+                    "tag_groups": {},
+                }
+                if self.db.insert_video_if_absent(record):
+                    registered.append(abs_path)
+                    with self._cache_lock:
+                        if self._memory_cache is not None:
+                            # 仅在缓存已预热时追加，避免半缓存状态
+                            if self._memory_cache:
+                                self._memory_cache[abs_path] = {
+                                    **record,
+                                    "thumbnail_path": None,
+                                    "thumbnail": None,
+                                }
+
+        if registered:
+            # 新入库后让下次 get_all_videos 从 DB 刷新完整记录
+            with self._cache_lock:
+                self._memory_cache = {}
+            self.log(f"工作范围扫盘：新登记 {len(registered)} 个未分析视频。")
+        return registered
+
+    def get_videos_in_work_scope(self) -> List[Dict]:
+        """已入库且属于当前工作范围的视频；空范围返回空列表。"""
+        if not self._work_scope_paths:
+            return []
+        videos = self.get_all_videos()
+        return [v for v in videos if self.is_path_in_work_scope(v.get("path", ""))]
+
+    def clear_work_scope(self) -> None:
+        """清空工作范围（不删库内记录）。"""
+        self._work_scope_paths = []
+        self.persist_work_scope_if_enabled()
 
     # --- 备份与恢复 (V6.0) ---
     def backup_configuration(self) -> str:
@@ -1729,14 +2009,9 @@ class VideoOrganizerService:
                 "thumbnail_path": thumbnail_path,
                 "raw_metadata": ai_data,
                 "emotion": ai_data.get("emotion"),
-                "composition": ai_data.get("composition"),
-                "rating": ai_data.get("rating", 0),
-                "quality_score": ai_data.get("quality_score", 0.0),
-                "is_proxy_needed": ai_data.get("is_proxy_needed", False),
                 "face_clusters": ai_data.get("characters", []),
                 "vector_id": ai_data.get("vector_id"),
                 "tag_groups": tag_groups,
-                "tag_weights": ai_data.get("tag_weights", {})
             }
         except Exception as e:
             self.log(f"处理失败 {video_path}: {e}")
@@ -1796,7 +2071,6 @@ class VideoOrganizerService:
             
             # V4.0: 增强型智能重命名 (V2)
             emotion = item.get("emotion") or ""
-            composition = item.get("composition") or ""
             
             # V6.0: 优先级：custom_pattern > 全局设置 > 默认设置
             pattern = custom_pattern
@@ -1813,11 +2087,12 @@ class VideoOrganizerService:
             # V6.0: 新增日期变量
             current_date = datetime.now().strftime("%Y%m%d")
 
+            # {composition} 已下线：替换为空，避免旧模板残留脏值
             new_fn = pattern.replace("{category}", str(category))\
                             .replace("{tags}", str(tags_str))\
                             .replace("{summary}", str(summary_safe))\
                             .replace("{emotion}", str(emotion))\
-                            .replace("{composition}", str(composition))\
+                            .replace("{composition}", "")\
                             .replace("{date}", current_date)\
                             .replace("{original_name}", str(original_suffix))
             
@@ -1914,9 +2189,12 @@ class VideoOrganizerService:
         self.log(f"回滚完成，还原了 {count} 个文件。")
         return True
 
-    def export_to_fcpx_xml(self, output_path: str):
-        """导出 FCPX XML"""
+    def export_to_fcpx_xml(self, output_path: str, selected_paths: Optional[List[str]] = None):
+        """导出 FCPX XML；selected_paths 限定导出集合（None 表示调用方已筛好则应显式传入）。"""
         videos = self.db.get_all_videos()
+        if selected_paths is not None:
+            allow = {normalize_work_path(p) for p in selected_paths}
+            videos = [v for v in videos if normalize_work_path(v.get("path", "")) in allow]
         xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
 <fcpxml version="1.8">
@@ -1965,7 +2243,7 @@ class VideoOrganizerService:
             "FPS\t25", # 默认为 25，实际导入时达芬奇会根据文件名匹配
             "",
             "Column",
-            "Name\tDescription\tKeywords\tRating\tCategory\tEmotion\tComposition\tSummary"
+            "Name\tDescription\tKeywords\tCategory\tEmotion\tSummary"
         ]
         
         lines.append("Data")
@@ -1975,14 +2253,12 @@ class VideoOrganizerService:
             description = item.get("summary", "").replace("\t", " ").replace("\n", " ")
             tags = item.get("tags", [])
             keywords = ", ".join(tags)
-            rating = str(item.get("rating", 0))
             category = item.get("category", "")
             emotion = item.get("emotion", "")
-            composition = item.get("composition", "")
-            summary = description # 重复一遍以防字段映射不同
+            summary = description  # 重复一遍以防字段映射不同
             
-            # 使用制表符分隔
-            row = f"{name}\t{description}\t{keywords}\t{rating}\t{category}\t{emotion}\t{composition}\t{summary}"
+            # 使用制表符分隔（已去掉 Rating / Composition）
+            row = f"{name}\t{description}\t{keywords}\t{category}\t{emotion}\t{summary}"
             lines.append(row)
             
         try:
@@ -2049,7 +2325,6 @@ class VideoOrganizerService:
             xmp_path = os.path.splitext(video_path)[0] + ".xmp"
             tags = item.get("tags", [])
             summary = escape(item.get("summary", ""))
-            rating = item.get("rating", 0)
             category = item.get("category", "")
             
             c1_mood = ""
@@ -2148,7 +2423,6 @@ class VideoOrganizerService:
     xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
     xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
     xmlns:stDim="http://ns.adobe.com/xmp/sType/Dimensions#">
-   <xmp:Rating>{rating}</xmp:Rating>
    <xmp:Label>{c1_mood}</xmp:Label>
    <dc:description>
     <rdf:Alt>

@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from .views.workstation import WorkstationView
+from .views.material_library import MaterialLibraryView
 from .views.tags_library import TagsView
 from .views.settings import SettingsView
 from .styles import get_main_style, normalize_theme
@@ -20,61 +21,69 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Video Organizer Pro (PySide6)")
         self.resize(1400, 900)
 
+        # 启动时恢复工作范围（若开启记住）
+        try:
+            self.service.restore_work_scope_if_enabled()
+        except Exception:
+            pass
+
         self.setup_ui()
         self.refresh_style()
+        self.apply_sidebar_width()
         
     def refresh_style(self):
         """刷新主窗 QSS，并广播主题到已创建的子视图。"""
         font_size = SettingsManager.get_setting(self.settings, "ui_preferences.font_size", 14)
         raw_theme = SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
         theme = normalize_theme(raw_theme)
-        # 写回规范值，避免 amber_gold 等历史值导致各处映射不一致
         if raw_theme != theme:
             SettingsManager.update_setting(self.settings, "ui_preferences.theme", theme)
             SettingsManager.save_settings(self.settings)
         self.setStyleSheet(get_main_style(font_size, theme))
         self._propagate_theme(theme)
+        self.apply_sidebar_width()
+
+    def apply_sidebar_width(self):
+        w = int(SettingsManager.get_setting(self.settings, "ui_preferences.sidebar_width", 220) or 220)
+        w = max(160, min(360, w))
+        if hasattr(self, "sidebar_container"):
+            self.sidebar_container.setFixedWidth(w)
 
     def _propagate_theme(self, theme: str):
-        """主题变更汇合点：子视图即时 apply，无需重启。"""
         theme = normalize_theme(theme)
-        if hasattr(self, "workstation_page") and hasattr(self.workstation_page, "apply_theme"):
-            self.workstation_page.apply_theme(theme)
-        if hasattr(self, "tags_page") and hasattr(self.tags_page, "apply_theme"):
-            self.tags_page.apply_theme(theme)
+        for page_name in ("workstation_page", "library_page", "tags_page"):
+            page = getattr(self, page_name, None)
+            if page is not None and hasattr(page, "apply_theme"):
+                page.apply_theme(theme)
 
     def setup_ui(self):
-        """初始化主界面布局"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # 主布局：水平排列（侧边栏 + 内容区）
         self.main_layout = QHBoxLayout(central_widget)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
-        # 1. 侧边栏
         self.sidebar_container = QFrame()
         self.sidebar_container.setObjectName("sidebar")
         self.sidebar_container.setFixedWidth(220)
         sidebar_layout = QVBoxLayout(self.sidebar_container)
         sidebar_layout.setContentsMargins(10, 20, 10, 20)
 
-        # 侧边栏标题
         title_label = QLabel("VIDEO ORGANIZER")
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setStyleSheet("font-weight: bold; font-size: 16px; margin-bottom: 20px;")
         sidebar_layout.addWidget(title_label)
 
-        # 导航列表
         self.nav_list = QListWidget()
         self.nav_list.setFrameShape(QFrame.NoFrame)
         
-        # 带有图标的导航项
+        # 0 工作台 / 1 素材库 / 2 标签库 / 3 系统设置
         nav_items = [
             ("📂 工作台", 0),
-            ("🏷️ 标签库", 1),
-            ("⚙️ 系统设置", 2)
+            ("📚 素材库", 1),
+            ("🏷️ 标签库", 2),
+            ("⚙️ 系统设置", 3),
         ]
         for text, _ in nav_items:
             item = QListWidgetItem(text)
@@ -86,7 +95,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.nav_list)
         sidebar_layout.addStretch()
 
-        # 处理方案切换 (V6.0)
         preset_layout = QVBoxLayout()
         preset_label = QLabel("🎬 导出方案预设:")
         preset_label.setStyleSheet("font-size: 12px; color: #888;")
@@ -98,7 +106,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.addLayout(preset_layout)
         sidebar_layout.addSpacing(20)
 
-        # 侧边栏底部：主题切换与备份
         footer_layout = QVBoxLayout()
         
         self.theme_btn = QPushButton("🌓 切换主题")
@@ -113,45 +120,47 @@ class MainWindow(QMainWindow):
 
         self.main_layout.addWidget(self.sidebar_container)
 
-        # 2. 右侧内容容器 (堆栈窗口)
         self.content_stack = QStackedWidget()
         self.content_stack.setContentsMargins(0, 0, 0, 0)
         
-        # 实例化子页面
         self.workstation_page = WorkstationView(self.service)
+        self.library_page = MaterialLibraryView(self.service)
         self.tags_page = TagsView(self.service)
         self.settings_page = SettingsView(self.service)
         
-        # 信号联动
         self.settings_page.settings_applied.connect(self.on_settings_applied)
+        self.library_page.work_scope_changed.connect(self.workstation_page.load_data)
         
-        # 添加到堆栈
         self.content_stack.addWidget(self.workstation_page)
+        self.content_stack.addWidget(self.library_page)
         self.content_stack.addWidget(self.tags_page)
         self.content_stack.addWidget(self.settings_page)
         
         self.main_layout.addWidget(self.content_stack)
 
-        # 3. 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("准备就绪")
         
-        # 全局进度条
         self.global_progress = QProgressBar()
         self.global_progress.setMaximumWidth(200)
         self.global_progress.setVisible(False)
         self.status_bar.addPermanentWidget(self.global_progress)
 
-        # 信号联动
         self.workstation_page.status_message.connect(self.status_bar.showMessage)
         self.workstation_page.progress_updated.connect(self.update_global_progress)
+        self.library_page.status_message.connect(self.status_bar.showMessage)
 
-        # 初始化数据加载
         self.workstation_page.load_data()
+        self.workstation_page.apply_default_view()
+        self.library_page.apply_default_view()
+        expanded = SettingsManager.get_setting(
+            self.settings, "ui_preferences.detail_panel_expanded", True
+        )
+        self.workstation_page.detail_panel.setVisible(bool(expanded))
+        self.library_page.detail_panel.setVisible(bool(expanded))
 
     def refresh_presets(self):
-        """从配置加载预设列表"""
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
         
@@ -159,14 +168,12 @@ class MainWindow(QMainWindow):
         presets = global_settings.get("presets", {})
         
         if not presets:
-            # 默认预设
             presets = {"默认方案": global_settings.get("export_schemes", {})}
             global_settings["presets"] = presets
             self.service.save_tag_config(self.service.tag_config)
             
         self.preset_combo.addItems(list(presets.keys()))
         
-        # 选中当前匹配项 (如果可能)
         current_scheme = global_settings.get("export_schemes", {})
         for name, scheme in presets.items():
             if scheme == current_scheme:
@@ -176,17 +183,16 @@ class MainWindow(QMainWindow):
         self.preset_combo.blockSignals(False)
 
     def on_preset_changed(self, preset_name):
-        """处理预设切换"""
         if self.service.switch_preset(preset_name):
             self.status_bar.showMessage(f"已切换导出方案: {preset_name}", 3000)
-            # 通知子页面刷新 (如有必要)
             self.on_settings_applied()
 
     def switch_page(self, index):
-        """切换视图页面"""
         self.content_stack.setCurrentIndex(index)
         if index == 0:
             self.workstation_page.load_data()
+        elif index == 1:
+            self.library_page.load_data()
 
     def update_global_progress(self, value):
         if value < 0:
@@ -194,18 +200,30 @@ class MainWindow(QMainWindow):
         else:
             self.global_progress.setVisible(True)
             if value == 0:
-                self.global_progress.setRange(0, 0) # 繁忙状态
+                self.global_progress.setRange(0, 0)
             else:
                 self.global_progress.setRange(0, 100)
                 self.global_progress.setValue(value)
 
     def on_settings_applied(self):
-        """当设置被应用时"""
         self.refresh_style()
-        self.workstation_page.detail_panel.refresh_tag_completer()
+        if hasattr(self.workstation_page, "detail_panel"):
+            self.workstation_page.detail_panel.refresh_tag_completer()
+        if hasattr(self.library_page, "detail_panel"):
+            self.library_page.detail_panel.refresh_tag_completer()
+        if hasattr(self.workstation_page, "apply_default_view"):
+            self.workstation_page.apply_default_view()
+        if hasattr(self.library_page, "apply_default_view"):
+            self.library_page.apply_default_view()
+        # 详情默认展开/收起
+        expanded = SettingsManager.get_setting(
+            self.settings, "ui_preferences.detail_panel_expanded", True
+        )
+        for page in (self.workstation_page, self.library_page):
+            if hasattr(page, "detail_panel"):
+                page.detail_panel.setVisible(bool(expanded))
 
     def toggle_theme(self):
-        """切换深色/浅色模式"""
         current_theme = normalize_theme(
             SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
         )
@@ -215,8 +233,6 @@ class MainWindow(QMainWindow):
         self.refresh_style()
 
     def run_backup(self):
-        """执行配置备份"""
-        from PySide6.QtWidgets import QMessageBox
         path = self.service.backup_configuration()
         if path:
             QMessageBox.information(self, "备份成功", f"配置已成功备份至：\n{path}")
