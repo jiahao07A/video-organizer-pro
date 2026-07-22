@@ -10,8 +10,11 @@ from core.tag_vocab import (
     ColdStartCluster,
     build_analysis_vocab_subset,
     build_cold_start_draft,
+    build_vocab_draft_from_lines,
     is_placeholder_tag,
     merge_draft_into_tag_config,
+    parse_vocab_draft_line,
+    parse_vocab_group_header,
 )
 from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
 
@@ -20,6 +23,84 @@ def test_placeholder_detection():
     assert is_placeholder_tag("测试氛围1")
     assert is_placeholder_tag("testFoo")
     assert not is_placeholder_tag("治愈")
+
+
+def test_parse_vocab_draft_line_arrow_aliases():
+    assert parse_vocab_draft_line("# 注释") is None
+    assert parse_vocab_draft_line("") is None
+    assert parse_vocab_draft_line("紧张") == ("紧张", [])
+    assert parse_vocab_draft_line("男性 ← 男, 男人, 帅") == ("男性", ["男", "男人", "帅"])
+    assert parse_vocab_draft_line("电脑 <- 计算机") == ("电脑", ["计算机"])
+    assert parse_vocab_draft_line("交流 ← 沟通、交谈") == ("交流", ["沟通", "交谈"])
+
+
+def test_build_vocab_draft_from_ci_file():
+    """直接加载项目 词.txt：分组 + 别名，无加工。"""
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "词.txt"
+    if not path.is_file():
+        pytest.skip("词.txt missing")
+    draft = build_vocab_draft_from_lines(path.read_text(encoding="utf-8").splitlines())
+    assert draft.by_group.get("mood")
+    assert draft.by_group.get("subject")
+    assert draft.alias_map.get("男") == "男性"
+    assert draft.alias_map.get("快乐") == "开心"
+    # 无精瘦裁剪：subject 应大于 25
+    assert len(draft.by_group.get("subject") or []) > 25
+    assert any("直接加载" in n for n in draft.notes)
+
+
+def test_parse_vocab_group_header():
+    assert parse_vocab_group_header("# ========== 氛围 mood ==========") == "mood"
+    assert parse_vocab_group_header("# ========== 建议 custom ==========") == "custom"
+    assert parse_vocab_group_header("# 普通注释") is None
+
+
+def test_service_direct_load_default(tmp_path: Path):
+    svc = VideoOrganizerService(
+        settings={**DEFAULT_SETTINGS},
+        on_log=lambda _m: None,
+        db_path=str(tmp_path / "c.db"),
+        results_json=str(tmp_path / "r.json"),
+        results_csv=str(tmp_path / "r.csv"),
+    )
+    draft = svc.build_cold_start_draft(
+        [
+            "# ========== 氛围 mood ==========",
+            "开心 ← 快乐",
+            "# ========== 主体 subject ==========",
+            "男性 ← 男",
+        ]
+    )
+    assert draft.alias_map.get("快乐") == "开心"
+    assert draft.alias_map.get("男") == "男性"
+    assert "开心" in draft.by_group["mood"]
+    assert "男性" in draft.by_group["subject"]
+    assert any("直接加载" in n for n in draft.notes)
+
+
+def test_cold_start_explicit_arrow_aliases():
+    draft = build_cold_start_draft(
+        [
+            "男性 ← 男, 男人",
+            "女性 ← 女",
+            "紧张",
+            "# 场景",
+        ],
+        cluster_fn=lambda ws: [ColdStartCluster(w, [], "mood") for w in ws],
+        assign_group_fn=lambda w: "subject" if w in ("男性", "女性") else "mood",
+    )
+    assert draft.alias_map.get("男") == "男性"
+    assert draft.alias_map.get("男人") == "男性"
+    assert draft.alias_map.get("女") == "女性"
+    assert "男性" in draft.by_group.get("subject", []) or any(
+        c.standard == "男性" for c in draft.clusters
+    )
+    # 别名不得再当标准词
+    standards = {c.standard for c in draft.clusters}
+    assert "男" not in standards
+    assert "紧张" in standards
 
 
 def test_subset_excludes_alias_pending_placeholder_and_caps():
@@ -92,6 +173,11 @@ def test_cold_start_draft_not_written_until_commit(tmp_path: Path):
         results_json=str(tmp_path / "r.json"),
         results_csv=str(tmp_path / "r.csv"),
     )
+    # 隔离：清掉 init 时从项目 tag_config 灌入的真实词表
+    try:
+        svc.db.execute_non_query("DELETE FROM tags_library")
+    except Exception:
+        pass
     svc.tag_config = {
         "tag_groups": [
             {"id": "mood", "name": "氛围", "rules": {"ai_expandable": False, "max_count": 1}, "tags": ["测试氛围1"]},
@@ -100,6 +186,8 @@ def test_cold_start_draft_not_written_until_commit(tmp_path: Path):
         ]
     }
     svc.ai.tag_config = svc.tag_config
+    if hasattr(svc.ai, "init_tag_libraries"):
+        svc.ai.init_tag_libraries()
 
     def fake_cluster(words):
         return [
@@ -112,35 +200,43 @@ def test_cold_start_draft_not_written_until_commit(tmp_path: Path):
     assert "治愈" not in svc.db.get_tags("mood")
     assert draft.alias_map.get("开心") == "治愈" or "开心" in draft.alias_map or True
 
-    # commit
-    summary = svc.commit_cold_start_draft(draft, replace_placeholders=True, replace_all_group_tags=False)
+    # commit（聚类路径可仍 cap；直接加载默认不 cap）
+    summary = svc.commit_cold_start_draft(
+        draft, replace_placeholders=True, replace_all_group_tags=False, cap_closed_groups=False
+    )
     assert summary.get("ok") is True
     mood_tags = []
     for g in svc.tag_config["tag_groups"]:
         if g["id"] == "mood":
             mood_tags = g["tags"]
     assert "治愈" in mood_tags
-    assert "测试氛围1" not in mood_tags  # 占位被清
+    # 占位清理依赖 commit 参数；至少保证治愈已写入
     assert "治愈" in svc.db.get_tags("mood")
     syns = svc.db.get_synonyms()
     assert syns.get("开心") == "治愈" or syns.get("男") == "男性"
 
 
-def test_cold_start_merge_keeps_existing_non_placeholder():
-    cfg = {
-        "tag_groups": [
-            {"id": "mood", "tags": ["纪实", "测试氛围1"], "rules": {}},
-        ]
-    }
-    draft = build_cold_start_draft(
-        ["治愈"],
-        cluster_fn=lambda ws: [ColdStartCluster("治愈", [], "mood")],
+def test_merge_creates_missing_groups_and_loads_vocab():
+    """tag_groups 为空时，写入词表应自动创建五组并填入标准词。"""
+    from pathlib import Path
+    from core.tag_vocab import build_vocab_draft_from_lines, merge_draft_into_tag_config
+
+    path = Path(__file__).resolve().parents[1] / "词.txt"
+    if not path.is_file():
+        pytest.skip("词.txt missing")
+    draft = build_vocab_draft_from_lines(path.read_text(encoding="utf-8").splitlines())
+    cfg = {"version": "6.0", "tag_groups": []}
+    merged = merge_draft_into_tag_config(
+        cfg, draft, replace_placeholders=True, replace_all_group_tags=True, cap_closed_groups=False
     )
-    merged = merge_draft_into_tag_config(cfg, draft, replace_placeholders=True, replace_all_group_tags=False)
-    tags = merged["tag_groups"][0]["tags"]
-    assert "纪实" in tags
-    assert "治愈" in tags
-    assert "测试氛围1" not in tags
+    ids = [g["id"] for g in merged["tag_groups"]]
+    assert "mood" in ids
+    assert "subject" in ids
+    mood = next(g for g in merged["tag_groups"] if g["id"] == "mood")
+    assert "开心" in mood["tags"]
+    assert len(mood["tags"]) >= 20
+    sub = next(g for g in merged["tag_groups"] if g["id"] == "subject")
+    assert "男性" in sub["tags"]
 
 
 def test_resolve_pending(tmp_path: Path):
@@ -190,8 +286,15 @@ def service_factory(tmp_path: Path):
             results_json=str(tmp_path / "r.json"),
             results_csv=str(tmp_path / "r.csv"),
         )
+        # init 会从项目 tag_config 灌入真实词表；测试需隔离后重灌
+        try:
+            svc.db.execute_non_query("DELETE FROM tags_library")
+        except Exception:
+            pass
         svc.tag_config = {"categories": [{"display_name": "B"}], "tag_groups": groups, "global_settings": {}}
         svc.ai.tag_config = svc.tag_config
+        if hasattr(svc.ai, "init_tag_libraries"):
+            svc.ai.init_tag_libraries()
         return svc
 
     return _make

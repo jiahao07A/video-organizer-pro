@@ -5,11 +5,12 @@ import json
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, 
     QComboBox, QFormLayout, QScrollArea, QFrame, QCheckBox, 
-    QPushButton, QMessageBox
+    QPushButton, QMessageBox, QMenu, QToolButton
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from .tag_flow import TagFlowWidget
+from .media_preview import MediaPreviewWidget
 from core.video_organizer_service import VideoOrganizerService
 
 class DetailPanel(QWidget):
@@ -22,11 +23,12 @@ class DetailPanel(QWidget):
         self.settings = service.settings
         self.current_video = None # 可以是单个 dict 或 list
         self.setup_ui()
+        self.apply_field_preferences()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(15)
+        layout.setSpacing(10)
 
         # 批量操作提示
         self.batch_info = QLabel("")
@@ -34,13 +36,23 @@ class DetailPanel(QWidget):
         self.batch_info.setVisible(False)
         layout.addWidget(self.batch_info)
 
-        # 1. 缩略图预览
-        self.thumb_label = QLabel("选择视频查看预览\n(双击播放)")
-        self.thumb_label.setFixedSize(320, 180)
-        self.thumb_label.setAlignment(Qt.AlignCenter)
-        self.thumb_label.setStyleSheet("border: 2px dashed #444; border-radius: 8px; background-color: #1a1a1a;")
-        self.thumb_label.setToolTip("双击预览视频")
-        layout.addWidget(self.thumb_label)
+        # 1. 素材预览区（放大）
+        preview_header = QHBoxLayout()
+        preview_header.addWidget(QLabel("素材预览"))
+        preview_header.addStretch()
+        self.field_pref_btn = QToolButton()
+        self.field_pref_btn.setText("显示字段")
+        self.field_pref_btn.setPopupMode(QToolButton.InstantPopup)
+        self.field_pref_btn.setToolTip("选择详情区显示/隐藏的字段")
+        preview_header.addWidget(self.field_pref_btn)
+        layout.addLayout(preview_header)
+
+        self.media_preview = MediaPreviewWidget()
+        self.media_preview.setMinimumHeight(260)
+        layout.addWidget(self.media_preview, 2)
+
+        # 兼容旧入口
+        self.thumb_label = self.media_preview
 
         # 2. 表单区域
         form_scroll = QScrollArea()
@@ -61,7 +73,6 @@ class DetailPanel(QWidget):
         self.category_input.addItems(self.settings.get("categories", []))
         
         self.tags_widget = TagFlowWidget()
-        # 初始化自动补全
         self.refresh_tag_completer()
         
         self.summary_input = QTextEdit()
@@ -70,15 +81,21 @@ class DetailPanel(QWidget):
         self.transcript_input = QTextEdit()
         self.transcript_input.setPlaceholderText("音频转录文本...")
         
+        self._field_rows = {}
+        self._field_rows["filename"] = form_layout.rowCount()
         form_layout.addRow("文件名:", self.filename_label)
+        self._field_rows["category"] = form_layout.rowCount()
         form_layout.addRow("分类:", self.category_input)
+        self._field_rows["tags"] = form_layout.rowCount()
         form_layout.addRow("标签:", self.tags_widget)
-        # 基调由氛围标签表达，不再展示独立情绪字段（ADR-0003）
+        self._field_rows["summary"] = form_layout.rowCount()
         form_layout.addRow("摘要:", self.summary_input)
+        self._field_rows["transcription"] = form_layout.rowCount()
         form_layout.addRow("转录:", self.transcript_input)
+        self._form_layout = form_layout
         
         form_scroll.setWidget(form_container)
-        layout.addWidget(form_scroll)
+        layout.addWidget(form_scroll, 3)
 
         # 批量设置
         self.merge_tags_cb = QCheckBox("合并标签 (不覆盖原有标签)")
@@ -113,8 +130,61 @@ class DetailPanel(QWidget):
         btn_layout.addWidget(self.export_tags_btn, 1)
         layout.addLayout(btn_layout)
 
-        # 绑定双击预览
-        self.thumb_label.mouseDoubleClickEvent = self.on_thumb_double_click
+        self._build_field_pref_menu()
+
+    def _build_field_pref_menu(self):
+        menu = QMenu(self)
+        prefs = (self.settings.get("ui_preferences") or {}).get("detail_fields_visible") or {}
+        defaults = {
+            "filename": True,
+            "category": True,
+            "tags": True,
+            "summary": True,
+            "transcription": True,
+        }
+        self._field_actions = {}
+        labels = {
+            "filename": "文件名",
+            "category": "分类",
+            "tags": "标签",
+            "summary": "摘要",
+            "transcription": "转录",
+        }
+        for key, lab in labels.items():
+            act = menu.addAction(lab)
+            act.setCheckable(True)
+            act.setChecked(prefs.get(key, defaults[key]))
+            act.toggled.connect(lambda checked, k=key: self._on_field_pref(k, checked))
+            self._field_actions[key] = act
+        self.field_pref_btn.setMenu(menu)
+
+    def _on_field_pref(self, key: str, visible: bool):
+        prefs = self.settings.setdefault("ui_preferences", {})
+        fields = prefs.setdefault("detail_fields_visible", {})
+        fields[key] = visible
+        try:
+            from core.video_organizer_service import SettingsManager
+            SettingsManager.save_settings(self.settings, self.service.db)
+        except Exception:
+            pass
+        self.apply_field_preferences()
+
+    def apply_field_preferences(self):
+        prefs = (self.settings.get("ui_preferences") or {}).get("detail_fields_visible") or {}
+        mapping = {
+            "filename": self.filename_label,
+            "category": self.category_input,
+            "tags": self.tags_widget,
+            "summary": self.summary_input,
+            "transcription": self.transcript_input,
+        }
+        for key, widget in mapping.items():
+            show = prefs.get(key, True)
+            widget.setVisible(show)
+            # 隐藏对应标签
+            label = self._form_layout.labelForField(widget)
+            if label:
+                label.setVisible(show)
 
     def export_tag_cloud(self):
         """导出标签统计报告 (标签云入口)"""
@@ -218,17 +288,9 @@ class DetailPanel(QWidget):
                 QMessageBox.critical(self, "失败", "故事板生成失败，请检查日志。")
 
     def on_thumb_double_click(self, event):
-        if not self.current_video or isinstance(self.current_video, list):
-            return
-        
-        path = self.current_video.get("path")
-        if path and os.path.exists(path):
-            if sys.platform == "win32":
-                os.startfile(path)
-            else:
-                import subprocess
-                opener = "open" if sys.platform == "darwin" else "xdg-open"
-                subprocess.call([opener, path])
+        """兼容右键播放：切换素材预览播放。"""
+        if hasattr(self, "media_preview") and self.media_preview:
+            self.media_preview.toggle_play()
 
     def load_video_data(self, video_data):
         """填充数据到面板，支持单选或多选"""
@@ -246,8 +308,8 @@ class DetailPanel(QWidget):
             self.summary_input.setEnabled(False)
             self.transcript_input.setPlainText("(批量模式不支持修改转录)")
             self.transcript_input.setEnabled(False)
-            self.thumb_label.setText("批量模式预览不可用")
-            self.thumb_label.setPixmap(QPixmap())
+            if hasattr(self, "media_preview"):
+                self.media_preview.set_media(None)
             return
 
         # 单选模式
@@ -333,20 +395,10 @@ class DetailPanel(QWidget):
         self.ai_rec_btn.setEnabled(True)
         self.storyboard_btn.setEnabled(True)
 
-        # 展示分析结果（分类/标签/摘要；情绪已并入氛围标签）
-        
-        # 加载缩略图
-        thumb_path = video_data.get("thumbnail_path") or video_data.get("thumbnail")
-        if thumb_path and os.path.exists(thumb_path):
-            pixmap = QPixmap(thumb_path)
-            if not pixmap.isNull():
-                self.thumb_label.setPixmap(pixmap.scaled(self.thumb_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                self.thumb_label.setText("预览图加载失败")
-                self.thumb_label.setPixmap(QPixmap())
-        else:
-            self.thumb_label.setText("无预览图")
-            self.thumb_label.setPixmap(QPixmap())
+        # 素材预览
+        path = video_data.get("path")
+        if hasattr(self, "media_preview"):
+            self.media_preview.set_media(path)
 
     def save_changes(self):
         """保存修改到数据库"""

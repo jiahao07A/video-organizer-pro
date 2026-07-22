@@ -56,15 +56,28 @@ except ImportError:
 
 # ================= 配置区域 (Configuration) =================
 
-SETTINGS_FILE = get_resource_path("settings.json")
+# 项目根目录（core/ 的上一级），避免 settings 依赖进程 cwd
+_CORE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_CORE_DIR)
+
+
+def get_settings_file_path() -> str:
+    """可写配置路径：开发环境固定在项目根；打包后放可执行文件旁。"""
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath(".")
+        return os.path.join(base, "settings.json")
+    return os.path.join(_PROJECT_ROOT, "settings.json")
+
+
+SETTINGS_FILE = get_settings_file_path()
 RESULTS_FILE_JSON = "video_analysis_results.json"
 RESULTS_FILE_CSV = "video_analysis_results.csv"
 BACKUP_DIR = "backups"
 THUMBNAILS_DIR = ".thumbnails"
 DB_FILE = "video_organizer.db"
 ENV_FILE = get_resource_path(".env")
-DICTIONARY_FILE = get_resource_path("词.txt")
-TAG_CONFIG_FILE = "tag_config.json"
+DICTIONARY_FILE = os.path.join(_PROJECT_ROOT, "词.txt")
+TAG_CONFIG_FILE = os.path.join(_PROJECT_ROOT, "tag_config.json")
 
 DEFAULT_SETTINGS = {
     "api": {
@@ -76,6 +89,10 @@ DEFAULT_SETTINGS = {
             "content_description": "gemini-2.0-flash",
         }
     },
+    # 模型供应商档案列表 + 当前 id；空列表在 load 时从旧 api 迁为「默认」
+    "model_providers": [],
+    "current_provider_id": "",
+
     "prompts": {
         "video_classification": "你是一个视频分类专家，请根据视频帧内容将其归入最合适的分类。返回 JSON 格式，包含 category 字段。",
         "tag_generation": "请为以下视频生成5个准确的中文标签，涵盖氛围、主体、场景、动作和核心对象。返回 JSON 格式，包含 tags 列表。",
@@ -99,6 +116,13 @@ DEFAULT_SETTINGS = {
         "enable_scene_detection": True,
         "enable_audio_transcription": False,
         "enable_metadata_injection": False,
+        # 分析任务重试（ADR-0005）
+        "analysis_retry": {
+            "call_extra_attempts": 2,
+            "item_max_attempts": 2,
+            "batch_rerun_enabled": True,
+            "batch_rerun_max_rounds": 1,
+        },
     },
     "rename_pattern": "{category}-{tags}-{summary}-{original_name}",
     "categories": [
@@ -407,6 +431,11 @@ class DatabaseManager:
         d["is_proxy_needed"] = 0
         d["tag_weights"] = {}
         d["thumbnail_path"] = d["thumbnail"]
+        # 入库编号：使用表主键 id（稳定、首次入库分配）
+        if d.get("id") is not None:
+            d["library_id"] = d["id"]
+        else:
+            d["library_id"] = None
         return d
 
     def insert_video_if_absent(self, video_data: Dict) -> bool:
@@ -454,6 +483,10 @@ class DatabaseManager:
             d["tag_weights"] = {}
                 
             d["thumbnail_path"] = d["thumbnail"]
+            if d.get("id") is not None:
+                d["library_id"] = d["id"]
+            else:
+                d["library_id"] = None
             processed_rows.append(d)
         return processed_rows
 
@@ -526,6 +559,58 @@ class DatabaseManager:
         params = list(updates.values()) + [tag_id]
         query = f"UPDATE tags_library SET {set_clause} WHERE id = ?"
         self.execute_non_query(query, tuple(params))
+
+    def delete_tag_by_id(self, tag_id: int):
+        self.execute_non_query("DELETE FROM tags_library WHERE id = ?", (tag_id,))
+
+    def delete_tag_by_name(self, tag_name: str, dimension: Optional[str] = None):
+        name = (tag_name or "").strip()
+        if not name:
+            return
+        if dimension is not None:
+            self.execute_non_query(
+                "DELETE FROM tags_library WHERE tag_name = ? AND LOWER(dimension) = LOWER(?)",
+                (name, dimension),
+            )
+        else:
+            self.execute_non_query("DELETE FROM tags_library WHERE tag_name = ?", (name,))
+
+    def reassign_tags_dimension(self, tag_names: List[str], target_dimension: str):
+        """将标准词 dimension 整批改到目标组（标签移动 / 删组改派）。
+
+        同名多行（历史脏数据）时：保留一条写到目标组，删除其余，避免 UNIQUE(dimension, tag_name) 冲突。
+        """
+        dim = (target_dimension or "").strip()
+        if not dim or not tag_names:
+            return
+        for name in tag_names:
+            n = (name or "").strip()
+            if not n:
+                continue
+            rows = self.execute_query(
+                "SELECT id, dimension FROM tags_library WHERE tag_name = ?",
+                (n,),
+            )
+            if not rows:
+                continue
+            keep_id = None
+            for r in rows:
+                if str(r.get("dimension") or "").strip().lower() == dim.lower():
+                    keep_id = r["id"]
+                    break
+            if keep_id is None:
+                keep_id = rows[0]["id"]
+                self.execute_non_query(
+                    "UPDATE tags_library SET dimension = ? WHERE id = ?",
+                    (dim, keep_id),
+                )
+            for r in rows:
+                rid = r["id"]
+                if rid != keep_id:
+                    self.execute_non_query(
+                        "DELETE FROM tags_library WHERE id = ?",
+                        (rid,),
+                    )
 
     def increment_tag_usage(self, tag_name: str):
         self.execute_non_query("UPDATE tags_library SET usage_count = usage_count + 1 WHERE tag_name = ?", (tag_name,))
@@ -611,7 +696,26 @@ class DatabaseManager:
 
 class SettingsManager:
     """管理配置信息，支持从 SQLite 数据库或 settings.json 加载，支持嵌套键名访问"""
-    
+
+    @staticmethod
+    def deep_copy_defaults() -> Dict:
+        """深拷贝默认配置，避免浅拷贝污染 DEFAULT_SETTINGS。"""
+        import copy
+        return copy.deepcopy(DEFAULT_SETTINGS)
+
+    @staticmethod
+    def deep_update(d: Dict, u: Dict) -> Dict:
+        for k, v in (u or {}).items():
+            if isinstance(v, dict):
+                node = d.get(k)
+                if not isinstance(node, dict):
+                    node = {}
+                    d[k] = node
+                SettingsManager.deep_update(node, v)
+            else:
+                d[k] = v
+        return d
+
     @staticmethod
     def get_setting(settings: Dict, key_path: str, default: Any = None) -> Any:
         """支持路径式键名访问，如 'api.key'"""
@@ -637,48 +741,79 @@ class SettingsManager:
 
     @staticmethod
     def load_settings(db: Optional[DatabaseManager] = None) -> Dict:
-        """加载配置，优先使用 settings.json，然后合并数据库中的配置"""
-        settings = DEFAULT_SETTINGS.copy()
-        
-        # 1. 尝试从文件加载
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    file_settings = json.load(f)
-                    # 深度更新 settings
-                    def deep_update(d, u):
-                        for k, v in u.items():
-                            if isinstance(v, dict):
-                                d[k] = deep_update(d.get(k, {}), v)
-                            else:
-                                d[k] = v
-                        return d
-                    deep_update(settings, file_settings)
-            except Exception:
-                pass
+        """
+        加载配置：默认值深拷贝 → settings.json → 数据库整包备份（settings_blob）。
+        """
+        settings = SettingsManager.deep_copy_defaults()
+        settings_path = get_settings_file_path()
 
-        # 2. 如果提供了数据库，同步到数据库（主要是为了向后兼容）
+        # 1. 文件
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    file_settings = json.load(f)
+                if isinstance(file_settings, dict):
+                    SettingsManager.deep_update(settings, file_settings)
+            except Exception as e:
+                logger.warning(f"读取 settings.json 失败: {e}")
+
+        # 2. 数据库整包（若存在则覆盖同名字段，便于从 DB 恢复）
         if db:
             try:
-                # 这里简单处理，将整个 JSON 存入数据库的一个字段，或者按原样存储
-                # 考虑到复杂嵌套，目前倾向于保持文件作为主要来源
-                pass
-            except Exception:
-                pass
-                
+                blob = db.get_setting("settings_blob")
+                if isinstance(blob, dict):
+                    SettingsManager.deep_update(settings, blob)
+                elif isinstance(blob, str) and blob.strip():
+                    SettingsManager.deep_update(settings, json.loads(blob))
+            except Exception as e:
+                logger.debug(f"从数据库加载 settings_blob 跳过: {e}")
+
+        # 模型供应商：无档案则从旧扁平 api 迁移；写穿 api.* 供 AIHandler
+        try:
+            from core.model_providers import ensure_providers
+            ensure_providers(settings)
+        except Exception as e:
+            logger.warning(f"模型供应商迁移/规范化失败: {e}")
+
         return settings
 
     @staticmethod
     def save_settings(settings: Dict, db: Optional[DatabaseManager] = None):
-        """保存配置到文件和数据库"""
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-        
+        """保存完整嵌套配置到 settings.json，并写入数据库 settings_blob。"""
+        import copy
+        settings_path = get_settings_file_path()
+        if settings is not None:
+            try:
+                from core.model_providers import ensure_providers
+                ensure_providers(settings)
+            except Exception as e:
+                logger.warning(f"保存前同步模型供应商失败: {e}")
+        payload = copy.deepcopy(settings) if settings is not None else SettingsManager.deep_copy_defaults()
+        if settings is None:
+            try:
+                from core.model_providers import ensure_providers
+                ensure_providers(payload)
+            except Exception as e:
+                logger.warning(f"保存前同步模型供应商失败: {e}")
+
+        # 原子写入，避免半截 JSON
+        parent = os.path.dirname(settings_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp_path = settings_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, settings_path)
+
         if db:
-            # 兼容旧版本：如果是扁平键，存入数据库
-            for k, v in settings.items():
-                if not isinstance(v, dict):
-                    db.save_setting(k, v)
+            try:
+                # 整包持久化（含 api.key 等嵌套字段）
+                db.save_setting("settings_blob", payload)
+                # 兼容旧扁平键
+                for k, v in payload.items():
+                    if not isinstance(v, dict):
+                        db.save_setting(k, v)
+            except Exception as e:
+                logger.warning(f"写入数据库 settings 失败: {e}")
 
 class VideoProcessor:
     """处理视频文件：抽帧、压缩、场景检测、哈希计算"""
@@ -718,6 +853,11 @@ class VideoProcessor:
 
     @staticmethod
     def encode_image_to_base64(image: np.ndarray, quality: int = 80) -> str:
+        """将 OpenCV 图像编码为 JPEG base64。
+
+        入参必须是 BGR 通道顺序（与 cv2.VideoCapture / imencode 一致）。
+        若误传 RGB，红蓝通道会对调，送 AI 的画面会偏蓝/偏紫。
+        """
         try:
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
             success, buffer = cv2.imencode('.jpg', image, encode_param)
@@ -769,6 +909,7 @@ class VideoProcessor:
                 ret, frame = cap.read()
                 if ret:
                     if i == 0:
+                        # phash 走 PIL，需要 RGB
                         phash = cls.calculate_phash(frame)
                         
                         if save_thumbnail:
@@ -779,13 +920,14 @@ class VideoProcessor:
                             thumbnail_path = os.path.join(THUMBNAILS_DIR, f"{file_hash}.webp")
                             try:
                                 # 尝试使用 WebP，如果不支持则退回到 JPEG
+                                # frame 为 BGR，与 cv2.imwrite 一致，色相正确
                                 cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_WEBP_QUALITY), 80])
-                            except:
+                            except Exception:
                                 thumbnail_path = os.path.join(THUMBNAILS_DIR, f"{file_hash}.jpg")
                                 cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    resized_frame = cls.resize_image(frame_rgb, target_size)
+                    # 保持 BGR：cv2.imencode 按 BGR 写 JPEG；切勿先转 RGB 再 encode
+                    resized_frame = cls.resize_image(frame, target_size)
                     base64_str = cls.encode_image_to_base64(resized_frame)
                     if base64_str:
                         base64_frames.append(base64_str)
@@ -850,17 +992,32 @@ class AIHandler:
         base_url = SettingsManager.get_setting(settings, "api.base_url", "")
         
         self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            max_retries=2,
+            api_key=api_key or "EMPTY",
+            base_url=base_url or None,
+            # 调用层重试由 _get_api_response 统一负责，避免与 max_retries 叠加烧费用
+            max_retries=0,
             timeout=45.0
         )
         
         # 模型路由 - 动态获取，不再缓存到成员变量
         self.tag_lib_lock = threading.Lock()
+        # 每线程独立的上次 API 失败信息（避免并行 worker 串台）
+        self._tls = threading.local()
         
         # 初始化标签库
         self.init_tag_libraries()
+
+    def reload_client(self):
+        """设置变更后重建 OpenAI 客户端（API Key / Base URL）。"""
+        api_key = SettingsManager.get_setting(self.settings, "api.key", "")
+        base_url = SettingsManager.get_setting(self.settings, "api.base_url", "")
+        self.client = OpenAI(
+            api_key=api_key or "EMPTY",
+            base_url=base_url or None,
+            max_retries=0,
+            timeout=45.0,
+        )
+        logger.info("AI 客户端已按最新配置重建")
 
     def init_tag_libraries(self):
         """同步设置或 tag_config.json 中的标签到数据库"""
@@ -897,30 +1054,109 @@ class AIHandler:
                     self.db.add_tag(dim, tag, is_learned=0)
 
     def _get_api_response(self, model: str, system_prompt: str, content_parts: List[Any], json_mode: bool = True) -> Optional[Dict]:
-        logger.info(f"正在调用 AI 模型: {model} (JSON 模式: {json_mode})")
-        try:
-            kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content_parts}
-                ],
-                "temperature": 0.2,
-            }
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-                
-            response = self.client.chat.completions.create(**kwargs)
-            res_content = response.choices[0].message.content
-            
-            if json_mode:
-                data = json.loads(res_content) if res_content else None
-                logger.debug(f"AI 响应解析成功")
-                return data
-            return res_content
-        except Exception as e:
-            logger.error(f"AI API 调用出错: {e}")
-            return None
+        """调用 AI；对瞬时错误做调用层重试（ADR-0005）。
+
+        失败时写入 self._last_api_failure: ApiCallFailure，供单条层决定是否 B 重试。
+        """
+        from core.analysis_job_policy import (
+            ApiCallFailure,
+            RetryConfig,
+            is_retriable,
+            should_retry_call,
+            sleep_backoff,
+        )
+
+        cfg = getattr(self, "_job_retry_config", None) or RetryConfig.from_settings(self.settings)
+        sleeper = getattr(self, "_retry_sleeper", None)
+        cancel_ev = getattr(self, "analysis_cancel_event", None)
+        attempt = 0
+        last_err: Optional[BaseException] = None
+        self._last_api_failure = None
+        # 同步清理线程局部，避免读到过期失败
+        if getattr(self, "_tls", None) is not None:
+            self._tls.last_api_failure = None
+
+        while True:
+            if cancel_ev is not None and cancel_ev.is_set():
+                logger.info("AI 调用因用户取消而中止")
+                fail = ApiCallFailure(
+                    message="用户取消", retriable=False, cancelled=True
+                )
+                self._last_api_failure = fail
+                if getattr(self, "_tls", None) is not None:
+                    self._tls.last_api_failure = fail
+                return None
+            attempt += 1
+            logger.info(f"正在调用 AI 模型: {model} (JSON 模式: {json_mode}, 尝试 {attempt})")
+            try:
+                kwargs = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": content_parts}
+                    ],
+                    "temperature": 0.2,
+                }
+                if json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+                response = self.client.chat.completions.create(**kwargs)
+                res_content = response.choices[0].message.content
+
+                if res_content is None or (isinstance(res_content, str) and not res_content.strip()):
+                    raise ValueError("empty body")
+
+                if json_mode:
+                    data = json.loads(res_content)
+                    logger.debug("AI 响应解析成功")
+                    self._last_api_failure = None
+                    if getattr(self, "_tls", None) is not None:
+                        self._tls.last_api_failure = None
+                    return data
+                self._last_api_failure = None
+                if getattr(self, "_tls", None) is not None:
+                    self._tls.last_api_failure = None
+                return res_content
+            except Exception as e:
+                last_err = e
+                logger.error(f"AI API 调用出错: {e}")
+                msg = str(e) or e.__class__.__name__
+                if len(msg) > 200:
+                    msg = msg[:200] + "…"
+                retriable = is_retriable(e)
+                if not retriable:
+                    fail = ApiCallFailure(
+                        message=msg, retriable=False, cancelled=False
+                    )
+                    self._last_api_failure = fail
+                    if getattr(self, "_tls", None) is not None:
+                        self._tls.last_api_failure = fail
+                    return None
+                if not should_retry_call(attempt, call_extra_attempts=cfg.call_extra_attempts):
+                    fail = ApiCallFailure(
+                        message=msg, retriable=True, cancelled=False
+                    )
+                    self._last_api_failure = fail
+                    if getattr(self, "_tls", None) is not None:
+                        self._tls.last_api_failure = fail
+                    return None
+                sleep_backoff(attempt, config=cfg, sleeper=sleeper)
+
+        if last_err:
+            logger.error(f"AI API 重试耗尽: {last_err}")
+            msg = str(last_err) or last_err.__class__.__name__
+            fail = ApiCallFailure(message=msg, retriable=True)
+            self._last_api_failure = fail
+            if getattr(self, "_tls", None) is not None:
+                self._tls.last_api_failure = fail
+        return None
+
+    def get_last_api_failure(self):
+        """线程安全读取上次 API 失败。"""
+        tls = getattr(self, "_tls", None)
+        if tls is not None and getattr(tls, "last_api_failure", None) is not None:
+            return tls.last_api_failure
+        return getattr(self, "_last_api_failure", None)
 
     def build_analysis_prompts(self, system_prompt_override: Optional[str] = None) -> Dict[str, str]:
         """
@@ -1117,11 +1353,18 @@ class AIHandler:
         ]
         return data
 
-    def analyze_video(self, base64_frames: List[str], cache_key: Optional[str] = None) -> Optional[Dict]:
+    def analyze_video(
+        self,
+        base64_frames: List[str],
+        cache_key: Optional[str] = None,
+        *,
+        use_cache: bool = True,
+    ) -> Optional[Dict]:
         if not base64_frames:
             return None
 
-        if self.db and cache_key:
+        # use_cache=False：强制重新分析时跳过读缓存，但仍可写回新结果
+        if use_cache and self.db and cache_key:
             cached = self.db.get_cache(cache_key)
             if cached:
                 logger.info("使用 API 响应缓存")
@@ -1146,8 +1389,8 @@ class AIHandler:
         data = self._get_api_response(model_name, system_prompt, content_parts)
         
         if data:
-            # 4. 标签归一（半封闭硬过滤 + 别名；禁止模糊贴词；建议组不自动入库）
-            data = self.apply_tag_normalization(data, persist_pending=True)
+            # 归一不在此处写待审：由 _process_single_video 最终路径统一 persist，避免 B 重试重复
+            data = self.apply_tag_normalization(data, persist_pending=False)
 
             if self.db and cache_key:
                 self.db.set_cache(cache_key, data)
@@ -1185,6 +1428,107 @@ class AIHandler:
         if data and "recommendations" in data:
             return data["recommendations"]
         return []
+
+    def cluster_cold_start_words(self, words: List[str]):
+        """
+        词表冷启动：真实 AI 近义分簇 + 归组。
+        返回 (clusters, notes)；失败时降级为规则分簇并在 notes 说明。
+        """
+        from core.tag_ai_assist import (
+            COLD_START_AI_CHUNK,
+            cold_start_ai_system_prompt,
+            cold_start_ai_user_prompt,
+            parse_ai_cold_start_clusters,
+            rule_cold_start_cluster,
+        )
+        from core.tag_vocab import ColdStartCluster
+
+        uniq: List[str] = []
+        seen = set()
+        for w in words or []:
+            t = str(w or "").strip()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            uniq.append(t)
+
+        notes: List[str] = []
+        if not uniq:
+            return [], notes
+
+        model_name = SettingsManager.get_setting(
+            self.settings,
+            "api.model_personalization.tag_generation",
+            "gemini-2.0-flash",
+        )
+        system_prompt = cold_start_ai_system_prompt()
+        all_clusters: List[ColdStartCluster] = []
+        used: Set[str] = set()
+        ai_ok_chunks = 0
+        ai_fail_chunks = 0
+
+        for i in range(0, len(uniq), COLD_START_AI_CHUNK):
+            chunk = uniq[i : i + COLD_START_AI_CHUNK]
+            user_prompt = cold_start_ai_user_prompt(chunk)
+            data = self._get_api_response(
+                model_name,
+                system_prompt,
+                [{"type": "text", "text": user_prompt}],
+            )
+            # 必须有非空 clusters 列表才算 AI 成功
+            ai_clusters = (
+                data.get("clusters")
+                if isinstance(data, dict) and isinstance(data.get("clusters"), list)
+                else None
+            )
+            if not ai_clusters:
+                ai_fail_chunks += 1
+                parsed = rule_cold_start_cluster(chunk)
+            else:
+                parsed = parse_ai_cold_start_clusters(data, chunk)
+                if not parsed:
+                    ai_fail_chunks += 1
+                    parsed = rule_cold_start_cluster(chunk)
+                else:
+                    ai_ok_chunks += 1
+            for c in parsed:
+                if c.standard in used:
+                    continue
+                aliases = [a for a in (c.aliases or []) if a not in used and a != c.standard]
+                for a in aliases:
+                    used.add(a)
+                used.add(c.standard)
+                all_clusters.append(
+                    ColdStartCluster(
+                        standard=c.standard,
+                        aliases=aliases,
+                        group_id=c.group_id,
+                    )
+                )
+
+        # 漏网词
+        for w in uniq:
+            if w not in used:
+                from core.tag_vocab import heuristic_assign_group
+
+                all_clusters.append(
+                    ColdStartCluster(standard=w, aliases=[], group_id=heuristic_assign_group(w))
+                )
+                used.add(w)
+
+        if ai_ok_chunks and not ai_fail_chunks:
+            notes.append(f"已使用 AI 近义分簇与归组（模型 {model_name}，{len(uniq)} 词）。")
+        elif ai_ok_chunks and ai_fail_chunks:
+            notes.append(
+                f"部分批次使用 AI 分簇，{ai_fail_chunks} 批失败已降级规则分簇（模型 {model_name}）。"
+            )
+        else:
+            notes.append(
+                f"AI 分簇不可用或全部失败，已降级为规则分簇（模型 {model_name}）。"
+                "请检查 API 密钥与网络。"
+            )
+        return all_clusters, notes
+
 
 class TagProcessor:
     """标签预处理与分类联动逻辑"""
@@ -1490,8 +1834,15 @@ class VideoOrganizerService:
         self.tag_config = self.load_tag_config()
         self.on_log = on_log or (lambda m: print(m))
         self.on_progress = on_progress or (lambda c, t: None)
+        # 结构化分析进度快照（dict）；UI 优先消费
+        self.on_analysis_snapshot: Callable[[Dict], None] = lambda _s: None
+        self._analysis_cancel = threading.Event()
+        self._progress_lock = threading.Lock()
+        # 测试可注入：跳过真实 sleep
+        self._retry_sleeper: Optional[Callable[[float], None]] = None
         self.processor = VideoProcessor()
         self.ai = AIHandler(self.settings, self.db, self.tag_config)
+        self.ai.analysis_cancel_event = self._analysis_cancel
         self.tag_processor = TagProcessor(self.settings, self.db)
         json_path = results_json if results_json is not None else RESULTS_FILE_JSON
         csv_path = results_csv if results_csv is not None else RESULTS_FILE_CSV
@@ -1502,6 +1853,42 @@ class VideoOrganizerService:
         self._cache_lock = threading.Lock()
         # 工作范围：当前工作台呈现与处理的路径集合（文件 + 文件夹）
         self._work_scope_paths: List[str] = []
+        # 从工作范围「移出」的视频路径（规范化），即使仍落在文件夹范围内也不再呈现
+        self._work_scope_exclusions: Set[str] = set()
+        # S4：废除中转池 — 启动时将 pool/未分组标准词降为待审（不碰视频 tags 字符串）
+        try:
+            self.migrate_pool_standard_tags_to_pending()
+        except Exception as e:
+            logger.warning(f"pool→待审迁移跳过: {e}")
+
+    def reload_ai_from_settings(self) -> None:
+        """设置保存后：同步 AI 客户端与依赖 settings 的处理器。"""
+        try:
+            from core.model_providers import ensure_providers
+            ensure_providers(self.settings)
+        except Exception:
+            pass
+        if hasattr(self, "ai") and self.ai is not None:
+            self.ai.settings = self.settings
+            if hasattr(self.ai, "reload_client"):
+                self.ai.reload_client()
+        if hasattr(self, "tag_processor") and self.tag_processor is not None:
+            self.tag_processor.settings = self.settings
+
+    def reload_ai_client(self):
+        """设置保存后：让 AI 客户端使用最新 api.key / base_url。"""
+        try:
+            from core.model_providers import ensure_providers
+            ensure_providers(self.settings)
+        except Exception:
+            pass
+        if hasattr(self, "ai") and self.ai is not None:
+            # 保证 handler 引用同一 settings 对象
+            self.ai.settings = self.settings
+            if hasattr(self.ai, "reload_client"):
+                self.ai.reload_client()
+        if hasattr(self, "tag_processor") and self.tag_processor is not None:
+            self.tag_processor.settings = self.settings
 
     # --- 工作范围 (Work Scope) ---
 
@@ -1509,12 +1896,25 @@ class VideoOrganizerService:
         """返回当前工作范围路径列表（副本）。"""
         return list(self._work_scope_paths)
 
-    def set_work_scope_paths(self, paths: List[str], *, scan: bool = True) -> Dict[str, Any]:
+    def set_work_scope_paths(
+        self,
+        paths: List[str],
+        *,
+        scan: bool = True,
+        clear_exclusions: bool = True,
+    ) -> Dict[str, Any]:
         """
         整份替换工作范围。
         scan=True 时扫描范围内视频并入库：新文件登记为未分析(pending)，已存在不覆盖分析结果。
+        clear_exclusions=True：清空「移出工作范围」排除集（浏览替换时应 True；累加时应 False）。
         """
         self._work_scope_paths = dedupe_scope_paths(paths)
+        if clear_exclusions:
+            self._work_scope_exclusions = set()
+        else:
+            # 累加后：若排除路径已不在任何范围项下，可保留；仍在范围内的继续排除
+            if not hasattr(self, "_work_scope_exclusions"):
+                self._work_scope_exclusions = set()
         registered: List[str] = []
         if scan:
             registered = self.scan_and_register_work_scope()
@@ -1526,82 +1926,137 @@ class VideoOrganizerService:
 
     def replace_work_scope(self, paths: List[str], *, scan: bool = True) -> Dict[str, Any]:
         """set_work_scope_paths 的别名（语义：浏览确认 = 整份替换）。"""
-        return self.set_work_scope_paths(paths, scan=scan)
+        return self.set_work_scope_paths(paths, scan=scan, clear_exclusions=True)
 
     def append_work_scope(self, paths: List[str], *, scan: bool = True) -> Dict[str, Any]:
-        """累加路径到当前工作范围（去重），可选扫盘入库。"""
+        """累加路径到当前工作范围（去重），可选扫盘入库；保留已移出排除集。"""
         combined = list(self._work_scope_paths) + list(paths or [])
-        return self.set_work_scope_paths(combined, scan=scan)
+        return self.set_work_scope_paths(combined, scan=scan, clear_exclusions=False)
 
     def is_path_in_work_scope(self, video_path: str) -> bool:
-        """视频路径是否落在当前工作范围内。"""
+        """视频路径是否落在当前工作范围内（排除已移出的路径）。"""
+        if not video_path:
+            return False
+        try:
+            np = normalize_work_path(video_path)
+        except Exception:
+            np = video_path
+        if np in getattr(self, "_work_scope_exclusions", set()):
+            return False
         return is_video_path_in_scope(video_path, self._work_scope_paths)
 
     def resolve_operation_target_paths(
-        self, checked_paths: Optional[List[str]] = None
+        self,
+        selected_paths: Optional[List[str]] = None,
+        visible_paths: Optional[List[str]] = None,
+        *,
+        scope_paths: Optional[List[str]] = None,
+        checked_paths: Optional[List[str]] = None,
     ) -> List[str]:
         """
-        解析工作台批量操作目标路径。
+        解析批量操作目标路径（对接 core.operation_targets）。
+
+        新语义（UI 推荐）：
+        - selected_paths：列表选中（可空 / None）
+        - visible_paths：当前可见列表路径
+        - scope_paths：工作台传入工作范围内路径；素材库传 None 或不传
+
+        旧语义兼容（test_ops_filter_scope / 仅传 checked）：
+        - 仅传 selected_paths/checked_paths 且未传 visible_paths
+          → 视为旧「勾选 ∩ 工作范围」：无选中则可见=范围内全部
         - 工作范围为空 → []
-        - 有勾选 → 勾选 ∩ 工作范围
-        - 无勾选 → 工作范围内全部已入库路径
-        绝不回退到全库。
         """
-        if not self._work_scope_paths:
-            return []
-        in_scope = self.get_videos_in_work_scope()
-        scope_paths = [v.get("path") for v in in_scope if v.get("path")]
-        if not checked_paths:
-            return list(scope_paths)
-        scope_norm = {normalize_work_path(p) for p in scope_paths}
-        out: List[str] = []
-        seen = set()
-        for p in checked_paths:
-            if not p:
-                continue
-            np = normalize_work_path(p)
-            if np in scope_norm and np not in seen:
-                # 用库内原始 path 字符串
-                for sp in scope_paths:
-                    if normalize_work_path(sp) == np:
-                        out.append(sp)
-                        seen.add(np)
-                        break
-        return out
+        from core.operation_targets import resolve_operation_target_paths as resolve_pure
+
+        selected = selected_paths if selected_paths is not None else checked_paths
+
+        # 旧签名：resolve_operation_target_paths() / ([paths]) / (None)
+        if visible_paths is None and scope_paths is None:
+            if not getattr(self, "_work_scope_paths", None):
+                return []
+            in_scope = self.get_videos_in_work_scope()
+            scope_list = [v.get("path") for v in in_scope if v.get("path")]
+            # None/空选中 → 可见=范围内全部；有选中 → 与范围求交
+            return resolve_pure(selected, scope_list, scope_paths=scope_list)
+
+        # 新签名：UI 显式传入 visible（scope 可选）
+        vis = list(visible_paths or [])
+        if scope_paths is not None:
+            scope_list = list(scope_paths)
+            # 工作台：范围为空时不操作
+            if not scope_list and not getattr(self, "_work_scope_paths", None):
+                return []
+            return resolve_pure(selected, vis, scope_paths=scope_list)
+        return resolve_pure(selected, vis, scope_paths=None)
 
     def get_videos_for_operation(
-        self, checked_paths: Optional[List[str]] = None
+        self,
+        selected_paths: Optional[List[str]] = None,
+        visible_paths: Optional[List[str]] = None,
+        *,
+        scope_paths: Optional[List[str]] = None,
+        checked_paths: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """工作台操作目标视频记录（⊆ 工作范围）。"""
-        targets = set(normalize_work_path(p) for p in self.resolve_operation_target_paths(checked_paths))
+        """操作目标视频记录。工作台默认 ⊆ 工作范围；素材库可无 scope。"""
+        targets = set(
+            normalize_work_path(p)
+            for p in self.resolve_operation_target_paths(
+                selected_paths,
+                visible_paths,
+                scope_paths=scope_paths,
+                checked_paths=checked_paths,
+            )
+        )
         if not targets:
             return []
+        # 有工作范围约束时从范围内取记录，否则从全库
+        if scope_paths is not None or (
+            visible_paths is None and scope_paths is None
+        ):
+            pool = self.get_videos_in_work_scope()
+        else:
+            pool = self.get_all_videos()
         return [
             v
-            for v in self.get_videos_in_work_scope()
+            for v in pool
             if normalize_work_path(v.get("path", "")) in targets
         ]
 
     def persist_work_scope_if_enabled(self) -> None:
-        """若开启「记住上次工作范围」，把当前路径写入 settings。"""
+        """若开启「记住上次工作范围」，把当前路径与移出排除集写入 settings。"""
         prefs = self.settings.setdefault("ui_preferences", {})
         if not prefs.get("remember_work_scope"):
             return
         prefs["last_work_scope"] = list(self._work_scope_paths)
+        prefs["last_work_scope_exclusions"] = list(
+            getattr(self, "_work_scope_exclusions", set()) or set()
+        )
         try:
             SettingsManager.save_settings(self.settings, self.db)
         except Exception as e:
             logger.warning(f"保存工作范围失败: {e}")
 
     def restore_work_scope_if_enabled(self) -> bool:
-        """启动时若开启记住范围则恢复；成功返回 True。"""
+        """启动时若开启记住范围则恢复路径与排除集；成功返回 True。"""
         prefs = self.settings.get("ui_preferences", {}) or {}
         if not prefs.get("remember_work_scope"):
             return False
         paths = prefs.get("last_work_scope") or []
         if not paths:
             return False
-        self.set_work_scope_paths(list(paths), scan=True)
+        exclusions = prefs.get("last_work_scope_exclusions") or []
+        self.set_work_scope_paths(list(paths), scan=True, clear_exclusions=True)
+        # 恢复「移出工作范围」排除（在替换清排除之后写回）
+        restored: Set[str] = set()
+        for p in exclusions:
+            if not p:
+                continue
+            try:
+                restored.add(normalize_work_path(p))
+            except Exception:
+                restored.add(str(p))
+        self._work_scope_exclusions = restored
+        self.persist_work_scope_if_enabled()
         return True
 
     def scan_and_register_work_scope(self) -> List[str]:
@@ -1633,6 +2088,31 @@ class VideoOrganizerService:
                     "tag_groups": {},
                 }
                 if self.db.insert_video_if_absent(record):
+                    # 入库轻量缩略图（不依赖完整 AI 分析）
+                    thumb = None
+                    try:
+                        proc = self.processor.extract_frames(
+                            abs_path,
+                            max_frames=1,
+                            target_size=SettingsManager.get_setting(
+                                self.settings, "processing.target_size", 512
+                            ),
+                            save_thumbnail=True,
+                            use_scene_detection=False,
+                        )
+                        thumb = proc.get("thumbnail")
+                        if thumb:
+                            self.db.upsert_video(
+                                {
+                                    **record,
+                                    "thumbnail": thumb,
+                                    "thumbnail_path": thumb,
+                                }
+                            )
+                            record["thumbnail"] = thumb
+                            record["thumbnail_path"] = thumb
+                    except Exception as e:
+                        logger.warning(f"入库缩略图失败 {abs_path}: {e}")
                     registered.append(abs_path)
                     with self._cache_lock:
                         if self._memory_cache is not None:
@@ -1640,8 +2120,8 @@ class VideoOrganizerService:
                             if self._memory_cache:
                                 self._memory_cache[abs_path] = {
                                     **record,
-                                    "thumbnail_path": None,
-                                    "thumbnail": None,
+                                    "thumbnail_path": thumb,
+                                    "thumbnail": thumb,
                                 }
 
         if registered:
@@ -1661,7 +2141,99 @@ class VideoOrganizerService:
     def clear_work_scope(self) -> None:
         """清空工作范围（不删库内记录）。"""
         self._work_scope_paths = []
+        self._work_scope_exclusions = set()
         self.persist_work_scope_if_enabled()
+
+    def suggest_pending_tag(
+        self,
+        pending_row: Dict,
+        *,
+        suggest_fn=None,
+    ):
+        """待审词 AI/规则建议（不写库）。"""
+        from core.tag_ai_assist import rule_pending_suggestion
+
+        standards: List[str] = []
+        for g in (self.tag_config or {}).get("tag_groups") or []:
+            for t in g.get("tags") or []:
+                if isinstance(t, dict):
+                    n = t.get("name")
+                else:
+                    n = t
+                if n:
+                    standards.append(str(n).strip())
+        fn = suggest_fn or rule_pending_suggestion
+        return fn(pending_row, standards)
+
+    def apply_pending_suggestion(self, suggestion, *, confirm: bool = True) -> bool:
+        """确认后应用待审建议；confirm=False 时拒绝写库（测试用）。"""
+        if not confirm or suggestion is None:
+            return False
+
+        def _get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            if hasattr(obj, key):
+                return getattr(obj, key)
+            return default
+
+        action = _get(suggestion, "action")
+        pid = _get(suggestion, "pending_id")
+        if action == "discard":
+            return self.resolve_pending_tag(pid, "discard")
+        if action == "link_alias":
+            std = _get(suggestion, "recommended_standard")
+            return self.resolve_pending_tag(pid, "link_alias", standard_tag=std)
+        if action == "approve_standard":
+            gid = _get(suggestion, "recommended_group_id") or _get(suggestion, "group_id")
+            return self.resolve_pending_tag(pid, "approve_standard", group_id=gid)
+        return False
+
+    def audit_synonyms(self, *, audit_fn=None):
+        """近义巡检：返回合并建议列表（不写库）。"""
+        from core.tag_ai_assist import rule_synonym_audit
+
+        standards: List[str] = []
+        for g in (self.tag_config or {}).get("tag_groups") or []:
+            for t in g.get("tags") or []:
+                n = t.get("name") if isinstance(t, dict) else t
+                if n:
+                    standards.append(str(n).strip())
+        fn = audit_fn or rule_synonym_audit
+        return fn(standards)
+
+    def apply_synonym_merge_suggestions(
+        self, suggestions, *, confirm: bool = True
+    ) -> Dict[str, Any]:
+        """
+        确认后执行近义合并：被合并词 → 保留词的别名，并 bulk_replace 视频标签。
+        """
+        from core.tag_ai_assist import apply_synonym_merges_plan
+
+        if not confirm:
+            return {"ok": False, "applied": 0, "message": "未确认，未写库"}
+        plan = apply_synonym_merges_plan(suggestions or [])
+        applied = 0
+        for alias, standard in plan.items():
+            try:
+                self.db.add_synonym(standard, alias)
+                self.bulk_replace_tags(alias, standard)
+                # 从 tag_config 各组移除被合并标准词
+                cfg = self.tag_config or {}
+                for group in cfg.get("tag_groups") or []:
+                    tags = group.get("tags") or []
+                    new_tags = []
+                    for t in tags:
+                        name = t.get("name") if isinstance(t, dict) else t
+                        if str(name).strip() == alias:
+                            continue
+                        new_tags.append(t)
+                    group["tags"] = new_tags
+                self.save_tag_config(cfg)
+                applied += 1
+            except Exception as e:
+                logger.warning(f"合并 {alias}->{standard} 失败: {e}")
+        return {"ok": True, "applied": applied, "plan": plan}
 
     # --- 备份与恢复 (V6.0) ---
     def backup_configuration(self) -> str:
@@ -1844,15 +2416,27 @@ class VideoOrganizerService:
         }
 
         if not os.path.exists(TAG_CONFIG_FILE):
-            return default_v6
+            from core.tag_vocab import ensure_canonical_tag_groups
+            return ensure_canonical_tag_groups(default_v6)
 
         try:
             with open(TAG_CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
             
             # 检查版本并执行迁移
-            version = str(config.get("version", "1.0"))
-            if version < "6.0":
+            # 已有 tag_groups 的配置按 v6 处理；勿把「缺 version 字段」误当 v1 整表清空
+            raw_ver = config.get("version", None)
+            has_groups = bool(config.get("tag_groups"))
+            if has_groups and (raw_ver is None or str(raw_ver) < "6.0"):
+                config = dict(config)
+                config["version"] = "6.0"
+                from core.tag_vocab import ensure_canonical_tag_groups
+                config = ensure_canonical_tag_groups(config)
+                self.save_tag_config(config)
+                return config
+
+            version = str(raw_ver if raw_ver is not None else "1.0")
+            if version < "6.0" and not has_groups:
                 logger.info(f"正在将标签配置从 v{version} 迁移至 v6.0...")
                 migrated = default_v6.copy()
                 
@@ -1880,15 +2464,29 @@ class VideoOrganizerService:
                     migrated["categories"] = config["categories"]
                 
                 # 自动保存迁移后的版本
+                from core.tag_vocab import ensure_canonical_tag_groups
+                migrated = ensure_canonical_tag_groups(migrated)
                 self.save_tag_config(migrated)
                 return migrated
             
-            return config
+            from core.tag_vocab import ensure_canonical_tag_groups
+            return ensure_canonical_tag_groups(config)
         except Exception as e:
             logger.error(f"加载标签配置失败: {e}")
-            return default_v6
+            from core.tag_vocab import ensure_canonical_tag_groups
+            return ensure_canonical_tag_groups(default_v6)
 
     def save_tag_config(self, config: Dict):
+        from core.tag_vocab import ensure_canonical_tag_groups
+
+        # 始终带上 version，避免下次启动被误当 v1 迁移
+        if isinstance(config, dict) and not config.get("version"):
+            config = dict(config)
+            config["version"] = "6.0"
+        try:
+            config = ensure_canonical_tag_groups(config or {})
+        except Exception:
+            pass
         self.tag_config = config
         try:
             with open(TAG_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1904,11 +2502,67 @@ class VideoOrganizerService:
         draft_lines: List[str],
         *,
         cluster_fn=None,
+        use_ai: Optional[bool] = None,
+        direct: Optional[bool] = None,
     ):
-        """从草稿行生成词表冷启动草案（不写库）。cluster_fn 可注入以便测试。"""
-        from core.tag_vocab import build_cold_start_draft
+        """
+        从草稿行生成词表草案（不写库）。
 
-        return build_cold_start_draft(draft_lines, cluster_fn=cluster_fn)
+        产品默认 **direct=True**：按词.txt 语义直接解析（分组标题 + 标准词 ← 别名），
+        不做 AI/规则分簇、不做精瘦裁剪。
+
+        - cluster_fn：注入时走旧聚类路径（测试保留）
+        - use_ai=True：显式走 AI 分簇（代码保留，默认关闭）
+        - direct=None：无 cluster_fn 且未强制 AI 时为直接加载
+        """
+        from core.tag_ai_assist import COLD_START_AI_ENABLED, rule_cold_start_cluster
+        from core.tag_vocab import build_cold_start_draft, build_vocab_draft_from_lines
+
+        # 显式聚类函数 → 旧路径
+        if cluster_fn is not None:
+            draft = build_cold_start_draft(draft_lines, cluster_fn=cluster_fn)
+            return draft
+
+        if use_ai is None:
+            use_ai = bool(COLD_START_AI_ENABLED)
+        if direct is None:
+            direct = not use_ai
+
+        # 产品主路径：直接加载
+        if direct and not use_ai:
+            return build_vocab_draft_from_lines(draft_lines)
+
+        notes_extra: List[str] = []
+        if use_ai:
+            def _ai_cluster(ws):
+                clusters, notes = self.ai.cluster_cold_start_words(list(ws))
+                notes_extra.extend(notes)
+                return clusters
+
+            draft = build_cold_start_draft(draft_lines, cluster_fn=_ai_cluster)
+        else:
+            draft = build_cold_start_draft(draft_lines, cluster_fn=rule_cold_start_cluster)
+            notes_extra.append("使用规则分簇（非直接加载模式）。")
+
+        try:
+            draft.notes = list(draft.notes or []) + notes_extra
+        except Exception:
+            pass
+        return draft
+
+    def load_vocab_file(self, path: Optional[str] = None):
+        """从词表文件（默认项目根 词.txt）直接解析为草案，不写库。"""
+        from core.tag_vocab import build_vocab_draft_from_lines
+
+        file_path = path or DICTIONARY_FILE
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        draft = build_vocab_draft_from_lines(lines)
+        try:
+            draft.notes = list(draft.notes or []) + [f"来源文件：{file_path}"]
+        except Exception:
+            pass
+        return draft
 
     def commit_cold_start_draft(
         self,
@@ -1916,10 +2570,11 @@ class VideoOrganizerService:
         *,
         replace_placeholders: bool = True,
         replace_all_group_tags: bool = False,
+        cap_closed_groups: bool = False,
     ) -> Dict[str, Any]:
         """
         终审写入：合并草案到 tag_config + 标签库 + 别名表。
-        replace_all_group_tags=False 时与现有非占位标准词合并，不静默清空用户词。
+        直接加载词.txt 时默认 cap_closed_groups=False（不截断封闭组）。
         """
         from core.tag_vocab import commit_plan_summary, merge_draft_into_tag_config
 
@@ -1930,15 +2585,17 @@ class VideoOrganizerService:
             draft,
             replace_placeholders=replace_placeholders,
             replace_all_group_tags=replace_all_group_tags,
+            cap_closed_groups=cap_closed_groups,
+            create_missing_groups=True,
         )
         self.save_tag_config(cfg)
-        # 同步标准词入库
+        # 同步标准词入库（dimension 用小写组 id）
         for group in cfg.get("tag_groups") or []:
             gid = group.get("id")
             for t in group.get("tags") or []:
                 name = t if isinstance(t, str) else (t.get("name") if isinstance(t, dict) else None)
                 if name and gid:
-                    self.db.add_tag(gid, str(name).strip(), is_learned=0)
+                    self.db.add_tag(str(gid).strip(), str(name).strip(), is_learned=0)
         # 别名
         for alias, standard in (draft.alias_map or {}).items():
             if alias and standard:
@@ -1949,9 +2606,200 @@ class VideoOrganizerService:
                 self.ai.init_tag_libraries()
             except Exception:
                 pass
+        # 再 heal 一次，确保内存与文件一致
+        try:
+            self.heal_tag_config_tags_from_db()
+        except Exception:
+            pass
         summary = commit_plan_summary(draft)
         summary["ok"] = True
+        summary["group_counts"] = {
+            (g.get("id") or "?"): len(g.get("tags") or [])
+            for g in (self.tag_config or {}).get("tag_groups") or []
+        }
         return summary
+
+    def heal_tag_config_tags_from_db(self, *, force: bool = False) -> bool:
+        """
+        保证五组骨架存在，并用 tags_library 回填/补全各组标准词。
+        解决：词写入 DB 成功但 tag_config.json 组缺失或 tags 过少，界面「标签组没数据」。
+        """
+        from core.tag_vocab import ensure_canonical_tag_groups
+
+        cfg = ensure_canonical_tag_groups(self.tag_config or {})
+        details = self.db.get_tags_detail() or []
+        by_dim: Dict[str, List[str]] = {}
+        for t in details:
+            name = (t.get("tag_name") or "").strip()
+            dim = (t.get("dimension") or "").strip().lower()
+            if not name or not dim or dim == "pool":
+                continue
+            by_dim.setdefault(dim, []).append(name)
+
+        changed = False
+        # 组数量/骨架变化
+        old_ids = {
+            (g.get("id") if isinstance(g, dict) else None)
+            for g in (self.tag_config or {}).get("tag_groups") or []
+        }
+        new_ids = {
+            (g.get("id") if isinstance(g, dict) else None)
+            for g in (cfg.get("tag_groups") or [])
+        }
+        if old_ids != new_ids:
+            changed = True
+
+        for g in cfg.get("tag_groups") or []:
+            if not isinstance(g, dict):
+                continue
+            gid = (g.get("id") or "").strip()
+            if not gid:
+                continue
+            existing_names: List[str] = []
+            for t in g.get("tags") or []:
+                if isinstance(t, str) and t.strip():
+                    existing_names.append(t.strip())
+                elif isinstance(t, dict) and t.get("name"):
+                    existing_names.append(str(t["name"]).strip())
+            db_names = list(dict.fromkeys(by_dim.get(gid, [])))
+            if not db_names and not existing_names:
+                continue
+            if force or not existing_names:
+                merged = db_names or existing_names
+            elif len(db_names) > len(existing_names):
+                # 库里明显更全：合并补全
+                merged = list(dict.fromkeys(existing_names + db_names))
+            else:
+                merged = list(dict.fromkeys(existing_names + [
+                    n for n in db_names if n not in existing_names
+                ]))
+            if merged != existing_names:
+                g["tags"] = merged
+                changed = True
+
+        self.tag_config = cfg
+        if hasattr(self, "ai") and self.ai is not None:
+            self.ai.tag_config = cfg
+        if changed:
+            self.save_tag_config(cfg)
+            self.log("已同步标签组结构，并从数据库补全标准词。")
+        return changed
+
+    def rebuild_tag_config_from_vocab_file(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """从词.txt 直接解析并整组写入标签库（一键修复）。"""
+        draft = self.load_vocab_file(path)
+        return self.commit_cold_start_draft(
+            draft,
+            replace_placeholders=True,
+            replace_all_group_tags=True,
+            cap_closed_groups=False,
+        )
+
+    def migrate_pool_standard_tags_to_pending(self) -> Dict[str, Any]:
+        """
+        S4：将 tags_library / tag_config 中 pool 或未分组标准词降为待审。
+        不批量清空视频素材上的 tags 字符串。
+        """
+        from core.tag_group_ops import (
+            known_group_ids,
+            migrate_pool_tags_to_pending,
+            strip_names_from_tag_groups,
+        )
+
+        cfg = self.tag_config or {}
+        groups = cfg.get("tag_groups") or []
+        known = known_group_ids(groups)
+        tags_list = self.db.get_tags_detail() or []
+        pending_list = self.db.list_pending_tags(status="pending") or []
+        result = migrate_pool_tags_to_pending(tags_list, pending_list, known)
+
+        for name in result.to_pending:
+            self.db.add_pending_tag(name, group_id="", source_path=None)
+
+        for tid in result.remove_library_ids:
+            self.db.delete_tag_by_id(tid)
+
+        remaining_names = {
+            (t.get("tag_name") or "").strip()
+            for t in (self.db.get_tags_detail() or [])
+        }
+        for name in result.remove_library_names:
+            if name not in remaining_names:
+                continue
+            for row in tags_list:
+                if (row.get("tag_name") or "").strip() != name:
+                    continue
+                rid = row.get("id")
+                if rid is not None:
+                    try:
+                        self.db.delete_tag_by_id(int(rid))
+                    except Exception:
+                        pass
+
+        if result.strip_from_config:
+            # 仅从配置中剔除「未挂在任何合法组」的词名；已在合法组 tags 里的保留
+            protected: set = set()
+            for g in groups:
+                if not isinstance(g, dict):
+                    continue
+                gid = str(g.get("id") or "").strip()
+                if not gid or gid.lower() == "pool" or gid not in known:
+                    continue
+                for t in g.get("tags") or []:
+                    if isinstance(t, dict):
+                        n = str(t.get("name") or "").strip()
+                    else:
+                        n = str(t or "").strip()
+                    if n:
+                        protected.add(n)
+            to_strip = [n for n in result.strip_from_config if n not in protected]
+            if to_strip:
+                new_groups = strip_names_from_tag_groups(groups, to_strip)
+                cfg = dict(cfg)
+                cfg["tag_groups"] = new_groups
+                self.save_tag_config(cfg)
+
+        summary = {
+            "to_pending": list(result.to_pending),
+            "removed_from_library": list(result.remove_library_names),
+            "count": len(result.remove_library_names),
+        }
+        if summary["count"]:
+            try:
+                self.log(
+                    f"中转池废除迁移：{summary['count']} 个无组标准词已降为待审（素材标签字符串保留）。"
+                )
+            except Exception:
+                pass
+        return summary
+
+    def delete_tag_group(
+        self,
+        group_id: str,
+        *,
+        target_group_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        删除标签组：空组可直接删；非空须 target_group_id 整组改派后删；
+        唯一剩余组拒绝。
+        """
+        from core.tag_group_ops import reassign_and_remove_group
+
+        cfg = self.tag_config or {}
+        groups = list(cfg.get("tag_groups") or [])
+        ok, new_groups, err, moved = reassign_and_remove_group(
+            groups, group_id, target_group_id=target_group_id
+        )
+        if not ok:
+            return {"ok": False, "error": err, "moved": []}
+
+        if moved and target_group_id:
+            self.db.reassign_tags_dimension(moved, str(target_group_id).strip())
+
+        cfg = dict(cfg)
+        cfg["tag_groups"] = new_groups
+        self.save_tag_config(cfg)
+        return {"ok": True, "error": "", "moved": moved, "groups": new_groups}
 
     def resolve_pending_tag(
         self,
@@ -1963,7 +2811,10 @@ class VideoOrganizerService:
     ) -> bool:
         """
         处理待审词：approve_standard | link_alias | discard
+        approve_standard 必须提供有效 group_id（禁止 pool / 缺省回落 custom）。
         """
+        from core.tag_group_ops import known_group_ids, validate_standard_tag_group_id
+
         rows = self.db.execute_query("SELECT * FROM pending_tags WHERE id = ?", (pending_id,))
         if not rows:
             return False
@@ -1980,15 +2831,48 @@ class VideoOrganizerService:
             self.db.update_pending_tag_status(pending_id, "linked_as_alias")
             return True
         if action == "approve_standard":
-            gid = (group_id or row.get("group_id") or "custom").strip()
             if not raw:
                 return False
-            self.db.add_tag(gid, raw, is_learned=0)
-            # 写入 tag_config 对应组
+            gid = str(group_id or "").strip()
+            if not gid:
+                gid = str(row.get("group_id") or "").strip()
+            known = known_group_ids((self.tag_config or {}).get("tag_groups") or [])
+            ok, _err = validate_standard_tag_group_id(gid, known)
+            if not ok:
+                return False
+            for k in known:
+                if k.lower() == gid.lower():
+                    gid = k
+                    break
+            # 已存在同名标准词：安全改派 dimension（多行去重），避免 UNIQUE 崩溃
+            existing = self.db.execute_query(
+                "SELECT id, dimension FROM tags_library WHERE tag_name = ?",
+                (raw,),
+            )
+            try:
+                if existing:
+                    self.db.reassign_tags_dimension([raw], gid)
+                else:
+                    self.db.add_tag(gid, raw, is_learned=0)
+            except Exception as e:
+                logger.error(f"批准待审词写入标准词失败 raw={raw!r} group={gid}: {e}")
+                return False
             cfg = self.tag_config or {}
+            # 从所有组剥离同名，再挂到目标组（避免双组显示）
+            for group in cfg.get("tag_groups") or []:
+                tags = group.get("tags") or []
+                cleaned = []
+                for t in tags:
+                    if isinstance(t, dict):
+                        n = t.get("name")
+                    else:
+                        n = t
+                    if n != raw:
+                        cleaned.append(t)
+                group["tags"] = cleaned
             for group in cfg.get("tag_groups") or []:
                 if group.get("id") == gid:
-                    tags = group.get("tags") or []
+                    tags = list(group.get("tags") or [])
                     names = []
                     for t in tags:
                         if isinstance(t, dict):
@@ -1999,7 +2883,11 @@ class VideoOrganizerService:
                         tags.append(raw)
                         group["tags"] = tags
                     break
-            self.save_tag_config(cfg)
+            try:
+                self.save_tag_config(cfg)
+            except Exception as e:
+                logger.error(f"批准待审词后保存 tag_config 失败: {e}")
+                return False
             self.db.update_pending_tag_status(pending_id, "approved_as_standard")
             return True
         return False
@@ -2072,9 +2960,46 @@ class VideoOrganizerService:
                 break
 
     def delete_videos(self, paths: List[str]):
-        """从数据库中删除视频记录"""
+        """取消入库：从数据库中删除视频记录（不删磁盘文件）。"""
         for path in paths:
             self.db.delete_video(path)
+        with self._cache_lock:
+            if self._memory_cache:
+                for path in paths:
+                    self._memory_cache.pop(path, None)
+            else:
+                self._memory_cache = {}
+
+    def uncatalog_videos(self, paths: List[str]):
+        """产品语义：取消入库（同 delete_videos，不删磁盘）。"""
+        self.delete_videos(paths)
+        self.log(f"已取消入库 {len(paths)} 条（磁盘文件保留）。")
+
+    def remove_videos_from_work_scope(self, video_paths: List[str]) -> int:
+        """
+        移出工作范围：从范围路径中去掉精确文件项，并对仍可能被文件夹覆盖的路径记入排除集。
+        不删库记录、不删磁盘文件。
+        """
+        if not video_paths:
+            return 0
+        if not hasattr(self, "_work_scope_exclusions"):
+            self._work_scope_exclusions: Set[str] = set()
+        removed = 0
+        to_exclude: List[str] = []
+        for p in video_paths:
+            if not p:
+                continue
+            np = normalize_work_path(p)
+            to_exclude.append(np)
+            # 去掉范围中的精确文件项
+            self._work_scope_paths = [
+                x for x in self._work_scope_paths if normalize_work_path(x) != np
+            ]
+            self._work_scope_exclusions.add(np)
+            removed += 1
+        self.persist_work_scope_if_enabled()
+        self.log(f"已移出工作范围 {removed} 条（库记录保留）。")
+        return removed
 
     def bulk_replace_tags(self, old_tag: str, new_tag: str):
         """全局批量替换标签"""
@@ -2085,138 +3010,501 @@ class VideoOrganizerService:
             self._memory_cache = {}
         self.log(f"已将标签 '{old_tag}' 批量替换为 '{new_tag}'")
 
-    def run_analysis(self, input_path: Union[str, List[str]]):
-        """执行分析工作流"""
+    def request_cancel_analysis(self) -> None:
+        """协作式取消分析任务。"""
+        self._analysis_cancel.set()
+        self.log("已请求取消分析…")
+
+    def clear_analysis_cancel(self) -> None:
+        self._analysis_cancel.clear()
+
+    def is_analysis_cancelled(self) -> bool:
+        return self._analysis_cancel.is_set()
+
+    def _emit_analysis_snapshot(self, reducer) -> None:
+        with self._progress_lock:
+            snap = reducer.snapshot()
+            d = snap.to_dict()
+        try:
+            self.on_analysis_snapshot(d)
+        except Exception as e:
+            logger.debug(f"on_analysis_snapshot: {e}")
+        total = snap.overall_total or 0
+        done = snap.overall_done
+        if total <= 0:
+            self.on_progress(0, 0)
+        else:
+            self.on_progress(done, total)
+
+    def _persist_analysis_success(self, res: Dict) -> int:
+        """入库 + XMP；返回 xmp 失败 0/1。"""
+        self.db.upsert_video(res)
+        with self._cache_lock:
+            if self._memory_cache is not None:
+                self._memory_cache[res["path"]] = res
+        try:
+            self.sync_metadata_to_xmp([res["path"]])
+            return 0
+        except Exception as e:
+            logger.warning(f"XMP 同步失败 {res.get('path')}: {e}")
+            self.log(f"XMP 同步失败 {os.path.basename(res.get('path') or '')}: {e}")
+            return 1
+
+    def _persist_analysis_failure(self, video_path: str, reason: str) -> None:
+        try:
+            existing = self.db.get_video_by_path(video_path) or {}
+            meta = existing.get("raw_metadata") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta = {**meta, "last_error": reason}
+            fail_row = {
+                **existing,
+                "path": video_path,
+                "filename": existing.get("filename") or os.path.basename(video_path),
+                "status": "failed",
+                "raw_metadata": meta,
+                "last_error": reason,
+            }
+            self.db.upsert_video(fail_row)
+        except Exception as e:
+            logger.warning(f"写入失败状态失败 {video_path}: {e}")
+
+    def run_analysis(
+        self,
+        input_path: Union[str, List[str]],
+        *,
+        force_reanalyze: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        执行分析工作流（分析任务）：分析目标集 + 三层重试 + 可选批次补跑。
+        返回 {attempted, succeeded, failed, skipped, message, ...}。
+        """
+        from core.analysis_job_policy import (
+            ProgressReducer,
+            RetryConfig,
+            RoundKind,
+            should_batch_rerun,
+        )
+        from core.analysis_targets import (
+            build_path_status_map,
+            resolve_analysis_target_paths,
+            path_status_key,
+        )
+
+        self.clear_analysis_cancel()
+        self.ai.analysis_cancel_event = self._analysis_cancel
+        self.ai._retry_sleeper = self._retry_sleeper
+        self.ai.settings = self.settings
+
+        empty = {
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "message": "未找到视频文件。",
+        }
         if isinstance(input_path, list):
-            all_videos = input_path
+            all_videos = list(input_path)
         else:
             all_videos = self.file_manager.scan_videos(input_path)
-            
+
         if not all_videos:
             logger.warning("未找到视频文件")
             self.log("未找到视频文件。")
-            return
+            return empty
 
-        current_videos = self.db.get_all_videos()
-        processed_paths = {r['path'] for r in current_videos}
-        
-        videos_to_process = [v for v in all_videos if v not in processed_paths]
-        
-        self.log(f"总文件数: {len(all_videos)}, 待处理: {len(videos_to_process)}")
+        all_videos = [os.path.abspath(p) for p in all_videos if p]
+        status_map = build_path_status_map(self.db.get_all_videos())
+        status_map_norm: Dict[str, str] = {}
+        for k, v in status_map.items():
+            try:
+                status_map_norm[path_status_key(k)] = v
+            except Exception:
+                status_map_norm[k] = v
+            status_map_norm[k] = v
+
+        videos_to_process = resolve_analysis_target_paths(
+            all_videos, status_map_norm, force=force_reanalyze
+        )
+        skipped = len(all_videos) - len(videos_to_process)
+
+        self.log(
+            f"候选: {len(all_videos)}, 待分析: {len(videos_to_process)}, "
+            f"跳过(已分析): {skipped}, 强制: {force_reanalyze}"
+        )
         if not videos_to_process:
-            self.on_progress(len(all_videos), len(all_videos))
-            return
+            msg = "没有待分析视频（已分析项已跳过；可勾选「强制重新分析」）。"
+            self.log(msg)
+            self.on_progress(0, 0)
+            return {
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "skipped": skipped,
+                "message": msg,
+            }
 
-        completed = 0
-        total = len(videos_to_process)
-        self.on_progress(0, total)
+        retry_cfg = RetryConfig.from_settings(self.settings)
+        # 冻结本任务配置，避免分析中途改设置搅乱 A/B 行为
+        self._job_retry_config = retry_cfg
+        self.ai._job_retry_config = retry_cfg
+        reducer = ProgressReducer()
+        reducer.apply("job_started", target_count=len(videos_to_process))
+        self._emit_analysis_snapshot(reducer)
 
-        max_workers = SettingsManager.get_setting(self.settings, "processing.max_workers", 4)
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_video = {executor.submit(self._process_single_video, v): v for v in videos_to_process}
-            for future in as_completed(future_to_video):
-                res = future.result()
-                if res:
-                    self.db.upsert_video(res)
-                    # 同步更新 L1 缓存
-                    with self._cache_lock:
-                        self._memory_cache[res['path']] = res
-                    
-                    # V5.0: 分析完成后自动生成 XMP (Silent Sync)
-                    self.sync_metadata_to_xmp([res['path']])
-                completed += 1
-                self.on_progress(completed, total)
-        
-        # 同步 L2 (DB) 与 L3 (JSON)
+        total_target = len(videos_to_process)
+        succeeded = 0
+        failed = 0
+        xmp_failed = 0
+        failure_reasons: List[str] = []
+        cancelled = False
+
+        def run_round(paths: List[str], *, kind: RoundKind) -> List[str]:
+            """处理一轮；返回本轮仍失败的路径。"""
+            nonlocal succeeded, failed, xmp_failed, cancelled
+            reducer.apply("round_started", kind=kind, item_count=len(paths))
+            self._emit_analysis_snapshot(reducer)
+            if kind == RoundKind.RERUN:
+                self.log(f"批次补跑：{len(paths)} 条失败项")
+            failed_paths: List[str] = []
+            rerun_candidates: List[str] = []
+            max_workers = SettingsManager.get_setting(
+                self.settings, "processing.max_workers", 4
+            )
+            # 取消后不再提交新任务：用串行检查 + executor
+            pending = list(paths)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_video = {}
+                for v in pending:
+                    if self.is_analysis_cancelled():
+                        cancelled = True
+                        break
+                    future_to_video[
+                        executor.submit(
+                            self._process_single_video,
+                            v,
+                            force_reanalyze,
+                            progress_reducer=reducer,
+                            retry_cfg=retry_cfg,
+                        )
+                    ] = v
+                for future in as_completed(future_to_video):
+                    video_path = future_to_video[future]
+                    if self.is_analysis_cancelled():
+                        cancelled = True
+                    try:
+                        res, err_reason = future.result()
+                    except Exception as e:
+                        res, err_reason = None, str(e)
+                    if res and res.get("status") == "analyzed":
+                        xmp_failed += self._persist_analysis_success(res)
+                        succeeded += 1
+                        with self._progress_lock:
+                            reducer.apply("item_terminal", path=video_path, ok=True)
+                    else:
+                        reason = err_reason or "未知原因"
+                        if self.is_analysis_cancelled() and (
+                            not reason or "取消" not in reason
+                        ):
+                            reason = reason or "用户取消"
+                        short_name = os.path.basename(video_path)
+                        if len(failure_reasons) < 8:
+                            failure_reasons.append(f"{short_name}: {reason}")
+                        self._persist_analysis_failure(video_path, reason)
+                        failed_paths.append(video_path)
+                        # 仅瞬时/可重试失败进入批次补跑；鉴权/取消/文件类跳过 C
+                        from core.analysis_job_policy import is_retriable as _is_ret
+                        if (
+                            "用户取消" not in (reason or "")
+                            and _is_ret(reason)
+                        ):
+                            rerun_candidates.append(video_path)
+                        with self._progress_lock:
+                            reducer.apply(
+                                "item_terminal",
+                                path=video_path,
+                                ok=False,
+                                cancelled=self.is_analysis_cancelled(),
+                            )
+                    self._emit_analysis_snapshot(reducer)
+            # 未提交即取消的路径
+            submitted = set(future_to_video.values()) if future_to_video else set()
+            for v in pending:
+                if v not in submitted and v not in failed_paths:
+                    if self.is_analysis_cancelled():
+                        self._persist_analysis_failure(v, "用户取消")
+                        failed_paths.append(v)
+                        with self._progress_lock:
+                            reducer.apply(
+                                "item_terminal", path=v, ok=False, cancelled=True
+                            )
+                        self._emit_analysis_snapshot(reducer)
+            if cancelled:
+                reducer.apply("job_cancelled")
+                self._emit_analysis_snapshot(reducer)
+            # 本轮返回「可补跑候选」；永久失败只在 failed_paths 计数
+            return failed_paths, rerun_candidates
+
+        # 首轮
+        failed_paths, rerun_candidates = run_round(videos_to_process, kind=RoundKind.FIRST)
+        first_fail_n = len(failed_paths)
+        first_ok = total_target - first_fail_n
+        succeeded = first_ok
+        failed = first_fail_n
+
+        # 批次补跑：仅可重试失败集
+        rerun_done = False
+        if should_batch_rerun(
+            len(rerun_candidates),
+            rerun_done=False,
+            enabled=retry_cfg.batch_rerun_enabled,
+            cancelled=self.is_analysis_cancelled(),
+            max_rounds=retry_cfg.batch_rerun_max_rounds,
+        ):
+            rerun_done = True
+            still_failed, _ = run_round(rerun_candidates, kind=RoundKind.RERUN)
+            # 永久失败 + 补跑仍失败
+            permanent = [p for p in failed_paths if p not in rerun_candidates]
+            recovered = len(rerun_candidates) - len(still_failed)
+            succeeded = first_ok + recovered
+            failed = len(permanent) + len(still_failed)
+            failed_paths = permanent + still_failed
+
+        if self.is_analysis_cancelled():
+            cancelled = True
+            reducer.apply("job_cancelled")
+            self._emit_analysis_snapshot(reducer)
+
         self._save_l3_backup()
         self.file_manager.save_results_to_csv(self.get_all_videos())
-        self.log("分析完成。")
+        msg = f"分析完成：成功 {succeeded}，失败 {failed}，跳过 {skipped}。"
+        if rerun_done:
+            msg += " 已执行批次补跑。"
+        if cancelled:
+            msg += " （已取消）"
+        if xmp_failed:
+            msg += f" XMP 侧车失败 {xmp_failed}。"
+        if failure_reasons:
+            # 去重保留顺序
+            uniq = list(dict.fromkeys(failure_reasons))
+            msg += " 失败摘要：" + "；".join(uniq[:5])
+            if len(uniq) > 5:
+                msg += f"…（另有 {len(uniq) - 5} 条）"
+        self.log(msg)
+        return {
+            "attempted": total_target,
+            "succeeded": succeeded,
+            "failed": failed,
+            "skipped": skipped,
+            "xmp_failed": xmp_failed,
+            "failure_reasons": failure_reasons,
+            "batch_rerun": rerun_done,
+            "cancelled": cancelled,
+            "message": msg,
+        }
 
-    def _process_single_video(self, video_path: str) -> Optional[Dict]:
-        try:
-            filename = os.path.basename(video_path)
-            self.log(f"正在处理: {filename}")
-            
-            file_hash = self.processor.get_file_hash(video_path)
-            
-            proc_res = self.processor.extract_frames(
-                video_path,
-                max_frames=SettingsManager.get_setting(self.settings, "processing.max_frames", 10),
-                target_size=SettingsManager.get_setting(self.settings, "processing.target_size", 512),
-                save_thumbnail=True,
-                use_scene_detection=SettingsManager.get_setting(self.settings, "processing.enable_scene_detection", True)
-            )
-            frames = proc_res.get("frames", [])
-            thumbnail_path = proc_res.get("thumbnail")
-            phash = proc_res.get("phash", "")
-            
-            if not frames: return None
-            
-            model_name = SettingsManager.get_setting(self.settings, "api.model_personalization.video_classification", "gemini-2.0-flash")
-            cache_key = f"{file_hash}_{model_name}"
-            ai_data = self.ai.analyze_video(frames, cache_key=cache_key)
-            
-            if not ai_data: return None
+    def _process_single_video(
+        self,
+        video_path: str,
+        force_reanalyze: bool = False,
+        progress_reducer=None,
+        retry_cfg=None,
+    ) -> tuple:
+        """
+        分析单条视频（含单条层重试）。
+        返回 (result_dict | None, error_reason | None)。
+        """
+        from core.analysis_job_policy import (
+            AnalysisPhase,
+            RetryConfig,
+            is_retriable,
+            should_retry_item,
+        )
 
-            # 标签预处理与分类联动；最终再走标签归一，保证落库标准词
-            processed_tags = ai_data.get("tags", [])
-            tag_groups = ai_data.get("tag_groups", {})
-            raw_category = ai_data.get("category", "Unknown")
+        cfg = retry_cfg or getattr(self, "_job_retry_config", None) or RetryConfig.from_settings(
+            self.settings
+        )
+        max_b = cfg.item_max_attempts
+        last_reason = "未知原因"
 
-            processed_tags, suggested_category = self.tag_processor.process(processed_tags, raw_category)
+        def emit_phase(phase, attempt_b: int):
+            if progress_reducer is None:
+                return
+            try:
+                with self._progress_lock:
+                    progress_reducer.apply(
+                        "item_phase",
+                        path=video_path,
+                        phase=phase,
+                        attempt_b=attempt_b,
+                    )
+                self._emit_analysis_snapshot(progress_reducer)
+            except Exception:
+                pass
 
-            synced_tag_groups = {}
-            for dim_id, group_tags in tag_groups.items():
-                clean_group, _ = self.tag_processor.process(group_tags, suggested_category)
-                synced_tag_groups[dim_id] = clean_group
-            tag_groups = synced_tag_groups
+        for attempt_b in range(1, max_b + 1):
+            if self.is_analysis_cancelled():
+                return None, "用户取消"
+            try:
+                filename = os.path.basename(video_path)
+                self.log(
+                    f"正在处理: {filename}"
+                    + (" [强制]" if force_reanalyze else "")
+                    + (f" [单条尝试 {attempt_b}/{max_b}]" if attempt_b > 1 else "")
+                )
 
-            ai_data = dict(ai_data)
-            ai_data["tag_groups"] = tag_groups
-            ai_data["tags"] = processed_tags
-            # 分类建议后再次归一（别名/封闭组）；待审已在 analyze 阶段记过，此处仍可补记
-            ai_data = self.ai.apply_tag_normalization(
-                ai_data, source_path=video_path, persist_pending=True
-            )
-            processed_tags = ai_data.get("tags", [])
-            tag_groups = ai_data.get("tag_groups", {})
+                emit_phase(AnalysisPhase.EXTRACT, attempt_b)
+                if not os.path.exists(video_path):
+                    return None, "文件不存在"
 
-            for tag in processed_tags:
-                self.db.increment_tag_usage(tag)
+                file_hash = self.processor.get_file_hash(video_path)
 
-            transcription = ""
-            if SettingsManager.get_setting(self.settings, "processing.enable_audio_transcription"):
-                api_key = SettingsManager.get_setting(self.settings, "api.key", "")
-                base_url = SettingsManager.get_setting(self.settings, "api.base_url", "")
-                transcription = AudioTranscriber.transcribe(video_path, api_key, base_url)
+                proc_res = self.processor.extract_frames(
+                    video_path,
+                    max_frames=SettingsManager.get_setting(
+                        self.settings, "processing.max_frames", 10
+                    ),
+                    target_size=SettingsManager.get_setting(
+                        self.settings, "processing.target_size", 512
+                    ),
+                    save_thumbnail=True,
+                    use_scene_detection=SettingsManager.get_setting(
+                        self.settings, "processing.enable_scene_detection", True
+                    ),
+                )
+                frames = proc_res.get("frames", [])
+                thumbnail_path = proc_res.get("thumbnail")
+                phash = proc_res.get("phash", "")
 
-            metadata_injected = False
-            if SettingsManager.get_setting(self.settings, "processing.enable_metadata_injection"):
-                metadata_injected = MetadataInjector.inject_tags(video_path, ai_data.get("tags", []), ai_data.get("summary", ""))
+                if not frames:
+                    last_reason = "无法抽取视频帧"
+                    self.log(f"处理失败 {filename}: {last_reason}")
+                    # 抽帧失败：默认可 B 再试一次（场景检测偶发空），但次数受 item_max 限制
+                    if should_retry_item(attempt_b, item_max_attempts=max_b):
+                        continue
+                    return None, last_reason
 
-            return {
-                "path": video_path,
-                "filename": filename,
-                "file_hash": file_hash,
-                "phash": phash,
-                "category": suggested_category,
-                "summary": ai_data.get("summary", ""),
-                "tags": processed_tags,
-                "transcription": transcription,
-                "timestamp": datetime.now().isoformat(),
-                "status": "analyzed",
-                "manual_override": False,
-                "metadata_injected": metadata_injected,
-                "thumbnail_path": thumbnail_path,
-                "raw_metadata": ai_data,
-                "face_clusters": ai_data.get("characters", []),
-                "vector_id": ai_data.get("vector_id"),
-                "tag_groups": tag_groups,
-            }
-        except Exception as e:
-            self.log(f"处理失败 {video_path}: {e}")
-        return None
+                if self.is_analysis_cancelled():
+                    return None, "用户取消"
+
+                emit_phase(AnalysisPhase.AI, attempt_b)
+                model_name = SettingsManager.get_setting(
+                    self.settings,
+                    "api.model_personalization.video_classification",
+                    "gemini-2.0-flash",
+                )
+                cache_key = f"{file_hash}_{model_name}"
+                ai_data = self.ai.analyze_video(
+                    frames, cache_key=cache_key, use_cache=not force_reanalyze
+                )
+
+                if not ai_data:
+                    if self.is_analysis_cancelled():
+                        return None, "用户取消"
+                    fail = self.ai.get_last_api_failure() if hasattr(self.ai, "get_last_api_failure") else getattr(self.ai, "_last_api_failure", None)
+                    if fail is not None:
+                        if fail.cancelled:
+                            return None, "用户取消"
+                        last_reason = fail.message or "AI 调用失败"
+                        self.log(f"处理失败 {filename}: {last_reason}")
+                        # 不可重试（鉴权等）→ 禁止 B 层再试
+                        if not fail.retriable:
+                            return None, last_reason
+                        if should_retry_item(attempt_b, item_max_attempts=max_b):
+                            continue
+                        return None, last_reason
+                    last_reason = "AI 未返回有效分析结果"
+                    self.log(f"处理失败 {filename}: {last_reason}")
+                    if should_retry_item(attempt_b, item_max_attempts=max_b):
+                        continue
+                    return None, last_reason
+
+                emit_phase(AnalysisPhase.NORMALIZE, attempt_b)
+                processed_tags = ai_data.get("tags", [])
+                tag_groups = ai_data.get("tag_groups", {})
+                raw_category = ai_data.get("category", "Unknown")
+
+                processed_tags, suggested_category = self.tag_processor.process(
+                    processed_tags, raw_category
+                )
+
+                synced_tag_groups = {}
+                for dim_id, group_tags in tag_groups.items():
+                    clean_group, _ = self.tag_processor.process(
+                        group_tags, suggested_category
+                    )
+                    synced_tag_groups[dim_id] = clean_group
+                tag_groups = synced_tag_groups
+
+                ai_data = dict(ai_data)
+                ai_data["tag_groups"] = tag_groups
+                ai_data["tags"] = processed_tags
+                # 最终归一 + 待审落库（仅成功路径一次）
+                ai_data = self.ai.apply_tag_normalization(
+                    ai_data, source_path=video_path, persist_pending=True
+                )
+                processed_tags = ai_data.get("tags", [])
+                tag_groups = ai_data.get("tag_groups", {})
+
+                for tag in processed_tags:
+                    self.db.increment_tag_usage(tag)
+
+                transcription = ""
+                if SettingsManager.get_setting(
+                    self.settings, "processing.enable_audio_transcription"
+                ):
+                    api_key = SettingsManager.get_setting(self.settings, "api.key", "")
+                    base_url = SettingsManager.get_setting(
+                        self.settings, "api.base_url", ""
+                    )
+                    transcription = AudioTranscriber.transcribe(
+                        video_path, api_key, base_url
+                    )
+
+                metadata_injected = False
+                if SettingsManager.get_setting(
+                    self.settings, "processing.enable_metadata_injection"
+                ):
+                    metadata_injected = MetadataInjector.inject_tags(
+                        video_path,
+                        ai_data.get("tags", []),
+                        ai_data.get("summary", ""),
+                    )
+
+                return {
+                    "path": video_path,
+                    "filename": filename,
+                    "file_hash": file_hash,
+                    "phash": phash,
+                    "category": suggested_category,
+                    "summary": ai_data.get("summary", ""),
+                    "tags": processed_tags,
+                    "transcription": transcription,
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "analyzed",
+                    "manual_override": False,
+                    "metadata_injected": metadata_injected,
+                    "thumbnail_path": thumbnail_path,
+                    "raw_metadata": ai_data,
+                    "face_clusters": ai_data.get("characters", []),
+                    "vector_id": ai_data.get("vector_id"),
+                    "tag_groups": tag_groups,
+                }, None
+            except Exception as e:
+                last_reason = str(e) or e.__class__.__name__
+                if len(last_reason) > 200:
+                    last_reason = last_reason[:200] + "…"
+                self.log(f"处理失败 {video_path}: {last_reason}")
+                if self.is_analysis_cancelled():
+                    return None, "用户取消"
+                # 不可恢复：不 B 重试
+                if not is_retriable(e) and not is_retriable(last_reason):
+                    return None, last_reason
+                if should_retry_item(attempt_b, item_max_attempts=max_b):
+                    continue
+                return None, last_reason
+
+        return None, last_reason
 
     def find_physical_file(self, video_data: Dict, index: Dict[str, str]) -> Optional[str]:
         """鲁棒性查找物理文件路径"""
@@ -2471,21 +3759,44 @@ class VideoOrganizerService:
         """
         为视频生成 XMP 侧边文件，优化了达芬奇与 PR 的双重兼容性。
         V6.0: 增加对全局导出方案的支持，并支持数据库驱动的层级标签。
+        人物 Region / 层级 lookup 缺失时安全降级，不得抛 NameError。
         """
+        from core.analysis_targets import path_status_key
+
         videos = self.db.get_all_videos()
         if selected_paths:
-            videos = [v for v in videos if v.get("path") in selected_paths]
+            allow = {path_status_key(p) for p in selected_paths if p}
+            videos = [
+                v for v in videos
+                if path_status_key(v.get("path", "")) in allow
+            ]
             
         # 获取全局导出设置
-        global_settings = self.tag_config.get("global_settings", {})
-        export_schemes = global_settings.get("export_schemes", {})
+        global_settings = self.tag_config.get("global_settings", {}) if self.tag_config else {}
+        export_schemes = global_settings.get("export_schemes", {}) or {}
         use_hierarchical = export_schemes.get("xmp_hierarchical", True)
         prefix_category = export_schemes.get("xmp_prefix_category", True)
 
-        # 建立标签库以供转换
-        tags_detail = self.db.get_tags_detail()
+        # 建立标签库以供转换 + 层级 / 人物集合（必须在本函数内构建，禁止未定义名）
+        tags_detail = self.db.get_tags_detail() or []
         zh_to_en = {t["tag_name"]: t.get("name_en") for t in tags_detail if t.get("name_en")}
         en_to_zh = {t.get("name_en"): t["tag_name"] for t in tags_detail if t.get("name_en")}
+
+        tag_lookup: Dict[str, Dict] = {}
+        id_lookup: Dict[Any, Dict] = {}
+        person_tags: set = set()
+        _person_dims = frozenset({"subject", "主体", "person", "人物", "people"})
+        for t in tags_detail:
+            name = t.get("tag_name")
+            if not name:
+                continue
+            tag_lookup[name] = t
+            tid = t.get("id")
+            if tid is not None:
+                id_lookup[tid] = t
+            dim = str(t.get("dimension") or "").strip().lower()
+            if t.get("is_person") or dim in _person_dims:
+                person_tags.add(name)
         
         # 确定目标语言 (V6.0)
         target_lang = global_settings.get("language", "zh-CN")
@@ -2520,9 +3831,9 @@ class VideoOrganizerService:
                 continue
                 
             xmp_path = os.path.splitext(video_path)[0] + ".xmp"
-            tags = item.get("tags", [])
-            summary = escape(item.get("summary", ""))
-            category = item.get("category", "")
+            tags = item.get("tags", []) or []
+            summary = escape(item.get("summary", "") or "")
+            category = item.get("category", "") or ""
             
             c1_mood = ""
             h_tags = []
@@ -2534,11 +3845,20 @@ class VideoOrganizerService:
             regions_rdf = ""
             active_person_tags = []
 
+            # face_clusters / characters 名称也视为人物，用于 Region 联动
+            face_names = set()
+            for face in item.get("face_clusters", []) or []:
+                if isinstance(face, dict) and face.get("name"):
+                    face_names.add(str(face["name"]))
+                elif isinstance(face, str) and face.strip():
+                    face_names.add(face.strip())
+            item_person_tags = set(person_tags) | face_names
+
             for t in tags:
                 # 翻译标签 (V6.0)
                 t_display = translate_tag(t)
                 
-                if t in person_tags:
+                if t in item_person_tags or t_display in item_person_tags:
                     active_person_tags.append(t_display)
 
                 if use_hierarchical:

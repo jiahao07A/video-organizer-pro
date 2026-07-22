@@ -5,26 +5,55 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QLabel, QSplitter, QStackedWidget, QTableView, QListView,
     QHeaderView, QAbstractItemView, QProgressBar, QMessageBox, QMenu,
-    QDialog, QFileDialog, QTreeView, QListView as QtListView,
+    QDialog, QFileDialog, QTreeView, QListView as QtListView, QCheckBox,
+    QToolButton, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QItemSelectionModel
+from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QEvent, QObject
+from PySide6.QtGui import QKeySequence, QShortcut
 from ..widgets.filter_panel import FilterPanel
 from ..widgets.detail_panel import DetailPanel
 from ..widgets.delegates import CardDelegate, StatusDelegate, ThumbnailDelegate
-from ..models.video_table import VideoTableModel
+from ..models.video_table import (
+    VideoTableModel,
+    COL_FILENAME,
+    COL_LIBRARY_ID,
+    COL_LIST_NO,
+    COL_STATUS,
+    COL_THUMB,
+    COL_CATEGORY,
+    COL_TAGS,
+    migrate_table_column_prefs,
+)
 from ..models.proxy_model import AdvancedSortFilterProxyModel
 from ..workers.analysis_worker import AnalysisWorker
 from ..workers.rename_worker import RenameWorker
 from ..widgets.rename_dialog import BatchRenameDialog
-from core.video_organizer_service import VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from gui.styles import normalize_theme
+
+
+class _ClearSelectionOnEmptyClickFilter(QObject):
+    """点空白区域清除选中（资源管理器常见交互）。"""
+
+    def __init__(self, view: QAbstractItemView, parent=None):
+        super().__init__(parent)
+        self._view = view
+
+    def eventFilter(self, obj, event):
+        if obj is self._view.viewport() and event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                idx = self._view.indexAt(pos)
+                if not idx.isValid():
+                    self._view.clearSelection()
+        return False
 
 
 class WorkstationView(QWidget):
     """工作台视图 - 核心视频处理区域（仅呈现当前工作范围）"""
-    video_selected = Signal(dict) # 选中视频信号
+    video_selected = Signal(dict)  # 选中视频信号
     status_message = Signal(str)  # 状态栏消息信号
-    progress_updated = Signal(int) # 进度值信号
+    progress_updated = Signal(int)  # 进度值信号
 
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
@@ -41,12 +70,12 @@ class WorkstationView(QWidget):
 
         # 1. 顶部工具栏
         toolbar = QHBoxLayout()
-        
+
         self.path_input = QLineEdit()
         self.path_input.setReadOnly(True)
         self.path_input.setPlaceholderText("尚未设定工作范围 — 请点「浏览」选择文件/文件夹")
         self.path_input.setToolTip("当前工作范围路径（由「浏览」整份替换设定）")
-        
+
         browse_btn = QPushButton("浏览")
         browse_btn.setToolTip("多选文件与文件夹，确认为整份替换工作范围")
         browse_btn.clicked.connect(self.browse_path)
@@ -54,19 +83,17 @@ class WorkstationView(QWidget):
         accumulate_btn = QPushButton("累加")
         accumulate_btn.setToolTip("再选文件/文件夹，追加进当前工作范围")
         accumulate_btn.clicked.connect(self.accumulate_path)
-        
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索视频...")
         self.search_input.setFixedWidth(200)
         self.search_input.textChanged.connect(self.filter_text_changed)
 
-        # 筛选器开关
         self.filter_btn = QPushButton("高级筛选")
         self.filter_btn.setCheckable(True)
         self.filter_btn.setChecked(False)
         self.filter_btn.clicked.connect(self.toggle_filter_panel)
 
-        # 视图切换
         self.view_switch_btn = QPushButton("切换视图")
         self.view_switch_btn.setCheckable(True)
         self.view_switch_btn.clicked.connect(self.toggle_view_mode)
@@ -76,7 +103,24 @@ class WorkstationView(QWidget):
         self.analyze_btn.setObjectName("primary_button")
         self.analyze_btn.setStyleSheet("background-color: #3d5afe; color: white; font-weight: bold;")
         self.analyze_btn.clicked.connect(self.start_analysis)
-        
+
+        self.cancel_analysis_btn = QPushButton("取消分析")
+        self.cancel_analysis_btn.setEnabled(False)
+        self.cancel_analysis_btn.setToolTip("协作式取消：停止排队与批次补跑，已成功结果保留")
+        self.cancel_analysis_btn.clicked.connect(self.cancel_analysis)
+
+        self.force_reanalyze_cb = QCheckBox("强制重新分析")
+        self.force_reanalyze_cb.setToolTip("勾选后对已分析视频也重新分析，并整份覆盖分类/摘要/标签")
+
+        self.delete_btn = QPushButton("移出工作范围")
+        self.delete_btn.setToolTip("从当前工作范围移除选中/可见目标（保留库记录与磁盘文件）")
+        self.delete_btn.clicked.connect(self.delete_selected)
+
+        self.cols_btn = QToolButton()
+        self.cols_btn.setText("列显示")
+        self.cols_btn.setPopupMode(QToolButton.InstantPopup)
+        self.cols_btn.setToolTip("显示/隐藏列表列")
+
         toolbar.addWidget(QLabel("路径:"))
         toolbar.addWidget(self.path_input)
         toolbar.addWidget(browse_btn)
@@ -85,8 +129,12 @@ class WorkstationView(QWidget):
         toolbar.addWidget(self.search_input)
         toolbar.addWidget(self.filter_btn)
         toolbar.addWidget(self.view_switch_btn)
+        toolbar.addWidget(self.cols_btn)
+        toolbar.addWidget(self.force_reanalyze_cb)
         toolbar.addWidget(self.analyze_btn)
-        
+        toolbar.addWidget(self.cancel_analysis_btn)
+        toolbar.addWidget(self.delete_btn)
+
         layout.addLayout(toolbar)
 
         # 2. 筛选面板
@@ -98,49 +146,52 @@ class WorkstationView(QWidget):
         # 3. 中间区域
         self.splitter = QSplitter(Qt.Horizontal)
         self.view_stack = QStackedWidget()
-        
-        # --- 表格视图 ---
+
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
         table_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         self.table_view = QTableView()
         self.model = VideoTableModel()
         self.proxy_model = AdvancedSortFilterProxyModel()
         self.proxy_model.setSourceModel(self.model)
         self.proxy_model.setFilterKeyColumn(-1)
         self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
-        
+
         self.table_view.setModel(self.proxy_model)
         self.table_view.setSortingEnabled(True)
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.verticalHeader().setVisible(False)
-        self.table_view.verticalHeader().setDefaultSectionSize(80) # 设置默认行高以适应 16:9 缩略图
-        
-        # 配置列头
+        self.table_view.verticalHeader().setDefaultSectionSize(80)
+
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table_view.setColumnWidth(0, 50)
-        self.table_view.setColumnWidth(1, 140) # 稍微增加宽度以适应 16:9 比例
-        self.table_view.setColumnWidth(3, 100)
-        self.table_view.setColumnWidth(4, 150)
-        self.table_view.setColumnWidth(5, 80)
+        header.setSectionResizeMode(COL_FILENAME, QHeaderView.Stretch)
+        header.sectionResized.connect(self._on_column_resized)
+        header.sectionDoubleClicked.connect(self._on_header_double_clicked)
+        self.table_view.setColumnWidth(COL_LIST_NO, 40)
+        self.table_view.setColumnWidth(COL_LIBRARY_ID, 70)
+        self.table_view.setColumnWidth(COL_THUMB, 140)
+        self.table_view.setColumnWidth(COL_STATUS, 80)
 
         self.thumb_delegate = ThumbnailDelegate()
         self.status_delegate = StatusDelegate()
-        self.table_view.setItemDelegateForColumn(1, self.thumb_delegate)
-        self.table_view.setItemDelegateForColumn(5, self.status_delegate)
+        self.table_view.setItemDelegateForColumn(COL_THUMB, self.thumb_delegate)
+        self.table_view.setItemDelegateForColumn(COL_STATUS, self.status_delegate)
 
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self.show_context_menu)
+        self.proxy_model.layoutChanged.connect(self._refresh_list_numbers)
+        self.proxy_model.modelReset.connect(self._refresh_list_numbers)
+        self.proxy_model.rowsInserted.connect(lambda *_: self._refresh_list_numbers())
+        self.proxy_model.rowsRemoved.connect(lambda *_: self._refresh_list_numbers())
+        header.sortIndicatorChanged.connect(lambda *_: self._refresh_list_numbers())
 
         table_layout.addWidget(self.table_view)
-        
-        # --- 卡片视图 ---
+
         self.card_view = QListView()
         self.card_view.setViewMode(QListView.IconMode)
         self.card_view.setResizeMode(QListView.Adjust)
@@ -148,28 +199,30 @@ class WorkstationView(QWidget):
         self.card_view.setWordWrap(True)
         self.card_view.setSpacing(10)
         self.card_view.setModel(self.proxy_model)
-        self.card_view.setModelColumn(2)
+        self.card_view.setModelColumn(COL_FILENAME)
         self.card_view.setItemDelegate(CardDelegate(self.card_view))
         self.card_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.card_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.card_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.card_view.customContextMenuRequested.connect(self.show_context_menu)
-        
+
         self.view_stack.addWidget(table_container)
         self.view_stack.addWidget(self.card_view)
 
-        # 右侧详情面板
+        self._wire_selection_ux(self.table_view)
+        self._wire_selection_ux(self.card_view)
+
         self.detail_panel = DetailPanel(self.service)
         self.detail_panel.data_changed.connect(self.load_data)
-        
+        self.detail_panel.setMinimumWidth(320)
+
         self.splitter.addWidget(self.view_stack)
         self.splitter.addWidget(self.detail_panel)
         self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 1)
-        
-        layout.addWidget(self.splitter)
+        self.splitter.setStretchFactor(1, 2)
 
-        # 4. 底部控制栏
+        layout.addWidget(self.splitter, 1)
+
         controls_layout = QHBoxLayout()
         self.simulate_btn = QPushButton("模拟重命名")
         self.apply_btn = QPushButton("应用重命名")
@@ -178,12 +231,11 @@ class WorkstationView(QWidget):
         self.export_ale_btn = QPushButton("导出 ALE (达芬奇)")
         self.sync_xmp_btn = QPushButton("同步元数据 (XMP)")
         self.sync_xmp_btn.setStyleSheet("background-color: #2e7d32; color: white;")
-        
-        # V4.0: 新增自动化按钮
+
         self.auto_organize_btn = QPushButton("自动分类整理")
         self.auto_organize_btn.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
         self.auto_organize_btn.clicked.connect(self.start_auto_organize)
-        
+
         self.simulate_btn.clicked.connect(lambda: self.start_rename(dry_run=True))
         self.apply_btn.clicked.connect(lambda: self.start_rename(dry_run=False))
         self.rollback_btn.clicked.connect(self.rollback_rename)
@@ -201,14 +253,232 @@ class WorkstationView(QWidget):
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
-        # 进度条
-        progress_layout = QHBoxLayout()
+        progress_layout = QVBoxLayout()
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(2)
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setMaximumHeight(22)
+        bar_row = QHBoxLayout()
+        bar_row.setContentsMargins(0, 0, 0, 0)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.status_label = QLabel("准备就绪")
+        self.progress_bar.setMaximumHeight(14)
+        self.progress_bar.setFormat("总 %p%")
+        self.sub_progress_bar = QProgressBar()
+        self.sub_progress_bar.setVisible(False)
+        self.sub_progress_bar.setMaximumHeight(14)
+        self.sub_progress_bar.setFormat("本轮 %p%")
+        bar_row.addWidget(QLabel("总"))
+        bar_row.addWidget(self.progress_bar, 1)
+        bar_row.addWidget(QLabel("本轮"))
+        bar_row.addWidget(self.sub_progress_bar, 1)
         progress_layout.addWidget(self.status_label)
-        progress_layout.addWidget(self.progress_bar, 1)
+        progress_layout.addLayout(bar_row)
         layout.addLayout(progress_layout)
+
+        self._build_column_menu()
+        self._apply_column_preferences()
+        self._restore_column_widths()
+
+    def _wire_selection_ux(self, view: QAbstractItemView):
+        """ExtendedSelection + Ctrl+A + 点空白 clearSelection。"""
+        view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        filt = _ClearSelectionOnEmptyClickFilter(view, self)
+        view.viewport().installEventFilter(filt)
+        if not hasattr(self, "_selection_filters"):
+            self._selection_filters = []
+        self._selection_filters.append(filt)
+        sc = QShortcut(QKeySequence.SelectAll, view)
+        sc.setContext(Qt.WidgetWithChildrenShortcut)
+        sc.activated.connect(view.selectAll)
+        if not hasattr(self, "_selection_shortcuts"):
+            self._selection_shortcuts = []
+        self._selection_shortcuts.append(sc)
+
+    def _active_item_view(self) -> QAbstractItemView:
+        if self.view_stack.currentWidget() == self.card_view:
+            return self.card_view
+        return self.table_view
+
+    def _get_selected_paths(self) -> list:
+        """当前列表/卡片选中的视频路径（去重，保持顺序）。"""
+        view = self._active_item_view()
+        if view is self.card_view:
+            indexes = view.selectionModel().selectedIndexes()
+        else:
+            indexes = view.selectionModel().selectedRows()
+        paths = []
+        seen = set()
+        for idx in indexes:
+            src = self.proxy_model.mapToSource(self.proxy_model.index(idx.row(), 0))
+            if not (0 <= src.row() < len(self.model.videos)):
+                continue
+            p = self.model.videos[src.row()].get("path")
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+        return paths
+
+    def _get_visible_paths(self) -> list:
+        """当前筛选/排序后的可见列表路径。"""
+        paths = []
+        for visual in range(self.proxy_model.rowCount()):
+            src = self.proxy_model.mapToSource(self.proxy_model.index(visual, 0)).row()
+            if not (0 <= src < len(self.model.videos)):
+                continue
+            p = self.model.videos[src].get("path")
+            if p:
+                paths.append(p)
+        return paths
+
+    def _scope_paths(self) -> list:
+        """工作范围内已入库视频路径。"""
+        return [v.get("path") for v in self.service.get_videos_in_work_scope() if v.get("path")]
+
+    def _resolve_batch_targets(self) -> list:
+        """批量操作目标：有选中用选中，无选中用可见；始终 ⊆ 工作范围。"""
+        selected = self._get_selected_paths()
+        visible = self._get_visible_paths()
+        return self.service.resolve_operation_target_paths(
+            selected or None,
+            visible,
+            scope_paths=self._scope_paths(),
+        )
+
+    def _build_column_menu(self):
+        menu = QMenu(self)
+        raw_prefs = (self.settings.get("ui_preferences") or {}).get("table_columns_visible") or {}
+        prefs = migrate_table_column_prefs(raw_prefs, self.model.columnCount())
+        defaults = {
+            COL_LIST_NO: True,
+            COL_LIBRARY_ID: True,
+            COL_THUMB: True,
+            COL_FILENAME: True,
+            COL_CATEGORY: True,
+            COL_TAGS: True,
+            COL_STATUS: True,
+        }
+        labels = list(self.model.headers)
+        self._col_actions = {}
+        for i, lab in enumerate(labels):
+            act = menu.addAction(lab)
+            act.setCheckable(True)
+            act.setChecked(prefs.get(str(i), defaults.get(i, True)))
+            act.toggled.connect(lambda checked, col=i: self._set_column_visible(col, checked))
+            self._col_actions[i] = act
+        reset_act = menu.addAction("重置列宽")
+        reset_act.triggered.connect(self._reset_column_widths)
+        self.cols_btn.setMenu(menu)
+
+    def _set_column_visible(self, col: int, visible: bool):
+        if col < 0 or col >= self.model.columnCount():
+            return
+        self.table_view.setColumnHidden(col, not visible)
+        prefs = self.settings.setdefault("ui_preferences", {})
+        cols = prefs.setdefault("table_columns_visible", {})
+        cols[str(col)] = visible
+        cols["_schema"] = "no_check_col"
+        try:
+            SettingsManager.save_settings(self.settings, self.service.db)
+        except Exception:
+            pass
+
+    def _apply_column_preferences(self):
+        raw = (self.settings.get("ui_preferences") or {}).get("table_columns_visible") or {}
+        prefs = migrate_table_column_prefs(raw, self.model.columnCount())
+        for i in range(self.model.columnCount()):
+            show = prefs.get(str(i), True)
+            self.table_view.setColumnHidden(i, not show)
+        if raw != prefs or raw.get("_schema") != "no_check_col":
+            try:
+                to_store = dict(prefs)
+                to_store["_schema"] = "no_check_col"
+                self.settings.setdefault("ui_preferences", {})["table_columns_visible"] = to_store
+                SettingsManager.save_settings(self.settings, self.service.db)
+            except Exception:
+                pass
+
+    def _on_column_resized(self, logical, _old, new):
+        if logical < 0 or logical >= self.model.columnCount():
+            return
+        prefs = self.settings.setdefault("ui_preferences", {})
+        widths = prefs.setdefault("table_column_widths", {})
+        widths[str(logical)] = new
+        try:
+            SettingsManager.save_settings(self.settings, self.service.db)
+        except Exception:
+            pass
+
+    def _restore_column_widths(self):
+        raw = (self.settings.get("ui_preferences") or {}).get("table_column_widths") or {}
+        widths = migrate_table_column_prefs(raw, self.model.columnCount())
+        for k, w in widths.items():
+            try:
+                col = int(k)
+                if 0 <= col < self.model.columnCount():
+                    self.table_view.setColumnWidth(col, int(w))
+            except Exception:
+                pass
+
+    def _reset_column_widths(self):
+        defaults = {
+            COL_LIST_NO: 40,
+            COL_LIBRARY_ID: 70,
+            COL_THUMB: 140,
+            COL_FILENAME: 200,
+            COL_CATEGORY: 100,
+            COL_TAGS: 150,
+            COL_STATUS: 80,
+        }
+        for c, w in defaults.items():
+            self.table_view.setColumnWidth(c, w)
+        prefs = self.settings.setdefault("ui_preferences", {})
+        prefs["table_column_widths"] = {str(k): v for k, v in defaults.items()}
+        try:
+            SettingsManager.save_settings(self.settings, self.service.db)
+        except Exception:
+            pass
+
+    def _on_header_double_clicked(self, logical):
+        if 0 <= logical < self.model.columnCount():
+            self.table_view.resizeColumnToContents(logical)
+
+    def _refresh_list_numbers(self):
+        """按当前可见顺序刷新列表序号；防重入，避免卡死 UI。"""
+        if getattr(self, "_list_no_refreshing", False):
+            return
+        if getattr(self, "_list_no_refresh_scheduled", False):
+            return
+        # 合并同事件循环内多次 layoutChanged/rows* 信号
+        self._list_no_refresh_scheduled = True
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._do_refresh_list_numbers)
+
+    def _do_refresh_list_numbers(self):
+        self._list_no_refresh_scheduled = False
+        if getattr(self, "_list_no_refreshing", False):
+            return
+        self._list_no_refreshing = True
+        proxy = self.proxy_model
+        # 更新「#」列 DisplayRole 时禁止代理按该列动态重排，否则会无限递归
+        was_dynamic = True
+        try:
+            was_dynamic = proxy.dynamicSortFilter()
+            proxy.setDynamicSortFilter(False)
+        except Exception:
+            pass
+        try:
+            mapping = {}
+            for visual in range(proxy.rowCount()):
+                src = proxy.mapToSource(proxy.index(visual, 0)).row()
+                mapping[src] = visual + 1
+            self.model.set_list_numbers(mapping)
+        finally:
+            try:
+                proxy.setDynamicSortFilter(was_dynamic)
+            except Exception:
+                pass
+            self._list_no_refreshing = False
 
     def toggle_filter_panel(self):
         self.filter_panel.setVisible(self.filter_btn.isChecked())
@@ -234,27 +504,25 @@ class WorkstationView(QWidget):
 
     def toggle_view_mode(self):
         if self.view_switch_btn.isChecked():
-            # 同步选择到卡片视图
             self.card_view.selectionModel().clearSelection()
             for idx in self.table_view.selectionModel().selectedRows():
                 self.card_view.selectionModel().select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
-            
             self.view_stack.setCurrentWidget(self.card_view)
             self.view_switch_btn.setText("切换列表")
         else:
-            # 同步选择到表格视图
             self.table_view.selectionModel().clearSelection()
             for idx in self.card_view.selectionModel().selectedIndexes():
                 self.table_view.selectionModel().select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
-                
             self.view_stack.setCurrentIndex(0)
             self.view_switch_btn.setText("切换视图")
 
     def filter_text_changed(self, text):
         self.proxy_model.set_filter_params({"text": text})
+        self._refresh_list_numbers()
 
     def apply_advanced_filter(self, params):
         self.proxy_model.set_filter_params(params)
+        self._refresh_list_numbers()
 
     def _collect_dialog_paths(self, dialog: QFileDialog) -> list:
         """从非原生文件对话框收集多选路径（文件 + 文件夹）。"""
@@ -290,7 +558,6 @@ class WorkstationView(QWidget):
                         path = None
                 if not path:
                     data = model.data(idx, Qt.DisplayRole)
-                    # 回退：相对名不可靠，跳过
                     if data and os.path.isabs(str(data)):
                         path = str(data)
                 add(path)
@@ -314,7 +581,6 @@ class WorkstationView(QWidget):
         """多选文件与文件夹，确认后整份替换工作范围并扫盘入库。"""
         dialog = QFileDialog(self, "选择工作范围（可多选文件与文件夹，确认后整份替换）")
         dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        # Directory 模式 + 显示文件：便于一次多选文件夹；文件亦可选
         dialog.setFileMode(QFileDialog.Directory)
         dialog.setOption(QFileDialog.ShowDirsOnly, False)
         dialog.setNameFilters([
@@ -378,12 +644,15 @@ class WorkstationView(QWidget):
         scope = self.service.get_work_scope_paths()
         videos = self.service.get_videos_in_work_scope()
         self.model.update_data(videos)
+        if hasattr(self, "_refresh_list_numbers"):
+            self._refresh_list_numbers()
         self._refresh_scope_path_ui()
         if not scope:
             self.status_label.setText("请先设定工作范围：点击「浏览」选择文件或文件夹")
             self.status_message.emit(self.status_label.text())
         else:
             self.status_label.setText(f"工作范围内共 {len(videos)} 个已入库视频")
+            self.status_message.emit(self.status_label.text())
 
     def on_selection_changed(self, selected, deselected):
         if self.view_stack.currentWidget() == self.card_view:
@@ -393,9 +662,9 @@ class WorkstationView(QWidget):
 
         if not indexes:
             return
-            
+
         rows = sorted(list(set(idx.row() for idx in indexes)))
-        
+
         if len(rows) > 1:
             selected_videos = []
             for row in rows:
@@ -412,27 +681,29 @@ class WorkstationView(QWidget):
 
     def show_context_menu(self, pos):
         sender = self.sender()
-        if not sender: return
-        
+        if not sender:
+            return
+
         if sender == self.card_view:
             indexes = self.card_view.selectionModel().selectedIndexes()
         else:
             indexes = self.table_view.selectionModel().selectedRows()
-            
-        if not indexes: return
+
+        if not indexes:
+            return
 
         menu = QMenu(self)
         analyze_action = menu.addAction("🔍 分析选中项")
-        delete_action = menu.addAction("🗑️ 删除记录")
+        delete_action = menu.addAction("移出工作范围")
         menu.addSeparator()
         replace_tag_action = menu.addAction("🔄 批量替换标签")
         menu.addSeparator()
-        folder_action = menu.addAction("📂 打开所在文件夹")
-        play_action = menu.addAction("▶️ 播放视频")
-        
+        folder_action = menu.addAction("📂 在文件夹中显示")
+        play_action = menu.addAction("▶️ 播放/暂停预览")
+
         global_pos = sender.viewport().mapToGlobal(pos)
         action = menu.exec_(global_pos)
-        
+
         if action == analyze_action:
             self.analyze_selected()
         elif action == delete_action:
@@ -448,13 +719,18 @@ class WorkstationView(QWidget):
         """弹出对话框进行批量标签替换"""
         from PySide6.QtWidgets import QInputDialog
         old_tag, ok1 = QInputDialog.getText(self, "批量替换标签", "请输入要替换的原标签:")
-        if not ok1 or not old_tag: return
-        
+        if not ok1 or not old_tag:
+            return
+
         new_tag, ok2 = QInputDialog.getText(self, "批量替换标签", f"将 '{old_tag}' 替换为:")
-        if not ok2: return
-        
-        reply = QMessageBox.question(self, "确认替换", f"确定要将所有视频中的标签 '{old_tag}' 替换为 '{new_tag}' 吗？",
-                                     QMessageBox.Yes | QMessageBox.No)
+        if not ok2:
+            return
+
+        reply = QMessageBox.question(
+            self, "确认替换",
+            f"确定要将所有视频中的标签 '{old_tag}' 替换为 '{new_tag}' 吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply == QMessageBox.Yes:
             self.service.bulk_replace_tags(old_tag, new_tag)
             self.load_data()
@@ -465,7 +741,7 @@ class WorkstationView(QWidget):
             indexes = self.card_view.selectionModel().selectedIndexes()
         else:
             indexes = self.table_view.selectionModel().selectedRows()
-            
+
         rows = sorted(list(set(idx.row() for idx in indexes)))
         source_rows = []
         for r in rows:
@@ -475,33 +751,55 @@ class WorkstationView(QWidget):
         return source_rows
 
     def analyze_selected(self):
-        source_rows = self.get_selected_source_rows()
-        paths = [self.model.videos[row].get("path") for row in source_rows]
-        if not paths: return
-        
+        """右键：仅分析当前列表选中（非「可见全部」回退）。"""
+        paths = self._get_selected_paths()
+        if not paths:
+            return
+        force = getattr(self, "force_reanalyze_cb", None) and self.force_reanalyze_cb.isChecked()
+        if force:
+            reply = QMessageBox.question(
+                self, "确认强制重新分析",
+                f"将对选中的 {len(paths)} 个视频强制重新分析并覆盖结果。是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
         self.set_ui_enabled(False)
+        self.cancel_analysis_btn.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.sub_progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        
-        self.worker = AnalysisWorker(self.service, paths)
+        self.sub_progress_bar.setVisible(True)
+        self.worker = AnalysisWorker(self.service, paths, force_reanalyze=bool(force))
         self.worker.progress_updated.connect(self.update_status)
+        self.worker.snapshot_updated.connect(self.on_analysis_snapshot)
         self.worker.task_finished.connect(self.on_task_finished)
         self.worker.start()
 
     def delete_selected(self):
-        source_rows = self.get_selected_source_rows()
-        if not source_rows: return
-        
-        reply = QMessageBox.question(self, "确认删除", f"确定要从数据库中删除选中的 {len(source_rows)} 条记录吗？\n(物理文件不会被删除)",
-                                     QMessageBox.Yes | QMessageBox.No)
+        """工作台删除 = 移出工作范围（操作目标集）。"""
+        paths = self._resolve_batch_targets()
+        if not paths:
+            QMessageBox.warning(
+                self, "提示",
+                "没有可移出的视频。\n请先设定工作范围，或在列表中选中目标（无选中则作用于当前可见列表）。",
+            )
+            return
+        n = len(paths)
+        reply = QMessageBox.question(
+            self, "移出工作范围",
+            f"确定将 {n} 条移出当前工作范围？\n"
+            f"仅从工作范围移除，素材库入库记录与磁盘文件都会保留。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply == QMessageBox.Yes:
-            paths = [self.model.videos[row].get("path") for row in source_rows]
-            self.service.delete_videos(paths)
+            self.service.remove_videos_from_work_scope(paths)
             self.load_data()
 
     def open_selected_folder(self):
         source_rows = self.get_selected_source_rows()
-        if not source_rows: return
+        if not source_rows:
+            return
         path = self.model.videos[source_rows[0]].get("path")
         if path and os.path.exists(path):
             folder = os.path.dirname(path)
@@ -521,6 +819,42 @@ class WorkstationView(QWidget):
             self.progress_bar.setValue(progress)
             self.progress_updated.emit(progress)
 
+    def on_analysis_snapshot(self, snap: dict):
+        """消费结构化分析进度快照（总/子进度 + 行临时态）。"""
+        if not isinstance(snap, dict):
+            return
+        msg = snap.get("message") or ""
+        if msg:
+            self.status_label.setText(msg)
+            self.status_message.emit(msg)
+        overall = int(snap.get("overall_percent") or 0)
+        sub = int(snap.get("sub_percent") or 0)
+        self.progress_bar.setVisible(True)
+        self.sub_progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.sub_progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(overall)
+        self.sub_progress_bar.setValue(sub)
+        od, ot = snap.get("overall_done", 0), snap.get("overall_total", 0)
+        sd, st = snap.get("sub_done", 0), snap.get("sub_total", 0)
+        self.progress_bar.setFormat(f"总 {od}/{ot} (%p%)")
+        kind = snap.get("round_kind") or "first"
+        if kind == "rerun":
+            self.sub_progress_bar.setFormat(f"补跑 {sd}/{st} (%p%)")
+        else:
+            self.sub_progress_bar.setFormat(f"本轮 {sd}/{st} (%p%)")
+        self.progress_updated.emit(overall)
+        rows = snap.get("rows") or {}
+        if hasattr(self.model, "set_temp_status_map"):
+            self.model.set_temp_status_map(rows)
+
+    def cancel_analysis(self):
+        w = getattr(self, "worker", None)
+        if w is not None and hasattr(w, "request_cancel"):
+            w.request_cancel()
+            self.status_label.setText("正在取消分析…")
+            self.cancel_analysis_btn.setEnabled(False)
+
     def set_ui_enabled(self, enabled):
         self.analyze_btn.setEnabled(enabled)
         self.simulate_btn.setEnabled(enabled)
@@ -528,25 +862,45 @@ class WorkstationView(QWidget):
         self.rollback_btn.setEnabled(enabled)
         self.sync_xmp_btn.setEnabled(enabled)
         self.path_input.setEnabled(enabled)
+        if enabled:
+            self.cancel_analysis_btn.setEnabled(False)
 
     def start_analysis(self):
-        """分析当前工作范围内的视频（有勾选则仅勾选；未勾选则范围全部）。"""
+        """分析操作目标集：有选中用选中，无选中用当前可见；⊆ 工作范围。"""
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先通过「浏览」设定工作范围。")
             return
 
-        paths = self.service.resolve_operation_target_paths(list(self.model.checked_items) or None)
+        paths = self._resolve_batch_targets()
         if not paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可分析的视频。")
             return
 
-        self.set_ui_enabled(False)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
+        force = getattr(self, "force_reanalyze_cb", None) and self.force_reanalyze_cb.isChecked()
+        if force:
+            reply = QMessageBox.question(
+                self, "确认强制重新分析",
+                f"将对 {len(paths)} 个目标强制重新分析并整份覆盖分类/摘要/标签。是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
-        self.worker = AnalysisWorker(self.service, paths)
+        self.set_ui_enabled(False)
+        self.cancel_analysis_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.sub_progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.sub_progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.sub_progress_bar.setRange(0, 100)
+        if hasattr(self.model, "clear_temp_status_map"):
+            self.model.clear_temp_status_map()
+
+        self.worker = AnalysisWorker(self.service, paths, force_reanalyze=bool(force))
         self.worker.progress_updated.connect(self.update_status)
+        self.worker.snapshot_updated.connect(self.on_analysis_snapshot)
         self.worker.task_finished.connect(self.on_task_finished)
         self.worker.start()
 
@@ -556,9 +910,15 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
 
-        checked = list(self.model.checked_items) or None
-        selected_paths = self.service.resolve_operation_target_paths(checked)
-        selected_videos = self.service.get_videos_for_operation(checked)
+        selected = self._get_selected_paths() or None
+        visible = self._get_visible_paths()
+        scope_paths = self._scope_paths()
+        selected_paths = self.service.resolve_operation_target_paths(
+            selected, visible, scope_paths=scope_paths
+        )
+        selected_videos = self.service.get_videos_for_operation(
+            selected, visible, scope_paths=scope_paths
+        )
 
         if not selected_videos:
             QMessageBox.warning(self, "警告", "工作范围内没有可重命名的视频。")
@@ -567,25 +927,29 @@ class WorkstationView(QWidget):
         dialog = BatchRenameDialog(self.service, selected_videos, self)
         if dialog.exec() != QDialog.Accepted:
             return
-            
+
         config = dialog.get_final_config()
 
         if not dry_run:
-            reply = QMessageBox.question(self, "确认", "确定要应用重命名吗？文件将被物理重命名。", 
-                                         QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.No: return
+            reply = QMessageBox.question(
+                self, "确认",
+                f"确定要对 {len(selected_paths)} 个文件应用重命名吗？文件将被物理重命名。",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
 
         self.set_ui_enabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        
+
         self.worker = RenameWorker(
-            self.service, 
-            dry_run=dry_run, 
+            self.service,
+            dry_run=dry_run,
             selected_paths=selected_paths,
             pattern=config["pattern"],
             regex_find=config["find_regex"],
-            regex_replace=config["replace_str"]
+            regex_replace=config["replace_str"],
         )
         self.worker.progress_updated.connect(self.update_status)
         self.worker.task_finished.connect(self.on_task_finished)
@@ -603,9 +967,7 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self.service.resolve_operation_target_paths(
-            list(self.model.checked_items) or None
-        )
+        selected_paths = self._resolve_batch_targets()
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
             return
@@ -619,9 +981,7 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self.service.resolve_operation_target_paths(
-            list(self.model.checked_items) or None
-        )
+        selected_paths = self._resolve_batch_targets()
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
             return
@@ -629,7 +989,10 @@ class WorkstationView(QWidget):
         if file_path:
             success = self.service.export_to_ale(file_path, selected_paths)
             if success:
-                QMessageBox.information(self, "成功", f"ALE 文件已导出至: {file_path}\n请在达芬奇中使用 'File -> Import -> Metadata from ALE...' 导入。")
+                QMessageBox.information(
+                    self, "成功",
+                    f"ALE 文件已导出至: {file_path}\n请在达芬奇中使用 'File -> Import -> Metadata from ALE...' 导入。",
+                )
             else:
                 QMessageBox.warning(self, "失败", "导出 ALE 文件失败。")
 
@@ -638,13 +1001,11 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self.service.resolve_operation_target_paths(
-            list(self.model.checked_items) or None
-        )
+        selected_paths = self._resolve_batch_targets()
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可同步的视频。")
             return
-            
+
         count = self.service.sync_metadata_to_xmp(selected_paths)
         QMessageBox.information(self, "完成", f"已成功为 {count} 个视频生成 XMP 侧边文件。")
 
@@ -654,19 +1015,20 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self.service.resolve_operation_target_paths(
-            list(self.model.checked_items) or None
-        )
+        selected_paths = self._resolve_batch_targets()
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可整理的视频。")
             return
-            
+
         target_root = QFileDialog.getExistingDirectory(self, "选择整理后的目标根目录")
         if not target_root:
             return
-            
-        reply = QMessageBox.question(self, "确认整理", f"确定要将 {len(selected_paths)} 个文件移动到分类目录吗？\n目标: {target_root}",
-                                     QMessageBox.Yes | QMessageBox.No)
+
+        reply = QMessageBox.question(
+            self, "确认整理",
+            f"确定要将 {len(selected_paths)} 个文件移动到分类目录吗？\n目标: {target_root}",
+            QMessageBox.Yes | QMessageBox.No,
+        )
         if reply == QMessageBox.Yes:
             count = self.service.execute_physical_migration(target_root, selected_paths)
             QMessageBox.information(self, "完成", f"已成功整理 {count} 个文件。")
@@ -674,13 +1036,19 @@ class WorkstationView(QWidget):
 
     def on_task_finished(self, success, message):
         self.set_ui_enabled(True)
+        self.cancel_analysis_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
+        self.sub_progress_bar.setVisible(False)
         self.progress_updated.emit(-1)
         self.progress_bar.setRange(0, 100)
+        self.sub_progress_bar.setRange(0, 100)
         self.status_label.setText(message)
+        if hasattr(self.model, "clear_temp_status_map"):
+            self.model.clear_temp_status_map()
+        # 部分成功时库内已有更新，失败也要刷新列表状态
+        if "模拟" not in (message or ""):
+            self.load_data()
         if success:
-            if "模拟" not in message:
-                self.load_data()
             QMessageBox.information(self, "任务完成", message)
         else:
             QMessageBox.critical(self, "错误", message)

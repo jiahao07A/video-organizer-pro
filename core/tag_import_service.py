@@ -3,12 +3,13 @@
 Tag Import Service v1.0
 Handles importing tags from external files and classifying them using AI.
 兼容 tag_config v6：`tag_groups`（不再要求旧键 `config`）。
+标准词写入必须指定合法标签组；拒绝 pool / 缺组。
 """
 
 import os
 import json
 import logging
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from core.video_organizer_service import AIHandler, TAG_CONFIG_FILE
 
 logger = logging.getLogger("VideoOrganizer.TagImport")
@@ -60,10 +61,13 @@ class TagImportService:
         categories = []
         for item in groups:
             rules = item.get("rules") or {}
+            gid = item.get("id")
+            if not gid or str(gid).lower() == "pool":
+                continue
             categories.append(
                 {
-                    "id": item.get("id"),
-                    "display_name": item.get("name") or item.get("display_name") or item.get("id"),
+                    "id": gid,
+                    "display_name": item.get("name") or item.get("display_name") or gid,
                     "description": rules.get("local_prompt") or item.get("description") or "",
                 }
             )
@@ -75,6 +79,7 @@ class TagImportService:
         system_prompt = (
             "你是一个视频标签分类专家。请将用户提供的标签列表映射到最合适的标签组 ID 中。"
             "如果语义模糊或不属于前几个封闭组，请归类到 'custom'（建议组）。"
+            "禁止使用 pool 或中转池。"
         )
 
         user_prompt = f"""
@@ -88,6 +93,7 @@ class TagImportService:
 1. 返回 JSON 格式，键为标签名，值为对应的组 ID。
 2. 即使没有完美匹配，也请根据语义选择最接近的组。
 3. 格式示例: {{"标签A": "mood", "标签B": "subject"}}
+4. 禁止输出 pool。
 """
 
         from core.video_organizer_service import SettingsManager
@@ -113,14 +119,17 @@ class TagImportService:
             return {}
 
         for tag, cat_id in result.items():
-            if cat_id in classified:
-                if tag not in classified[cat_id]:
-                    classified[cat_id].append(tag)
+            cid = str(cat_id or "").strip()
+            if cid.lower() == "pool":
+                # 中转池已废除：落到 custom 或最后一组
+                cid = "custom" if "custom" in classified else categories[-1]["id"]
+            if cid in classified:
+                if tag not in classified[cid]:
+                    classified[cid].append(tag)
             else:
                 if "custom" in classified:
                     classified["custom"].append(tag)
                 else:
-                    # 任意兜底：放第一个可扩展组或最后一组
                     fallback = next(
                         (c["id"] for c in categories if c["id"] == "custom"),
                         categories[-1]["id"],
@@ -129,13 +138,26 @@ class TagImportService:
 
         return classified
 
-    def persist_classified_tags(self, classified_tags: Dict[str, List[str]]):
-        """将分类后的标签合并并保存回 tag_config.json（v6 tag_groups）"""
+    def persist_classified_tags(self, classified_tags: Dict[str, List[str]]) -> Tuple[bool, str]:
+        """
+        将分类后的标签合并并保存回 tag_config.json（v6 tag_groups）。
+        拒绝 pool / 缺合法 group_id 的标准词写入。
+        返回 (ok, error_message)。
+        """
+        from core.tag_group_ops import known_group_ids, reject_pool_in_classified
+
         config = self.ai.tag_config
         groups = _tag_groups_from_config(config)
         if not config or not groups:
-            logger.error("无法持久化：tag_config 无有效标签组")
-            return
+            msg = "无法持久化：tag_config 无有效标签组"
+            logger.error(msg)
+            return False, msg
+
+        known = known_group_ids(groups)
+        ok, err = reject_pool_in_classified(classified_tags or {}, known)
+        if not ok:
+            logger.error(f"导入拒绝: {err}")
+            return False, err
 
         # 确保写入 tag_groups 键
         if "tag_groups" not in config and groups is config.get("config"):
@@ -145,6 +167,8 @@ class TagImportService:
         for item in target_groups:
             cat_id = item.get("id")
             if cat_id not in classified_tags:
+                continue
+            if not cat_id or str(cat_id).lower() == "pool":
                 continue
             new_tags = classified_tags[cat_id]
             existing = item.get("tags") or []
@@ -165,5 +189,8 @@ class TagImportService:
             with open(TAG_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
             logger.info("已成功保存分类后的标签到配置")
+            return True, ""
         except Exception as e:
-            logger.error(f"保存标签配置失败: {e}")
+            msg = f"保存标签配置失败: {e}"
+            logger.error(msg)
+            return False, msg

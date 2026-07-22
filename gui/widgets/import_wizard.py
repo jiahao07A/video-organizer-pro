@@ -34,14 +34,13 @@ class TagImportWizard(QWizard):
         self.setWindowTitle("标签导入向导")
         self.resize(600, 500)
         
-        # 定义维度选项用于校对页
+        # 校对页可选标签组（中转池已废除，必须落到真实组）
         self.dimensions = [
-            ("pool", "中转池"),
             ("mood", "C1: 氛围"),
             ("subject", "C2: 主体"),
             ("location", "C3: 场景"),
             ("action", "C4: 动作"),
-            ("custom", "C5: 建议")
+            ("custom", "C5: 建议"),
         ]
         
         self.addPage(FileSelectionPage(self))
@@ -123,10 +122,10 @@ class AIProcessingPage(QWizardPage):
             for t in tags:
                 flat_data[t] = cat_id
         
-        # 补全未被 AI 分类的标签到 pool
+        # 未被 AI 分类的标签默认落到建议组（禁止 pool）
         for t in self.wizard().imported_tags:
             if t not in flat_data:
-                flat_data[t] = "pool"
+                flat_data[t] = "custom"
                 
         self.wizard().classified_data = flat_data
         self._is_finished = True
@@ -152,14 +151,14 @@ class ReviewPage(QWizardPage):
         
         layout = QVBoxLayout(self)
         
-        # 工具栏
+        # 工具栏：批量改到建议组（中转池已废除）
         tool_layout = QHBoxLayout()
-        move_pool_btn = QPushButton("移动选中到中转池")
-        move_pool_btn.clicked.connect(self.move_selected_to_pool)
+        move_custom_btn = QPushButton("移动选中到建议组")
+        move_custom_btn.clicked.connect(self.move_selected_to_custom)
         tool_layout.addStretch()
-        tool_layout.addWidget(move_pool_btn)
+        tool_layout.addWidget(move_custom_btn)
         layout.addLayout(tool_layout)
-        
+
         self.table = QTableWidget()
         self.table.setColumnCount(2)
         self.table.setHorizontalHeaderLabels(["标签名", "分类"])
@@ -167,18 +166,16 @@ class ReviewPage(QWizardPage):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         layout.addWidget(self.table)
 
-    def move_selected_to_pool(self):
+    def move_selected_to_custom(self):
         selected_ranges = self.table.selectedRanges()
         if not selected_ranges:
             return
-            
         for r in selected_ranges:
             for row in range(r.topRow(), r.bottomRow() + 1):
                 combo = self.table.cellWidget(row, 1)
                 if isinstance(combo, QComboBox):
-                    # 寻找 "pool" 的索引
                     for i in range(combo.count()):
-                        if combo.itemData(i) == "pool":
+                        if combo.itemData(i) == "custom":
                             combo.setCurrentIndex(i)
                             break
 
@@ -198,14 +195,22 @@ class ReviewPage(QWizardPage):
             self.table.setCellWidget(i, 1, combo)
 
     def validatePage(self):
-        # 最终收集数据回 wizard
+        # 最终收集数据回 wizard；拒绝 pool / 空组
         final_result = {}
         for i in range(self.table.rowCount()):
             tag = self.table.item(i, 0).text()
             cat_id = self.table.cellWidget(i, 1).currentData()
-            if cat_id not in final_result:
-                final_result[cat_id] = []
-            final_result[cat_id].append(tag)
-            
+            cid = str(cat_id or "").strip()
+            if not cid or cid.lower() == "pool":
+                QMessageBox.warning(
+                    self,
+                    "目标组无效",
+                    f"标签「{tag}」未指定有效标签组（中转池已废除）。请为每条选择目标组。",
+                )
+                return False
+            if cid not in final_result:
+                final_result[cid] = []
+            final_result[cid].append(tag)
+
         self.wizard().final_classified = final_result
         return True

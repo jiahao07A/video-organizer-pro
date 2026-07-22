@@ -189,7 +189,7 @@ class TagListModel(QAbstractListModel):
             tag = TagItem(
                 id=item.get("id"),
                 name=item.get("tag_name"),
-                dimension=item.get("dimension") or "pool",
+                dimension=item.get("dimension") or "",
                 usage_count=item.get("usage_count", 0),
                 color=item.get("color"),
                 parent_id=item.get("parent_id"),
@@ -204,7 +204,7 @@ class TagListModel(QAbstractListModel):
         tag = TagItem(
             id=tag_data.get("id"),
             name=tag_data.get("tag_name"),
-            dimension=tag_data.get("dimension") or "pool",
+            dimension=tag_data.get("dimension") or "",
             usage_count=tag_data.get("usage_count", 0),
             color=tag_data.get("color"),
             parent_id=tag_data.get("parent_id"),

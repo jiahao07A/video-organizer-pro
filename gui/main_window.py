@@ -207,6 +207,12 @@ class MainWindow(QMainWindow):
 
     def on_settings_applied(self):
         self.refresh_style()
+        # 确保 AI 客户端与最新 settings 一致
+        if hasattr(self.service, "reload_ai_from_settings"):
+            try:
+                self.service.reload_ai_from_settings()
+            except Exception:
+                pass
         if hasattr(self.workstation_page, "detail_panel"):
             self.workstation_page.detail_panel.refresh_tag_completer()
         if hasattr(self.library_page, "detail_panel"):

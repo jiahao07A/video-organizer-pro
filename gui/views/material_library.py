@@ -5,14 +5,39 @@ from PySide6.QtWidgets import (
     QLabel, QSplitter, QStackedWidget, QTableView, QListView,
     QHeaderView, QAbstractItemView, QMessageBox,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QEvent, QObject
+from PySide6.QtGui import QKeySequence, QShortcut
 from ..widgets.filter_panel import FilterPanel
 from ..widgets.detail_panel import DetailPanel
 from ..widgets.delegates import CardDelegate, StatusDelegate, ThumbnailDelegate
-from ..models.video_table import VideoTableModel
+from ..models.video_table import (
+    VideoTableModel,
+    COL_FILENAME,
+    COL_LIBRARY_ID,
+    COL_LIST_NO,
+    COL_STATUS,
+    COL_THUMB,
+)
 from ..models.proxy_model import AdvancedSortFilterProxyModel
-from core.video_organizer_service import VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from gui.styles import normalize_theme
+
+
+class _ClearSelectionOnEmptyClickFilter(QObject):
+    """点空白区域清除选中。"""
+
+    def __init__(self, view: QAbstractItemView, parent=None):
+        super().__init__(parent)
+        self._view = view
+
+    def eventFilter(self, obj, event):
+        if obj is self._view.viewport() and event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                idx = self._view.indexAt(pos)
+                if not idx.isValid():
+                    self._view.clearSelection()
+        return False
 
 
 class MaterialLibraryView(QWidget):
@@ -50,14 +75,19 @@ class MaterialLibraryView(QWidget):
         self.add_scope_btn = QPushButton("累加到工作范围")
         self.add_scope_btn.setObjectName("primary_button")
         self.add_scope_btn.setStyleSheet("background-color: #3d5afe; color: white; font-weight: bold;")
-        self.add_scope_btn.setToolTip("将列表勾选的视频路径追加进工作范围")
+        self.add_scope_btn.setToolTip("将列表选中（无选中则当前可见全部）累加进工作范围")
         self.add_scope_btn.clicked.connect(self.accumulate_selected_to_scope)
+
+        self.delete_btn = QPushButton("取消入库")
+        self.delete_btn.setToolTip("从素材库移除记录（不删除磁盘视频文件）")
+        self.delete_btn.clicked.connect(self.uncatalog_selected)
 
         toolbar.addWidget(title)
         toolbar.addStretch()
         toolbar.addWidget(self.search_input)
         toolbar.addWidget(self.filter_btn)
         toolbar.addWidget(self.view_switch_btn)
+        toolbar.addWidget(self.delete_btn)
         toolbar.addWidget(self.add_scope_btn)
         layout.addLayout(toolbar)
 
@@ -84,12 +114,19 @@ class MaterialLibraryView(QWidget):
         self.table_view.verticalHeader().setDefaultSectionSize(80)
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table_view.setColumnWidth(0, 50)
-        self.table_view.setColumnWidth(1, 140)
-        self.table_view.setItemDelegateForColumn(1, ThumbnailDelegate(self.table_view))
-        self.table_view.setItemDelegateForColumn(3, StatusDelegate(self.table_view))
+        header.setSectionResizeMode(COL_FILENAME, QHeaderView.Stretch)
+        self.table_view.setColumnWidth(COL_LIST_NO, 40)
+        self.table_view.setColumnWidth(COL_LIBRARY_ID, 70)
+        self.table_view.setColumnWidth(COL_THUMB, 140)
+        self.table_view.setColumnWidth(COL_STATUS, 80)
+        self.table_view.setItemDelegateForColumn(COL_THUMB, ThumbnailDelegate(self.table_view))
+        self.table_view.setItemDelegateForColumn(COL_STATUS, StatusDelegate(self.table_view))
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        self.proxy_model.layoutChanged.connect(self._refresh_list_numbers)
+        self.proxy_model.modelReset.connect(self._refresh_list_numbers)
+        self.proxy_model.rowsInserted.connect(lambda *_: self._refresh_list_numbers())
+        self.proxy_model.rowsRemoved.connect(lambda *_: self._refresh_list_numbers())
+        header.sortIndicatorChanged.connect(lambda *_: self._refresh_list_numbers())
         self.view_stack.addWidget(self.table_view)
 
         self.card_view = QListView()
@@ -98,25 +135,44 @@ class MaterialLibraryView(QWidget):
         self.card_view.setResizeMode(QListView.Adjust)
         self.card_view.setMovement(QListView.Static)
         self.card_view.setSpacing(10)
+        self.card_view.setModelColumn(COL_FILENAME)
         self.card_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.card_view.setItemDelegate(CardDelegate(self.card_view))
         self.card_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.view_stack.addWidget(self.card_view)
 
+        self._wire_selection_ux(self.table_view)
+        self._wire_selection_ux(self.card_view)
+
         self.splitter.addWidget(self.view_stack)
         self.detail_panel = DetailPanel(self.service)
-        self.detail_panel.setMinimumWidth(280)
+        self.detail_panel.setMinimumWidth(320)
         self.splitter.addWidget(self.detail_panel)
         self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 1)
-        layout.addWidget(self.splitter)
+        self.splitter.setStretchFactor(1, 2)
+        layout.addWidget(self.splitter, 1)
 
         self.status_label = QLabel("")
+        self.status_label.setMaximumHeight(22)
         layout.addWidget(self.status_label)
 
         expanded = self.settings.get("ui_preferences", {}).get("detail_panel_expanded", True)
         if not expanded:
             self.detail_panel.setVisible(False)
+
+    def _wire_selection_ux(self, view: QAbstractItemView):
+        view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        filt = _ClearSelectionOnEmptyClickFilter(view, self)
+        view.viewport().installEventFilter(filt)
+        if not hasattr(self, "_selection_filters"):
+            self._selection_filters = []
+        self._selection_filters.append(filt)
+        sc = QShortcut(QKeySequence.SelectAll, view)
+        sc.setContext(Qt.WidgetWithChildrenShortcut)
+        sc.activated.connect(view.selectAll)
+        if not hasattr(self, "_selection_shortcuts"):
+            self._selection_shortcuts = []
+        self._selection_shortcuts.append(sc)
 
     def apply_default_view(self):
         mode = self.settings.get("ui_preferences", {}).get("default_view", "list")
@@ -149,15 +205,112 @@ class MaterialLibraryView(QWidget):
 
     def filter_text_changed(self, text):
         self.proxy_model.set_filter_params({"text": text})
+        self._refresh_list_numbers()
 
     def apply_advanced_filter(self, params):
         self.proxy_model.set_filter_params(params)
+        self._refresh_list_numbers()
+
+    def _refresh_list_numbers(self):
+        """按当前可见顺序刷新列表序号；防重入，避免卡死 UI。"""
+        if getattr(self, "_list_no_refreshing", False):
+            return
+        if getattr(self, "_list_no_refresh_scheduled", False):
+            return
+        self._list_no_refresh_scheduled = True
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._do_refresh_list_numbers)
+
+    def _do_refresh_list_numbers(self):
+        self._list_no_refresh_scheduled = False
+        if getattr(self, "_list_no_refreshing", False):
+            return
+        self._list_no_refreshing = True
+        proxy = self.proxy_model
+        was_dynamic = True
+        try:
+            was_dynamic = proxy.dynamicSortFilter()
+            proxy.setDynamicSortFilter(False)
+        except Exception:
+            pass
+        try:
+            mapping = {}
+            for visual in range(proxy.rowCount()):
+                src = proxy.mapToSource(proxy.index(visual, 0)).row()
+                mapping[src] = visual + 1
+            self.model.set_list_numbers(mapping)
+        finally:
+            try:
+                proxy.setDynamicSortFilter(was_dynamic)
+            except Exception:
+                pass
+            self._list_no_refreshing = False
 
     def load_data(self):
         videos = self.service.get_all_videos()
         self.model.update_data(videos)
+        self._refresh_list_numbers()
         self.status_label.setText(f"素材库共 {len(videos)} 条")
         self.status_message.emit(self.status_label.text())
+
+    def _get_selected_paths(self) -> list:
+        if self.view_stack.currentWidget() == self.card_view:
+            indexes = self.card_view.selectionModel().selectedIndexes()
+        else:
+            indexes = self.table_view.selectionModel().selectedRows()
+        paths = []
+        seen = set()
+        for idx in indexes:
+            src = self.proxy_model.mapToSource(self.proxy_model.index(idx.row(), 0))
+            if not (0 <= src.row() < len(self.model.videos)):
+                continue
+            p = self.model.videos[src.row()].get("path")
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+        return paths
+
+    def _get_visible_paths(self) -> list:
+        paths = []
+        for visual in range(self.proxy_model.rowCount()):
+            src = self.proxy_model.mapToSource(self.proxy_model.index(visual, 0)).row()
+            if not (0 <= src < len(self.model.videos)):
+                continue
+            p = self.model.videos[src].get("path")
+            if p:
+                paths.append(p)
+        return paths
+
+    def _resolve_batch_targets(self) -> list:
+        """素材库操作目标：有选中用选中，无选中用可见；无工作范围约束。"""
+        return self.service.resolve_operation_target_paths(
+            self._get_selected_paths() or None,
+            self._get_visible_paths(),
+            scope_paths=None,
+        )
+
+    def uncatalog_selected(self):
+        """素材库删除 = 取消入库（操作目标集）。"""
+        paths = self._resolve_batch_targets()
+        if not paths:
+            QMessageBox.warning(
+                self, "提示",
+                "没有可取消入库的视频。\n请选中目标，或清空筛选使列表有可见项（无选中则作用于当前可见全部）。",
+            )
+            return
+        n = len(paths)
+        reply = QMessageBox.question(
+            self,
+            "取消入库",
+            f"确定从素材库取消入库 {n} 条记录？\n"
+            f"仅移除素材库入库记录，磁盘上的视频文件不会被删除。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.service.uncatalog_videos(paths)
+        self.load_data()
+        self.work_scope_changed.emit()
 
     def on_selection_changed(self, selected, deselected):
         if self.view_stack.currentWidget() == self.card_view:
@@ -179,27 +332,13 @@ class MaterialLibraryView(QWidget):
             source_idx = self.proxy_model.mapToSource(proxy_idx)
             self.detail_panel.load_video_data(self.model.videos[source_idx.row()])
 
-    def _selected_video_paths(self):
-        """勾选框优先；否则用当前行选中。"""
-        checked = list(self.model.checked_items)
-        if checked:
-            return checked
-        if self.view_stack.currentWidget() == self.card_view:
-            indexes = self.card_view.selectionModel().selectedIndexes()
-        else:
-            indexes = self.table_view.selectionModel().selectedRows()
-        paths = []
-        for idx in indexes:
-            src = self.proxy_model.mapToSource(self.proxy_model.index(idx.row(), 0))
-            v = self.model.videos[src.row()]
-            if v.get("path"):
-                paths.append(v["path"])
-        return list(dict.fromkeys(paths))
-
     def accumulate_selected_to_scope(self):
-        paths = self._selected_video_paths()
+        paths = self._resolve_batch_targets()
         if not paths:
-            QMessageBox.warning(self, "提示", "请先勾选或选中要累加的视频。")
+            QMessageBox.warning(
+                self, "提示",
+                "没有可累加的视频。\n请选中目标，或确保当前可见列表非空（无选中则累加可见全部）。",
+            )
             return
         result = self.service.append_work_scope(paths, scan=True)
         n = len(result.get("paths") or [])

@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QListWidget, QListWidgetItem, QGroupBox,
     QFormLayout, QComboBox, QSpinBox, QTextEdit, QMessageBox,
-    QTabWidget, QCheckBox, QWidget
+    QTabWidget, QCheckBox, QWidget, QInputDialog
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 
 class TagGroupEditor(QDialog):
-    def __init__(self, tag_config, parent=None):
+    def __init__(self, tag_config, parent=None, service=None):
         super().__init__(parent)
         self.setWindowTitle("标签组管理")
         self.setMinimumSize(600, 450)
         self.tag_config = tag_config
+        # 有 service 时删组走服务层（配置 + DB dimension 改派）
+        self.service = service
         self.setup_ui()
         self.load_data()
 
@@ -42,6 +45,12 @@ class TagGroupEditor(QDialog):
         
         left_layout.addWidget(QLabel("标签组列表:"))
         left_layout.addWidget(self.group_list)
+        # 深色主题下列表项可读
+        self.group_list.setStyleSheet(
+            "QListWidget { background-color: #2b2b2b; color: #e8e8e8; border: 1px solid #444; }"
+            "QListWidget::item { color: #e8e8e8; padding: 6px 8px; }"
+            "QListWidget::item:selected { background-color: #3d5afe; color: #ffffff; }"
+        )
         left_layout.addLayout(btn_layout)
         left_layout.addLayout(move_layout)
         
@@ -77,28 +86,62 @@ class TagGroupEditor(QDialog):
 
     def load_data(self):
         self.group_list.clear()
-        for group in self.tag_config.get("tag_groups", []):
-            item = QListWidgetItem(f"{group['name']} ({group['id']})")
-            item.setData(Qt.UserRole, group["id"])
+        from core.tag_vocab import ensure_canonical_tag_groups
+
+        # 就地保证五组存在（编辑的是 service.tag_config 引用）
+        try:
+            ensured = ensure_canonical_tag_groups(self.tag_config or {})
+            # 写回同一 dict 结构
+            self.tag_config.clear()
+            self.tag_config.update(ensured)
+        except Exception:
+            pass
+
+        groups = self.tag_config.get("tag_groups") or []
+        if not groups:
+            item = QListWidgetItem("（暂无标签组 — 请点「加载词表」写入）")
+            item.setForeground(QColor("#e0e0e0"))
             self.group_list.addItem(item)
+            return
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            gid = group.get("id") or "?"
+            name = group.get("name") or gid
+            n_tags = len(group.get("tags") or [])
+            item = QListWidgetItem(f"{name} ({gid}) · {n_tags} 词")
+            item.setData(Qt.UserRole, gid)
+            item.setForeground(QColor("#e0e0e0"))
+            self.group_list.addItem(item)
+        if self.group_list.count() > 0:
+            self.group_list.setCurrentRow(0)
 
     def on_group_selected(self, row):
         if row < 0:
             self.detail_group.setEnabled(False)
             return
-        
+        item = self.group_list.item(row)
+        group_id = item.data(Qt.UserRole) if item else None
+        if not group_id:
+            self.detail_group.setEnabled(False)
+            return
+
         self.detail_group.setEnabled(True)
-        group_id = self.group_list.item(row).data(Qt.UserRole)
-        group = next(g for g in self.tag_config["tag_groups"] if g["id"] == group_id)
-        
-        self.id_edit.setText(group["id"])
-        self.id_edit.setEnabled(False) # ID usually shouldn't change easily as it's a key
-        self.name_edit.setText(group["name"])
-        rules = group.get("rules", {})
+        group = next(
+            (g for g in self.tag_config.get("tag_groups", []) if g.get("id") == group_id),
+            None,
+        )
+        if not group:
+            return
+
+        self.id_edit.setText(group.get("id") or "")
+        self.id_edit.setEnabled(False)
+        self.name_edit.setText(group.get("name") or "")
+        rules = group.get("rules", {}) or {}
         self.mode_combo.setCurrentText(rules.get("selection_mode", "single"))
-        self.max_spin.setValue(rules.get("max_count", 1))
-        self.ai_check.setChecked(rules.get("ai_expandable", False))
-        self.prompt_edit.setText(rules.get("local_prompt", ""))
+        self.max_spin.setValue(int(rules.get("max_count", 1) or 1))
+        self.ai_check.setChecked(bool(rules.get("ai_expandable", False)))
+        self.prompt_edit.setText(rules.get("local_prompt", "") or "")
 
     def add_group(self):
         # 简单添加
@@ -120,14 +163,79 @@ class TagGroupEditor(QDialog):
 
     def delete_group(self):
         row = self.group_list.currentRow()
-        if row < 0: return
-        
-        if QMessageBox.warning(self, "确认删除", "删除标签组将导致该组下的标签被移至中转池。确定吗？",
-                               QMessageBox.Yes | QMessageBox.No) == QMessageBox.No:
+        if row < 0:
             return
-            
+
         group_id = self.group_list.item(row).data(Qt.UserRole)
-        self.tag_config["tag_groups"] = [g for g in self.tag_config["tag_groups"] if g["id"] != group_id]
+        if not group_id:
+            return
+
+        from core.tag_group_ops import can_delete_tag_group, reassign_and_remove_group
+
+        groups = self.tag_config.get("tag_groups") or []
+        source = next((g for g in groups if g.get("id") == group_id), None)
+        if not source:
+            return
+
+        tag_count = len(source.get("tags") or [])
+        pre = can_delete_tag_group(groups, group_id, target_group_id=None)
+        if not pre.allowed and not pre.needs_reassign:
+            QMessageBox.warning(self, "无法删除", pre.reason or "不能删除该标签组。")
+            return
+
+        target_id = None
+        if tag_count > 0:
+            others = [
+                g for g in groups
+                if isinstance(g, dict) and g.get("id") and g.get("id") != group_id
+            ]
+            if not others:
+                QMessageBox.warning(self, "无法删除", "不能删除唯一剩余标签组。")
+                return
+            labels = [f"{g.get('name') or g.get('id')} ({g.get('id')})" for g in others]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "整组改派",
+                f"组内有 {tag_count} 个标准词。请选择改派到的目标标签组（中转池已废除）：",
+                labels,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            target_id = others[labels.index(choice)].get("id")
+        else:
+            if QMessageBox.warning(
+                self,
+                "确认删除",
+                "确定删除此空标签组吗？",
+                QMessageBox.Yes | QMessageBox.No,
+            ) == QMessageBox.No:
+                return
+
+        if self.service is not None and hasattr(self.service, "delete_tag_group"):
+            result = self.service.delete_tag_group(
+                group_id, target_group_id=target_id
+            )
+            if not result.get("ok"):
+                QMessageBox.warning(
+                    self, "无法删除", result.get("error") or "删除失败"
+                )
+                return
+            # 与服务层配置对齐（含 DB 改派结果）
+            self.tag_config = self.service.tag_config or self.tag_config
+            if result.get("groups") is not None:
+                self.tag_config["tag_groups"] = result["groups"]
+            self.load_data()
+            return
+
+        ok, new_groups, err, _moved = reassign_and_remove_group(
+            groups, group_id, target_group_id=target_id
+        )
+        if not ok:
+            QMessageBox.warning(self, "无法删除", err or "删除失败")
+            return
+        self.tag_config["tag_groups"] = new_groups
         self.load_data()
 
     def move_group(self, direction):

@@ -1,47 +1,90 @@
 # -*- coding: utf-8 -*-
 import os
 import json
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSize, QThreadPool
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSize, QThreadPool, QSortFilterProxyModel
 from PySide6.QtGui import QPixmap
 from ..workers.thumbnail_loader import ThumbnailLoader
 
+# 列索引常量（无「选择」勾选列；批量操作走列表选中）
+COL_LIST_NO = 0
+COL_LIBRARY_ID = 1
+COL_THUMB = 2
+COL_FILENAME = 3
+COL_CATEGORY = 4
+COL_TAGS = 5
+COL_STATUS = 6
+
+# 旧 8 列方案中的「选择」列索引（仅用于偏好迁移，勿作数据列）
+LEGACY_COL_CHECK = 0
+LEGACY_COLUMN_COUNT = 8
+
+
 class VideoTableModel(QAbstractTableModel):
-    """视频数据模型"""
+    """视频数据模型：列表序号 / 入库编号 / 缩略图 / 文件名 / 分类 / 标签 / 状态"""
+
     def __init__(self, videos=None):
         super().__init__()
         self.videos = videos or []
-        self.headers = ["选择", "缩略图", "文件名", "分类", "标签", "状态"]
-        self.checked_items = set() 
+        self.headers = ["#", "入库编号", "缩略图", "文件名", "分类", "标签", "状态"]
         self.thumbnail_cache = {}
-        
         self.thumbnail_pool = QThreadPool()
         self.thumbnail_pool.setMaxThreadCount(4)
         self.loading_paths = set()
+        # 代理模型可见行 -> 列表序号（由视图在刷新时可选设置；默认用源行+1）
+        self._list_no_by_source_row = {}
+        # 分析任务行临时态 path -> 文案（不写库）
+        self.temp_status_by_path = {}
+
+    def set_temp_status_map(self, mapping: dict):
+        """更新分析行临时态并刷新状态列。"""
+        self.temp_status_by_path = dict(mapping or {})
+        if self.rowCount() > 0:
+            tl = self.index(0, COL_STATUS)
+            br = self.index(self.rowCount() - 1, COL_STATUS)
+            self.dataChanged.emit(tl, br, [Qt.DisplayRole])
+
+    def clear_temp_status_map(self):
+        self.set_temp_status_map({})
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.videos)
 
     def columnCount(self, parent=QModelIndex()):
         return len(self.headers)
-    
+
+    def set_list_numbers(self, source_row_to_no: dict):
+        """由视图根据当前筛选/排序后的可见顺序写入列表序号。
+
+        注意：仅更新内存映射；若映射未变则不 emit，避免
+        dataChanged → 代理重排/重滤 → 再次刷新 的递归。
+        """
+        new_map = dict(source_row_to_no or {})
+        if new_map == self._list_no_by_source_row:
+            return
+        self._list_no_by_source_row = new_map
+        if not self.videos:
+            return
+        tl = self.index(0, COL_LIST_NO)
+        br = self.index(len(self.videos) - 1, COL_LIST_NO)
+        # 只声明 DisplayRole，且调用方应关闭 proxy dynamicSortFilter 再 emit
+        self.dataChanged.emit(tl, br, [Qt.DisplayRole])
+
     def on_thumbnail_loaded(self, path, image):
         if path in self.loading_paths:
             self.loading_paths.remove(path)
-        
+
         pixmap = QPixmap.fromImage(image)
-        
-        # 简单的缓存清理策略
+
         if len(self.thumbnail_cache) > 200:
-             self.thumbnail_cache.pop(next(iter(self.thumbnail_cache)))
-             
+            self.thumbnail_cache.pop(next(iter(self.thumbnail_cache)))
+
         self.thumbnail_cache[path] = pixmap
-        
-        # 刷新相关行
+
         for row, video in enumerate(self.videos):
-             if video.get("thumbnail_path") == path or video.get("thumbnail") == path:
-                 tl = self.index(row, 1)
-                 br = self.index(row, 2)
-                 self.dataChanged.emit(tl, br, [Qt.DecorationRole])
+            if video.get("thumbnail_path") == path or video.get("thumbnail") == path:
+                tl = self.index(row, COL_THUMB)
+                br = self.index(row, COL_THUMB)
+                self.dataChanged.emit(tl, br, [Qt.DecorationRole])
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self.videos)):
@@ -49,67 +92,73 @@ class VideoTableModel(QAbstractTableModel):
 
         row_data = self.videos[index.row()]
         col = index.column()
+        row = index.row()
 
         if role == Qt.DisplayRole:
-            if col == 2: return row_data.get("filename", "")
-            if col == 3: return row_data.get("category", "")
-            if col == 4:
+            if col == COL_LIST_NO:
+                return self._list_no_by_source_row.get(row, row + 1)
+            if col == COL_LIBRARY_ID:
+                lid = row_data.get("library_id")
+                if lid is None:
+                    lid = row_data.get("id")
+                return lid if lid is not None else ""
+            if col == COL_FILENAME:
+                return row_data.get("filename", "")
+            if col == COL_CATEGORY:
+                return row_data.get("category", "") or ""
+            if col == COL_TAGS:
                 tags = row_data.get("tags", [])
                 if isinstance(tags, str):
-                    try: tags = json.loads(tags)
-                    except: tags = []
+                    try:
+                        tags = json.loads(tags)
+                    except Exception:
+                        tags = []
                 return ", ".join(tags)
-            if col == 5: return row_data.get("status", "")
-        
-        elif role == Qt.CheckStateRole:
-            if col == 0:
-                return Qt.Checked if row_data.get("path") in self.checked_items else Qt.Unchecked
-        
+            if col == COL_STATUS:
+                path = row_data.get("path") or ""
+                temp = getattr(self, "temp_status_by_path", None) or {}
+                if path and path in temp:
+                    return temp[path]
+                # 尝试规范化键
+                try:
+                    from core.analysis_targets import path_status_key
+                    pk = path_status_key(path)
+                    if pk in temp:
+                        return temp[pk]
+                except Exception:
+                    pass
+                return row_data.get("status", "")
+
+        elif role == Qt.UserRole:
+            # 卡片与其它代理可取整行数据
+            return row_data
+
         elif role == Qt.DecorationRole:
-            if col == 1:
+            if col == COL_THUMB:
                 thumb_path = row_data.get("thumbnail_path") or row_data.get("thumbnail")
                 if not thumb_path:
                     return None
-                
+
                 if thumb_path in self.thumbnail_cache:
                     return self.thumbnail_cache[thumb_path]
-                
-                # 异步加载
+
                 if thumb_path not in self.loading_paths and os.path.exists(thumb_path):
                     self.loading_paths.add(thumb_path)
                     loader = ThumbnailLoader(thumb_path, QSize(320, 180))
                     loader.signals.loaded.connect(self.on_thumbnail_loaded)
                     self.thumbnail_pool.start(loader)
-                
-                return None 
-        
+
+                return None
+
         elif role == Qt.TextAlignmentRole:
             return Qt.AlignCenter
 
         return None
 
-    def setData(self, index, value, role=Qt.EditRole):
-        if not index.isValid():
-            return False
-            
-        if role == Qt.CheckStateRole and index.column() == 0:
-            path = self.videos[index.row()].get("path")
-            if value == Qt.Checked or value == True or value == 2:
-                self.checked_items.add(path)
-            else:
-                self.checked_items.discard(path)
-            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
-            return True
-        return False
-
     def flags(self, index):
         if not index.isValid():
             return Qt.NoItemFlags
-        
-        flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        if index.column() == 0:
-            flags |= Qt.ItemIsUserCheckable
-        return flags
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
@@ -121,4 +170,57 @@ class VideoTableModel(QAbstractTableModel):
         self.videos = new_videos
         self.thumbnail_cache.clear()
         self.loading_paths.clear()
+        self._list_no_by_source_row = {}
         self.endResetModel()
+
+
+def migrate_table_column_prefs(prefs: dict, current_column_count: int = 7) -> dict:
+    """旧 8 列（含选择列 0）偏好 → 新 7 列：丢弃选择列，其余索引 -1；越界键忽略。
+
+    识别旧方案：存在列键 7（8 列最大下标），或显式 legacy 标记。
+    新方案写入时应带 schema=no_check_col。
+    """
+    if not prefs:
+        return {}
+    schema = prefs.get("_schema") or prefs.get("schema")
+    if schema in ("no_check_col", "v2", 2, "2"):
+        out = {}
+        for k, v in prefs.items():
+            if str(k).startswith("_") or k in ("schema",):
+                continue
+            try:
+                i = int(k)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= i < current_column_count:
+                out[str(i)] = v
+        return out
+
+    int_entries = []
+    for k, v in prefs.items():
+        if str(k).startswith("_") or k in ("schema",):
+            continue
+        try:
+            int_entries.append((int(k), v))
+        except (TypeError, ValueError):
+            continue
+    if not int_entries:
+        return {}
+    max_key = max(i for i, _ in int_entries)
+    key_set = {i for i, _ in int_entries}
+    # 旧 8 列：有下标 7，或 max>=7
+    is_legacy_8 = max_key >= LEGACY_COLUMN_COUNT - 1 or 7 in key_set
+    if is_legacy_8:
+        shifted = {}
+        for i, v in int_entries:
+            if i == LEGACY_COL_CHECK:
+                continue
+            ni = i - 1
+            if 0 <= ni < current_column_count:
+                shifted[str(ni)] = v
+        return shifted
+    out = {}
+    for i, v in int_entries:
+        if 0 <= i < current_column_count:
+            out[str(i)] = v
+    return out

@@ -21,6 +21,18 @@ DEFAULT_TOTAL_MAX = 100
 # 占位测试词：测试* / test*
 PLACEHOLDER_RE = re.compile(r"^(测试|test)[\w\u4e00-\u9fff]*$", re.IGNORECASE)
 
+# 词.txt 别名行：标准词 ← 别名1, 别名2（兼容 ASCII: <-）
+_ALIAS_ARROW_RE = re.compile(
+    r"^(?P<std>.+?)\s*(?:←|<-)\s*(?P<aliases>.+)$"
+)
+_ALIAS_SPLIT_RE = re.compile(r"[,，、/|]+")
+
+# 词.txt 分组标题：# ========== 氛围 mood ==========
+_GROUP_HEADER_RE = re.compile(
+    r"#\s*=+\s*.*?\b(?P<gid>mood|subject|location|action|custom)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class VocabSubsetResult:
@@ -253,6 +265,133 @@ def heuristic_assign_group(word: str) -> str:
     return DEFAULT_SUGGESTION_GROUP_ID
 
 
+def parse_vocab_draft_line(line: str) -> Optional[Tuple[str, List[str]]]:
+    """
+    解析词表草稿一行。
+
+    支持：
+    - ``标准词``
+    - ``标准词 ← 别名1, 别名2``（兼容 ``<-``）
+
+    返回 (标准词, 别名列表)；空行/注释返回 None。
+    """
+    t = str(line or "").strip()
+    if not t or t.startswith("#"):
+        return None
+
+    m = _ALIAS_ARROW_RE.match(t)
+    if m:
+        std = m.group("std").strip()
+        raw_aliases = m.group("aliases").strip()
+        aliases: List[str] = []
+        seen: Set[str] = set()
+        for part in _ALIAS_SPLIT_RE.split(raw_aliases):
+            a = part.strip()
+            if not a or a == std or a in seen:
+                continue
+            seen.add(a)
+            aliases.append(a)
+        if not std:
+            return None
+        return std, aliases
+
+    # 无箭头：整行即标准词（忽略误写的尾部空白）
+    return t, []
+
+
+def parse_vocab_group_header(line: str) -> Optional[str]:
+    """
+    解析词表分组标题行，如 ``# ========== 氛围 mood ==========``。
+    返回 group_id（小写）；非标题返回 None。
+    """
+    t = str(line or "").strip()
+    if not t.startswith("#"):
+        return None
+    m = _GROUP_HEADER_RE.search(t)
+    if not m:
+        return None
+    return m.group("gid").strip().lower()
+
+
+def build_vocab_draft_from_lines(draft_lines: Sequence[str]) -> ColdStartDraft:
+    """
+    直接按词表文件语义加载，不做 AI/规则分簇、不做精瘦裁剪。
+
+    约定（与 ``词.txt`` 一致）：
+    - ``#`` 注释；``# === ... mood/subject/... ===`` 切换当前标签组
+    - ``标准词`` 或 ``标准词 ← 别名1, 别名2``
+    """
+    current_gid = DEFAULT_SUGGESTION_GROUP_ID
+    clusters: List[ColdStartCluster] = []
+    alias_map: Dict[str, str] = {}
+    by_group: Dict[str, List[str]] = {
+        gid: [] for gid in list(DEFAULT_CLOSED_GROUP_IDS) + [DEFAULT_SUGGESTION_GROUP_ID]
+    }
+    claimed: Set[str] = set()
+    notes: List[str] = ["直接加载词表（无分簇/无裁剪）。"]
+    skipped: List[str] = []
+    group_hits = 0
+
+    for line in draft_lines:
+        raw = str(line or "")
+        header = parse_vocab_group_header(raw)
+        if header:
+            current_gid = header
+            group_hits += 1
+            if header not in by_group:
+                by_group[header] = []
+            continue
+
+        parsed = parse_vocab_draft_line(raw)
+        if parsed is None:
+            continue
+        std, aliases = parsed
+        if not std:
+            continue
+
+        if std in claimed:
+            for a in aliases:
+                if a and a != std and a not in claimed:
+                    alias_map[a] = std
+                    claimed.add(a)
+                    for c in clusters:
+                        if c.standard == std and a not in c.aliases:
+                            c.aliases.append(a)
+                            break
+            continue
+
+        clean_aliases: List[str] = []
+        for a in aliases:
+            if not a or a == std or a in claimed:
+                continue
+            clean_aliases.append(a)
+            claimed.add(a)
+            alias_map[a] = std
+
+        claimed.add(std)
+        clusters.append(
+            ColdStartCluster(standard=std, aliases=clean_aliases, group_id=current_gid)
+        )
+        if std not in by_group[current_gid]:
+            by_group[current_gid].append(std)
+
+    notes.append(
+        f"解析到分组标题 {group_hits} 处，标准词 {len(clusters)} 个，别名 {len(alias_map)} 个。"
+    )
+    if group_hits == 0:
+        notes.append(
+            "未识别到 mood/subject/location/action/custom 分组标题，词已落入建议组 custom。"
+        )
+
+    return ColdStartDraft(
+        clusters=clusters,
+        by_group=by_group,
+        alias_map=alias_map,
+        skipped_placeholders=skipped,
+        notes=notes,
+    )
+
+
 def build_cold_start_draft(
     draft_lines: Sequence[str],
     *,
@@ -261,25 +400,81 @@ def build_cold_start_draft(
     assign_group_fn: Optional[Callable[[str], str]] = None,
 ) -> ColdStartDraft:
     """
-    从草稿行生成冷启动草案。不写库。
-    cluster_fn 可注入（测试用假实现）；默认 default_rule_cluster。
+    从草稿行生成冷启动草案（可聚类路径，保留给测试）。
+    产品默认请用 ``build_vocab_draft_from_lines`` 直接加载词.txt。
     """
     skipped: List[str] = []
-    words: List[str] = []
+    # 文件内已写明的标准词 → 别名（优先于自动分簇）
+    explicit: Dict[str, List[str]] = {}
+    plain_words: List[str] = []
+    claimed: Set[str] = set()  # 已作为标准词或别名出现的写法
+
     for line in draft_lines:
-        t = str(line or "").strip()
-        if not t:
+        if parse_vocab_group_header(line):
             continue
-        if is_placeholder_tag(t):
-            skipped.append(t)
+        parsed = parse_vocab_draft_line(line)
+        if parsed is None:
             continue
-        words.append(t)
+        std, aliases = parsed
+        if is_placeholder_tag(std):
+            skipped.append(std)
+            continue
+        clean_aliases = [a for a in aliases if not is_placeholder_tag(a)]
+        for a in aliases:
+            if is_placeholder_tag(a):
+                skipped.append(a)
+
+        if std in claimed:
+            # 同标准词重复行：合并别名
+            if std in explicit:
+                for a in clean_aliases:
+                    if a not in claimed and a not in explicit[std]:
+                        explicit[std].append(a)
+                        claimed.add(a)
+            continue
+
+        if clean_aliases:
+            explicit[std] = list(clean_aliases)
+            claimed.add(std)
+            for a in clean_aliases:
+                claimed.add(a)
+        else:
+            plain_words.append(std)
+
+    # 纯词去重，且不与已声明标准/别名冲突
+    plain_uniq: List[str] = []
+    for w in plain_words:
+        if w in claimed:
+            continue
+        if w in plain_uniq:
+            continue
+        plain_uniq.append(w)
+        claimed.add(w)
 
     cluster_fn = cluster_fn or (lambda ws: default_rule_cluster(ws))
     assign_group_fn = assign_group_fn or heuristic_assign_group
 
-    clusters = cluster_fn(words)
-    # 归组 + 别名表
+    auto_clusters = cluster_fn(plain_uniq) if plain_uniq else []
+    # 显式别名簇优先，再拼自动簇（自动簇里若标准词已被占用则跳过）
+    clusters: List[ColdStartCluster] = []
+    used_std: Set[str] = set()
+    for std, aliases in explicit.items():
+        clusters.append(ColdStartCluster(standard=std, aliases=list(aliases), group_id=""))
+        used_std.add(std)
+    for c in auto_clusters:
+        std = (c.standard or "").strip()
+        if not std or std in used_std:
+            continue
+        # 别名不得指向已占用词
+        safe_aliases = [
+            a for a in (c.aliases or [])
+            if a and a != std and a not in used_std and a not in explicit
+        ]
+        clusters.append(
+            ColdStartCluster(standard=std, aliases=safe_aliases, group_id=c.group_id or "")
+        )
+        used_std.add(std)
+
     alias_map: Dict[str, str] = {}
     by_group_all: Dict[str, List[str]] = {
         gid: [] for gid in list(DEFAULT_CLOSED_GROUP_IDS) + [DEFAULT_SUGGESTION_GROUP_ID]
@@ -301,7 +496,6 @@ def build_cold_start_draft(
             if a and a != std:
                 alias_map[a] = std
 
-    # 裁剪封闭组
     by_group: Dict[str, List[str]] = {}
     for gid, tags in by_group_all.items():
         tags_sorted = sorted(set(tags), key=lambda x: x)
@@ -313,6 +507,8 @@ def build_cold_start_draft(
     notes = []
     if skipped:
         notes.append(f"跳过占位词 {len(skipped)} 个")
+    if explicit:
+        notes.append(f"显式别名行 {len(explicit)} 条")
     if not any(by_group.get(g) for g in DEFAULT_CLOSED_GROUP_IDS):
         notes.append("封闭组草案仍空：请检查草稿词表或调整归组")
 
@@ -325,28 +521,76 @@ def build_cold_start_draft(
     )
 
 
+def default_tag_group_template(group_id: str) -> Dict[str, Any]:
+    """词表写入时若配置中尚无该组，自动创建默认骨架。"""
+    names = {
+        "mood": "氛围",
+        "subject": "主体",
+        "location": "场景",
+        "action": "动作",
+        "custom": "建议",
+    }
+    closed = group_id in DEFAULT_CLOSED_GROUP_IDS
+    return {
+        "id": group_id,
+        "name": names.get(group_id, group_id),
+        "rules": {
+            "selection_mode": "single" if closed else "multiple",
+            "max_count": 1 if closed else 5,
+            "ai_expandable": not closed,
+            "local_prompt": "",
+        },
+        "tags": [],
+    }
+
+
+def ensure_canonical_tag_groups(tag_config: Dict[str, Any]) -> Dict[str, Any]:
+    """保证 tag_config 至少含 mood/subject/location/action/custom 五组。"""
+    import copy
+
+    cfg = copy.deepcopy(tag_config or {})
+    groups = cfg.setdefault("tag_groups", [])
+    by_id = {g.get("id"): g for g in groups if isinstance(g, dict)}
+    order = list(DEFAULT_CLOSED_GROUP_IDS) + [DEFAULT_SUGGESTION_GROUP_ID]
+    for gid in order:
+        if gid not in by_id:
+            g = default_tag_group_template(gid)
+            groups.append(g)
+            by_id[gid] = g
+    return cfg
+
+
 def merge_draft_into_tag_config(
     tag_config: Dict[str, Any],
     draft: ColdStartDraft,
     *,
     replace_placeholders: bool = True,
     replace_all_group_tags: bool = False,
+    cap_closed_groups: bool = False,
+    create_missing_groups: bool = True,
 ) -> Dict[str, Any]:
     """
     将草案合并进 tag_config 副本（不落盘）。
     - replace_placeholders：去掉测试* 占位
     - replace_all_group_tags：True 时整组替换为草案（显式）；False 时合并追加
+    - cap_closed_groups：True 时封闭组截到精瘦上限（旧冷启动用）；直接加载词.txt 应为 False
+    - create_missing_groups：True 时为草案中的组自动创建默认标签组（修复 tag_groups 为空写不进去）
     """
     import copy
 
-    cfg = copy.deepcopy(tag_config or {"tag_groups": []})
+    cfg = ensure_canonical_tag_groups(tag_config or {})
     groups = cfg.setdefault("tag_groups", [])
-    by_id = {g.get("id"): g for g in groups}
+    by_id = {g.get("id"): g for g in groups if isinstance(g, dict)}
 
-    for gid, standards in draft.by_group.items():
-        if gid not in by_id:
-            # 不自动创建未知组
+    for gid, standards in (draft.by_group or {}).items():
+        if not gid:
             continue
+        if gid not in by_id:
+            if not create_missing_groups:
+                continue
+            g = default_tag_group_template(gid)
+            groups.append(g)
+            by_id[gid] = g
         g = by_id[gid]
         existing_raw = g.get("tags") or []
         existing_names = [tag_name_from_pool_item(t) for t in existing_raw]
@@ -363,8 +607,8 @@ def merge_draft_into_tag_config(
                 if s not in merged:
                     merged.append(s)
 
-        # 封闭组裁剪
-        if gid in DEFAULT_CLOSED_GROUP_IDS:
+        # 仅在显式要求时裁剪封闭组（直接加载完整词表时不要裁）
+        if cap_closed_groups and gid in DEFAULT_CLOSED_GROUP_IDS:
             merged = merged[:DEFAULT_PER_CLOSED_MAX]
         g["tags"] = merged
 
