@@ -118,12 +118,23 @@ class SettingsView(QWidget):
         
         self.audio_cb = QCheckBox("启用音频转录 (Whisper)")
         self.audio_cb.setChecked(SettingsManager.get_setting(self.settings, "processing.enable_audio_transcription", False))
+
+        self.auto_xmp_cb = QCheckBox("分析成功后自动同步 XMP 侧车（默认关闭）")
+        self.auto_xmp_cb.setToolTip(
+            "关闭时：仅分析落库，不在磁盘写 .xmp；可用工作台「同步元数据」手动生成。"
+        )
+        self.auto_xmp_cb.setChecked(
+            bool(SettingsManager.get_setting(
+                self.settings, "processing.auto_sync_xmp_after_analysis", False
+            ))
+        )
         
         proc_form.addRow("并发处理线程:", self.workers_spin)
         proc_form.addRow("AI 分析抽帧数:", self.frames_spin)
         proc_form.addRow("JPEG 压缩质量:", self.quality_spin)
         proc_form.addRow(self.scene_detect_cb)
         proc_form.addRow(self.audio_cb)
+        proc_form.addRow(self.auto_xmp_cb)
         form.addRow(proc_group)
 
         # 分析重试（高级，ADR-0005）
@@ -799,6 +810,11 @@ class SettingsView(QWidget):
         SettingsManager.update_setting(self.settings, "processing.jpeg_quality", self.quality_spin.value())
         SettingsManager.update_setting(self.settings, "processing.enable_scene_detection", self.scene_detect_cb.isChecked())
         SettingsManager.update_setting(self.settings, "processing.enable_audio_transcription", self.audio_cb.isChecked())
+        SettingsManager.update_setting(
+            self.settings,
+            "processing.auto_sync_xmp_after_analysis",
+            self.auto_xmp_cb.isChecked(),
+        )
         if hasattr(self, "call_extra_spin"):
             SettingsManager.update_setting(
                 self.settings,

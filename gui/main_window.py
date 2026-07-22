@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QLabel, QListWidget, QListWidgetItem, QStackedWidget,
     QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from .views.workstation import WorkstationView
 from .views.material_library import MaterialLibraryView
 from .views.tags_library import TagsView
@@ -21,16 +21,25 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Video Organizer Pro (PySide6)")
         self.resize(1400, 900)
 
-        # 启动时恢复工作范围（若开启记住）
+        # 启动只恢复路径，扫盘延后到 UI 就绪后由工作台后台执行（避免启动卡死）
+        self._pending_scope_scan = False
         try:
-            self.service.restore_work_scope_if_enabled()
+            if self.service.restore_work_scope_if_enabled(scan=False):
+                self._pending_scope_scan = bool(self.service.get_work_scope_paths())
         except Exception:
             pass
 
         self.setup_ui()
         self.refresh_style()
         self.apply_sidebar_width()
-        
+        if self._pending_scope_scan:
+            QTimer.singleShot(0, self._kick_background_scope_scan)
+
+    def _kick_background_scope_scan(self):
+        page = getattr(self, "workstation_page", None)
+        if page is not None and hasattr(page, "background_scan_work_scope"):
+            page.background_scan_work_scope(reason="启动恢复工作范围")
+
     def refresh_style(self):
         """刷新主窗 QSS，并广播主题到已创建的子视图。"""
         font_size = SettingsManager.get_setting(self.settings, "ui_preferences.font_size", 14)

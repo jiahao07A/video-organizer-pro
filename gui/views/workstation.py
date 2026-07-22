@@ -27,6 +27,7 @@ from ..models.video_table import (
 from ..models.proxy_model import AdvancedSortFilterProxyModel
 from ..workers.analysis_worker import AnalysisWorker
 from ..workers.rename_worker import RenameWorker
+from ..workers.io_worker import run_io_job
 from ..widgets.rename_dialog import BatchRenameDialog
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from gui.styles import normalize_theme
@@ -579,68 +580,6 @@ class WorkstationView(QWidget):
             self.path_input.setText(f"{len(paths)} 项已选")
         self.path_input.setToolTip("\n".join(paths))
 
-    def browse_path(self):
-        """多选文件与文件夹，确认后整份替换工作范围并扫盘入库。"""
-        dialog = QFileDialog(self, "选择工作范围（可多选文件与文件夹，确认后整份替换）")
-        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        dialog.setFileMode(QFileDialog.Directory)
-        dialog.setOption(QFileDialog.ShowDirsOnly, False)
-        dialog.setNameFilters([
-            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v *.flv *.wmv)",
-            "所有文件 (*.*)",
-        ])
-        for view in dialog.findChildren(QTreeView):
-            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        for view in dialog.findChildren(QtListView):
-            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-        if dialog.exec() != QDialog.Accepted:
-            return
-        selected = self._collect_dialog_paths(dialog)
-        if not selected:
-            return
-
-        result = self.service.replace_work_scope(selected, scan=True)
-        self._refresh_scope_path_ui()
-        self.load_data()
-        n_paths = len(result.get("paths") or [])
-        n_reg = len(result.get("registered") or [])
-        self.status_label.setText(
-            f"工作范围已替换为 {n_paths} 项；新入库未分析 {n_reg} 个"
-        )
-        self.status_message.emit(self.status_label.text())
-
-    def accumulate_path(self):
-        """多选路径并累加进当前工作范围。"""
-        dialog = QFileDialog(self, "累加到工作范围（可多选文件与文件夹）")
-        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        dialog.setFileMode(QFileDialog.Directory)
-        dialog.setOption(QFileDialog.ShowDirsOnly, False)
-        dialog.setNameFilters([
-            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v *.flv *.wmv)",
-            "所有文件 (*.*)",
-        ])
-        for view in dialog.findChildren(QTreeView):
-            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        for view in dialog.findChildren(QtListView):
-            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-        if dialog.exec() != QDialog.Accepted:
-            return
-        selected = self._collect_dialog_paths(dialog)
-        if not selected:
-            return
-
-        result = self.service.append_work_scope(selected, scan=True)
-        self._refresh_scope_path_ui()
-        self.load_data()
-        n_paths = len(result.get("paths") or [])
-        n_reg = len(result.get("registered") or [])
-        self.status_label.setText(
-            f"工作范围已累加，现共 {n_paths} 项；新入库未分析 {n_reg} 个"
-        )
-        self.status_message.emit(self.status_label.text())
-
     def load_data(self):
         """从服务层加载「工作范围内」的已入库视频；空范围显示空列表与提示。"""
         scope = self.service.get_work_scope_paths()
@@ -718,8 +657,15 @@ class WorkstationView(QWidget):
             self.detail_panel.on_thumb_double_click(None)
 
     def batch_replace_tags_ui(self):
-        """弹出对话框进行批量标签替换"""
+        """弹出对话框进行批量标签替换（仅操作目标集）。"""
         from PySide6.QtWidgets import QInputDialog
+        targets = self._resolve_batch_targets()
+        if not targets:
+            QMessageBox.warning(
+                self, "提示",
+                "没有可替换标签的目标。\n请设定工作范围，或选中条目（无选中则作用于当前可见列表）。",
+            )
+            return
         old_tag, ok1 = QInputDialog.getText(self, "批量替换标签", "请输入要替换的原标签:")
         if not ok1 or not old_tag:
             return
@@ -730,13 +676,105 @@ class WorkstationView(QWidget):
 
         reply = QMessageBox.question(
             self, "确认替换",
-            f"确定要将所有视频中的标签 '{old_tag}' 替换为 '{new_tag}' 吗？",
+            f"确定在当前操作目标集（{len(targets)} 条视频）中，\n"
+            f"将标签 '{old_tag}' 替换为 '{new_tag}' 吗？\n"
+            f"（不会修改范围外的全库其它条目）",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            self.service.bulk_replace_tags(old_tag, new_tag)
+            self.service.bulk_replace_tags(old_tag, new_tag, selected_paths=targets)
             self.load_data()
-            QMessageBox.information(self, "成功", "批量替换完成。")
+            QMessageBox.information(self, "成功", f"已在 {len(targets)} 条目标中完成替换。")
+
+    def background_scan_work_scope(self, reason: str = "扫盘入库"):
+        """后台扫描当前工作范围并入库。"""
+        def job():
+            return self.service.scan_and_register_work_scope()
+
+        def on_ok(registered):
+            n_reg = len(registered or [])
+            self.load_data()
+            self.status_label.setText(f"{reason}完成；新入库未分析 {n_reg} 个")
+            self.status_message.emit(self.status_label.text())
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setRange(0, 100)
+            self.set_ui_enabled(True)
+
+        def on_fail(msg):
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setRange(0, 100)
+            self.set_ui_enabled(True)
+            QMessageBox.warning(self, "扫盘失败", msg or "未知错误")
+
+        def on_start():
+            self.set_ui_enabled(False)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText(f"{reason}中…")
+
+        run_io_job(
+            self, fn=job, on_ok=on_ok, on_fail=on_fail, on_start=on_start,
+            busy_message=f"{reason}中…",
+        )
+
+    def browse_path(self):
+        """多选文件与文件夹，确认后整份替换工作范围并后台扫盘入库。"""
+        dialog = QFileDialog(self, "选择工作范围（可多选文件与文件夹，确认后整份替换）")
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, False)
+        dialog.setNameFilters([
+            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v *.flv *.wmv)",
+            "所有文件 (*.*)",
+        ])
+        for view in dialog.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for view in dialog.findChildren(QtListView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = self._collect_dialog_paths(dialog)
+        if not selected:
+            return
+
+        # 先同步替换路径（轻量），扫盘后台做
+        result = self.service.replace_work_scope(selected, scan=False)
+        self._refresh_scope_path_ui()
+        self.load_data()
+        n_paths = len(result.get("paths") or [])
+        self.status_label.setText(f"工作范围已替换为 {n_paths} 项；正在后台扫盘…")
+        self.status_message.emit(self.status_label.text())
+        self.background_scan_work_scope(reason="工作范围扫盘")
+
+    def accumulate_path(self):
+        """多选路径并累加进当前工作范围，后台扫盘。"""
+        dialog = QFileDialog(self, "累加到工作范围（可多选文件与文件夹）")
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, False)
+        dialog.setNameFilters([
+            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v *.flv *.wmv)",
+            "所有文件 (*.*)",
+        ])
+        for view in dialog.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for view in dialog.findChildren(QtListView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = self._collect_dialog_paths(dialog)
+        if not selected:
+            return
+
+        result = self.service.append_work_scope(selected, scan=False)
+        self._refresh_scope_path_ui()
+        self.load_data()
+        n_paths = len(result.get("paths") or [])
+        self.status_label.setText(f"工作范围已累加，现共 {n_paths} 项；正在后台扫盘…")
+        self.status_message.emit(self.status_label.text())
+        self.background_scan_work_scope(reason="累加扫盘")
 
     def get_selected_source_rows(self):
         if self.view_stack.currentWidget() == self.card_view:
@@ -858,12 +896,22 @@ class WorkstationView(QWidget):
             self.cancel_analysis_btn.setEnabled(False)
 
     def set_ui_enabled(self, enabled):
+        """分析/长任务期间锁定写盘与导出入口。"""
         self.analyze_btn.setEnabled(enabled)
         self.simulate_btn.setEnabled(enabled)
         self.apply_btn.setEnabled(enabled)
         self.rollback_btn.setEnabled(enabled)
         self.sync_xmp_btn.setEnabled(enabled)
         self.path_input.setEnabled(enabled)
+        self.export_fcpx_btn.setEnabled(enabled)
+        self.export_ale_btn.setEnabled(enabled)
+        self.auto_organize_btn.setEnabled(enabled)
+        self.delete_btn.setEnabled(enabled)
+        if hasattr(self, "detail_panel") and self.detail_panel:
+            try:
+                self.detail_panel.setEnabled(enabled)
+            except Exception:
+                pass
         if enabled:
             self.cancel_analysis_btn.setEnabled(False)
 
@@ -964,6 +1012,17 @@ class WorkstationView(QWidget):
         else:
             QMessageBox.warning(self, "错误", "没有可回滚的记录。")
 
+    def _busy_io_start(self, msg: str = "处理中…"):
+        self.set_ui_enabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText(msg)
+
+    def _busy_io_end(self):
+        self.set_ui_enabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+
     def export_fcpx(self):
         scope = self.service.get_work_scope_paths()
         if not scope:
@@ -974,9 +1033,26 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
             return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出 FCPX XML", "", "FCPXML Files (*.fcpxml)")
-        if file_path:
+        if not file_path:
+            return
+
+        def job():
             self.service.export_to_fcpx_xml(file_path, selected_paths)
-            QMessageBox.information(self, "成功", f"FCPX XML 已导出至: {file_path}")
+            return file_path
+
+        def on_ok(path):
+            self._busy_io_end()
+            QMessageBox.information(self, "成功", f"FCPX XML 已导出至: {path}")
+
+        def on_fail(msg):
+            self._busy_io_end()
+            QMessageBox.warning(self, "导出失败", msg or "未知错误")
+
+        run_io_job(
+            self, fn=job, on_ok=on_ok, on_fail=on_fail,
+            on_start=lambda: self._busy_io_start("正在导出 FCPX…"),
+            busy_message="正在导出 FCPX…",
+        )
 
     def export_ale(self):
         scope = self.service.get_work_scope_paths()
@@ -988,15 +1064,32 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
             return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出 ALE (达芬奇)", "", "ALE Files (*.ale)")
-        if file_path:
-            success = self.service.export_to_ale(file_path, selected_paths)
+        if not file_path:
+            return
+
+        def job():
+            return self.service.export_to_ale(file_path, selected_paths), file_path
+
+        def on_ok(result):
+            self._busy_io_end()
+            success, path = result if isinstance(result, tuple) else (result, file_path)
             if success:
                 QMessageBox.information(
                     self, "成功",
-                    f"ALE 文件已导出至: {file_path}\n请在达芬奇中使用 'File -> Import -> Metadata from ALE...' 导入。",
+                    f"ALE 文件已导出至: {path}\n请在达芬奇中使用 'File -> Import -> Metadata from ALE...' 导入。",
                 )
             else:
                 QMessageBox.warning(self, "失败", "导出 ALE 文件失败。")
+
+        def on_fail(msg):
+            self._busy_io_end()
+            QMessageBox.warning(self, "导出失败", msg or "未知错误")
+
+        run_io_job(
+            self, fn=job, on_ok=on_ok, on_fail=on_fail,
+            on_start=lambda: self._busy_io_start("正在导出 ALE…"),
+            busy_message="正在导出 ALE…",
+        )
 
     def sync_metadata(self):
         scope = self.service.get_work_scope_paths()
@@ -1008,11 +1101,25 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "警告", "工作范围内没有可同步的视频。")
             return
 
-        count = self.service.sync_metadata_to_xmp(selected_paths)
-        QMessageBox.information(self, "完成", f"已成功为 {count} 个视频生成 XMP 侧边文件。")
+        def job():
+            return self.service.sync_metadata_to_xmp(selected_paths)
+
+        def on_ok(count):
+            self._busy_io_end()
+            QMessageBox.information(self, "完成", f"已成功为 {count} 个视频生成 XMP 侧边文件。")
+
+        def on_fail(msg):
+            self._busy_io_end()
+            QMessageBox.warning(self, "XMP 同步失败", msg or "未知错误")
+
+        run_io_job(
+            self, fn=job, on_ok=on_ok, on_fail=on_fail,
+            on_start=lambda: self._busy_io_start("正在同步 XMP…"),
+            busy_message="正在同步 XMP…",
+        )
 
     def start_auto_organize(self):
-        """V4.0: 触发物理迁移自动整理"""
+        """物理整理：先模拟预览清单，确认后后台执行。"""
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
@@ -1026,15 +1133,47 @@ class WorkstationView(QWidget):
         if not target_root:
             return
 
+        plan = self.service.plan_physical_migration(target_root, selected_paths)
+        if not plan:
+            QMessageBox.information(self, "无需整理", "没有需要移动的文件（可能已在目标位置或路径无效）。")
+            return
+
+        preview_lines = []
+        for i, step in enumerate(plan[:20]):
+            preview_lines.append(
+                f"{i + 1}. {step.get('filename')} → {step.get('category')}/"
+            )
+        if len(plan) > 20:
+            preview_lines.append(f"… 另有 {len(plan) - 20} 条")
+        preview = "\n".join(preview_lines)
+
         reply = QMessageBox.question(
-            self, "确认整理",
-            f"确定要将 {len(selected_paths)} 个文件移动到分类目录吗？\n目标: {target_root}",
+            self, "模拟预览 — 确认整理",
+            f"将移动 {len(plan)} 个文件到：\n{target_root}\n\n"
+            f"{preview}\n\n确认后执行物理迁移（高风险）。是否继续？",
             QMessageBox.Yes | QMessageBox.No,
         )
-        if reply == QMessageBox.Yes:
-            count = self.service.execute_physical_migration(target_root, selected_paths)
-            QMessageBox.information(self, "完成", f"已成功整理 {count} 个文件。")
+        if reply != QMessageBox.Yes:
+            return
+
+        def job():
+            return self.service.execute_physical_migration(target_root, selected_paths)
+
+        def on_ok(count):
+            self._busy_io_end()
             self.load_data()
+            QMessageBox.information(self, "完成", f"已成功整理 {count} 个文件。")
+
+        def on_fail(msg):
+            self._busy_io_end()
+            self.load_data()
+            QMessageBox.warning(self, "整理失败", msg or "未知错误")
+
+        run_io_job(
+            self, fn=job, on_ok=on_ok, on_fail=on_fail,
+            on_start=lambda: self._busy_io_start("正在物理整理…"),
+            busy_message="正在物理整理…",
+        )
 
     def on_task_finished(self, success, message):
         self.set_ui_enabled(True)

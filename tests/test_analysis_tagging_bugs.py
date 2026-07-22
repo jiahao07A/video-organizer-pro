@@ -50,9 +50,10 @@ def test_sync_metadata_to_xmp_with_tags_no_nameerror(service: VideoOrganizerServ
 
 
 def test_run_analysis_xmp_failure_still_counts_success(service: VideoOrganizerService, tmp_path: Path, monkeypatch):
-    """XMP 抛异常不得推翻分析成功计数，也不得冒泡。"""
+    """开启分析后自动 XMP 时：XMP 抛异常不得推翻分析成功计数，也不得冒泡。"""
     v = _touch(tmp_path / "a.mp4")
     service.db.upsert_video({"path": v, "filename": "a.mp4", "status": "pending", "tags": []})
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = True
 
     def fake_process(path, force_reanalyze=False, **_kwargs):
         return {

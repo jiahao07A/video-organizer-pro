@@ -119,6 +119,8 @@ DEFAULT_SETTINGS = {
         "enable_scene_detection": True,
         "enable_audio_transcription": False,
         "enable_metadata_injection": False,
+        # 分析成功后是否自动写 XMP 侧车（默认关，避免分析阶段静默改盘）
+        "auto_sync_xmp_after_analysis": False,
         # 分析任务重试（ADR-0005）
         "analysis_retry": {
             "call_extra_attempts": 2,
@@ -636,13 +638,22 @@ class DatabaseManager:
                     cursor.execute("UPDATE tags_library SET usage_count = ? WHERE tag_name = ?", (count, tag))
                 conn.commit()
 
-    def bulk_replace_tags(self, old_tag: str, new_tag: str):
-        """数据库级批量替换视频标签（替换后走别名归一，落库写标准词）。"""
+    def bulk_replace_tags(self, old_tag: str, new_tag: str, selected_paths: Optional[List[str]] = None):
+        """
+        数据库级批量替换视频标签（替换后走别名归一，落库写标准词）。
+        selected_paths 为 None 时全库；为列表时仅替换这些路径（规范化匹配）。
+        """
         from core.tag_normalize import normalize_flat_tags
 
         alias_map = self.get_synonyms()
         videos = self.get_all_videos()
+        allow = None
+        if selected_paths is not None:
+            allow = {normalize_work_path(p) for p in selected_paths if p}
         for video in videos:
+            if allow is not None:
+                if normalize_work_path(video.get("path", "")) not in allow:
+                    continue
             tags = video.get("tags", [])
             if old_tag in tags:
                 new_tags = [new_tag if t == old_tag else t for t in tags]
@@ -1402,6 +1413,40 @@ class AIHandler:
         ]
         return data
 
+    def build_vocab_cache_fingerprint(self) -> str:
+        """
+        分析 API 缓存键中的词表/提示指纹。
+        标准词、别名、tag_config（含组与 prompt）任一变更则指纹变化，避免静默复用旧标签结果。
+        """
+        import hashlib
+        import json
+
+        synonyms: Dict[str, str] = {}
+        db_tags: List[tuple] = []
+        if self.db:
+            try:
+                synonyms = {
+                    str(k): str(v)
+                    for k, v in sorted((self.db.get_synonyms() or {}).items())
+                }
+            except Exception:
+                synonyms = {}
+            try:
+                detail = self.db.get_tags_detail() or []
+                db_tags = sorted(
+                    (str(t.get("tag_name") or ""), str(t.get("dimension") or ""))
+                    for t in detail
+                )
+            except Exception:
+                db_tags = []
+        payload = {
+            "tag_config": self.tag_config or {},
+            "synonyms": synonyms,
+            "db_tags": db_tags,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     def analyze_video(
         self,
         base64_frames: List[str],
@@ -1416,7 +1461,11 @@ class AIHandler:
         if use_cache and self.db and cache_key:
             cached = self.db.get_cache(cache_key)
             if cached:
-                logger.info("使用 API 响应缓存")
+                logger.info("使用 API 响应缓存（按当前词表再归一）")
+                # 键已含词表指纹；命中后再归一，防止极端键碰撞或中间层改写
+                data = dict(cached) if isinstance(cached, dict) else cached
+                if isinstance(data, dict):
+                    return self.apply_tag_normalization(data, persist_pending=False)
                 return cached
 
         # 与设置页预览共用同一条组装链路
@@ -2092,8 +2141,10 @@ class VideoOrganizerService:
         except Exception as e:
             logger.warning(f"保存工作范围失败: {e}")
 
-    def restore_work_scope_if_enabled(self) -> bool:
-        """启动时若开启记住范围则恢复路径与排除集；成功返回 True。"""
+    def restore_work_scope_if_enabled(self, *, scan: bool = True) -> bool:
+        """启动时若开启记住范围则恢复路径与排除集；成功返回 True。
+        scan=False 时仅恢复路径（供 GUI 后台扫盘，避免启动卡死）。
+        """
         prefs = self.settings.get("ui_preferences", {}) or {}
         if not prefs.get("remember_work_scope"):
             return False
@@ -2101,7 +2152,7 @@ class VideoOrganizerService:
         if not paths:
             return False
         exclusions = prefs.get("last_work_scope_exclusions") or []
-        self.set_work_scope_paths(list(paths), scan=True, clear_exclusions=True)
+        self.set_work_scope_paths(list(paths), scan=scan, clear_exclusions=True)
         # 恢复「移出工作范围」排除（在替换清排除之后写回）
         restored: Set[str] = set()
         for p in exclusions:
@@ -3352,14 +3403,19 @@ class VideoOrganizerService:
         self.log(f"已移出工作范围 {removed} 条（库记录保留）。")
         return removed
 
-    def bulk_replace_tags(self, old_tag: str, new_tag: str):
-        """全局批量替换标签"""
-        self.db.bulk_replace_tags(old_tag, new_tag)
-        self.db.refresh_tag_usage_counts() # 替换后刷新统计
-        # 清除内存缓存以强制重新加载
+    def bulk_replace_tags(
+        self,
+        old_tag: str,
+        new_tag: str,
+        selected_paths: Optional[List[str]] = None,
+    ):
+        """批量替换标签；selected_paths 限定操作目标集（None=全库，兼容旧调用）。"""
+        self.db.bulk_replace_tags(old_tag, new_tag, selected_paths=selected_paths)
+        self.db.refresh_tag_usage_counts()
         with self._cache_lock:
             self._memory_cache = {}
-        self.log(f"已将标签 '{old_tag}' 批量替换为 '{new_tag}'")
+        scope = "全库" if selected_paths is None else f"{len(selected_paths)} 条目标"
+        self.log(f"已将标签 '{old_tag}' 批量替换为 '{new_tag}'（{scope}）")
 
     def request_cancel_analysis(self) -> None:
         """协作式取消分析任务。"""
@@ -3388,11 +3444,16 @@ class VideoOrganizerService:
             self.on_progress(done, total)
 
     def _persist_analysis_success(self, res: Dict) -> int:
-        """入库 + XMP；返回 xmp 失败 0/1。"""
+        """入库；可选自动写 XMP。返回 xmp 失败 0/1（未写 XMP 视为 0）。"""
         self.db.upsert_video(res)
         with self._cache_lock:
             if self._memory_cache is not None:
                 self._memory_cache[res["path"]] = res
+        auto_xmp = SettingsManager.get_setting(
+            self.settings, "processing.auto_sync_xmp_after_analysis", False
+        )
+        if not auto_xmp:
+            return 0
         try:
             self.sync_metadata_to_xmp([res["path"]])
             return 0
@@ -3417,6 +3478,9 @@ class VideoOrganizerService:
                 "last_error": reason,
             }
             self.db.upsert_video(fail_row)
+            # 清空 L1 缓存，下次 get_all_videos 从 DB 拉失败态（避免双键重复/路径形态不一致）
+            with self._cache_lock:
+                self._memory_cache = {}
         except Exception as e:
             logger.warning(f"写入失败状态失败 {video_path}: {e}")
 
@@ -3752,7 +3816,12 @@ class VideoOrganizerService:
                     from core.model_providers import DEFAULT_MODEL
 
                     model_name = DEFAULT_MODEL
-                cache_key = f"{file_hash}_{model_name}"
+                try:
+                    vocab_fp = self.ai.build_vocab_cache_fingerprint()
+                except Exception:
+                    vocab_fp = "novocab"
+                # 键 = 文件哈希 + 模型 + 词表指纹（标准词/别名/tag_config 变更即失效）
+                cache_key = f"{file_hash}_{model_name}_{vocab_fp}"
                 ai_data = self.ai.analyze_video(
                     frames, cache_key=cache_key, use_cache=not force_reanalyze
                 )
@@ -4071,14 +4140,19 @@ class VideoOrganizerService:
         """
         导出 Avid Log Exchange (ALE) 文件，专门用于达芬奇 (DaVinci Resolve) 的元数据导入。
         ALE 是一种通用的、基于制表符分隔的格式，达芬奇对其支持非常出色。
+        selected_paths 语义与 FCPX 一致：None=不按路径裁剪；[]=空集合；列表=规范化路径筛选。
         """
         videos = self.db.get_all_videos()
-        if selected_paths:
-            videos = [v for v in videos if v.get("path") in selected_paths]
+        if selected_paths is not None:
+            allow = {normalize_work_path(p) for p in selected_paths if p}
+            videos = [
+                v for v in videos
+                if normalize_work_path(v.get("path", "")) in allow
+            ]
             
         if not videos:
             self.log("没有可导出的视频数据。")
-            return
+            return False
             
         # ALE 头部信息
         lines = [
@@ -4123,7 +4197,7 @@ class VideoOrganizerService:
         from core.analysis_targets import path_status_key
 
         videos = self.db.get_all_videos()
-        if selected_paths:
+        if selected_paths is not None:
             allow = {path_status_key(p) for p in selected_paths if p}
             videos = [
                 v for v in videos
@@ -4328,73 +4402,105 @@ class VideoOrganizerService:
         self.log(f"元数据同步完成，生成了 {success_count} 个 XMP 文件。")
         return success_count
 
-    def execute_physical_migration(self, target_root: str, selected_paths: Optional[List[str]] = None):
-        """V4.0: 执行物理迁移，按分类自动归档文件"""
+    def plan_physical_migration(
+        self,
+        target_root: str,
+        selected_paths: Optional[List[str]] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        物理整理模拟预览：返回 [{old_path, new_path, category, filename}, ...]，不改磁盘。
+        """
         videos = self.db.get_all_videos()
-        if selected_paths:
-            videos = [v for v in videos if v.get("path") in selected_paths]
-            
-        success_count = 0
+        if selected_paths is not None:
+            allow = {normalize_work_path(p) for p in selected_paths if p}
+            videos = [
+                v for v in videos
+                if normalize_work_path(v.get("path", "")) in allow
+            ]
+
+        plan: List[Dict[str, str]] = []
+        used_dest: set = set()
         for item in videos:
             old_path = item.get("path")
             if not old_path or not os.path.exists(old_path):
                 continue
-                
-            category = item.get("category", "Other")
-            dest_dir = os.path.join(target_root, category)
-            if not os.path.exists(dest_dir):
-                os.makedirs(dest_dir)
-                
+            category = item.get("category") or "Other"
+            dest_dir = os.path.join(target_root, str(category))
             filename = os.path.basename(old_path)
             new_path = os.path.join(dest_dir, filename)
-            
             if os.path.normpath(old_path) == os.path.normpath(new_path):
                 continue
-            
-            # 避免覆盖
-            if os.path.exists(new_path):
+            # 预览层冲突消解（与执行层策略一致的可解释命名）
+            if os.path.exists(new_path) or new_path in used_dest:
                 base, ext = os.path.splitext(filename)
-                new_path = os.path.join(dest_dir, f"{base}_{int(time.time()) % 1000}{ext}")
-                
+                n = 1
+                while True:
+                    candidate = os.path.join(dest_dir, f"{base}_{n}{ext}")
+                    if not os.path.exists(candidate) and candidate not in used_dest:
+                        new_path = candidate
+                        break
+                    n += 1
+                    if n > 9999:
+                        break
+            used_dest.add(new_path)
+            plan.append({
+                "old_path": old_path,
+                "new_path": new_path,
+                "category": str(category),
+                "filename": filename,
+            })
+        return plan
+
+    def execute_physical_migration(self, target_root: str, selected_paths: Optional[List[str]] = None):
+        """V4.0: 执行物理迁移，按分类自动归档文件"""
+        plan = self.plan_physical_migration(target_root, selected_paths)
+        success_count = 0
+        for step in plan:
+            old_path = step["old_path"]
+            new_path = step["new_path"]
+            category = step.get("category") or "Other"
+            filename = step.get("filename") or os.path.basename(old_path)
+            if not old_path or not os.path.exists(old_path):
+                continue
+            dest_dir = os.path.dirname(new_path)
             try:
+                if not os.path.exists(dest_dir):
+                    os.makedirs(dest_dir)
                 logger.info(f"执行物理迁移: {filename} -> {category}/")
                 self.log(f"正在迁移: {filename} -> {category}/")
-                # 原子化迁移: 复制 + 校验 + 删除 (安全性保障)
                 shutil.copy2(old_path, new_path)
-                
-                # 同步迁移 XMP
+
                 old_xmp = os.path.splitext(old_path)[0] + ".xmp"
                 new_xmp = os.path.splitext(new_path)[0] + ".xmp"
                 if os.path.exists(old_xmp):
                     try:
                         shutil.copy2(old_xmp, new_xmp)
-                    except:
+                    except Exception:
                         pass
 
-                # 简单的大小校验作为第一步，哈希校验作为第二步
                 if os.path.getsize(old_path) == os.path.getsize(new_path):
                     os.remove(old_path)
                     if os.path.exists(old_xmp) and os.path.exists(new_xmp):
                         try:
                             os.remove(old_xmp)
-                        except:
+                        except Exception:
                             pass
-                    
-                    # 更新数据库中的路径
+                    item = self.db.get_video_by_path(old_path) or {"path": old_path}
                     item["path"] = new_path
+                    item["filename"] = os.path.basename(new_path)
                     self.db.upsert_video(item)
-                    
-                    # 记录迁移日志
                     self.db.execute_non_query(
                         "INSERT INTO migration_history (old_path, new_path, reason) VALUES (?, ?, ?)",
-                        (old_path, new_path, "Auto-categorization")
+                        (old_path, new_path, "Auto-categorization"),
                     )
                     success_count += 1
                 else:
                     self.log(f"迁移校验失败 (大小不一致): {filename}")
             except Exception as e:
                 self.log(f"迁移过程出错 {filename}: {e}")
-                
+
+        with self._cache_lock:
+            self._memory_cache = {}
         self.log(f"物理整理完成，成功迁移: {success_count}")
         return success_count
 

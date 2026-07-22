@@ -281,11 +281,29 @@ class DetailPanel(QWidget):
         out_path, _ = QFileDialog.getSaveFileName(self, "保存故事板", os.path.splitext(path)[0] + "_storyboard.pdf", "PDF Files (*.pdf);;Image Files (*.jpg *.png)")
         
         if out_path:
-            success = self.service.generate_storyboard(path, out_path)
-            if success:
-                QMessageBox.information(self, "成功", f"故事板已生成并保存至:\n{out_path}")
-            else:
-                QMessageBox.critical(self, "失败", "故事板生成失败，请检查日志。")
+            from ..workers.io_worker import run_io_job
+
+            path = self.current_video.get("path")
+
+            def job():
+                return self.service.generate_storyboard(path, out_path)
+
+            def on_ok(success):
+                self.storyboard_btn.setEnabled(True)
+                if success:
+                    QMessageBox.information(self, "成功", f"故事板已生成并保存至:\n{out_path}")
+                else:
+                    QMessageBox.critical(self, "失败", "故事板生成失败，请检查日志。")
+
+            def on_fail(msg):
+                self.storyboard_btn.setEnabled(True)
+                QMessageBox.critical(self, "失败", msg or "故事板生成失败")
+
+            self.storyboard_btn.setEnabled(False)
+            run_io_job(
+                self, fn=job, on_ok=on_ok, on_fail=on_fail,
+                busy_message="正在生成故事板…",
+            )
 
     def on_thumb_double_click(self, event):
         """兼容右键播放：切换素材预览播放。"""
