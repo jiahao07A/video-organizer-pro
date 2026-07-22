@@ -187,10 +187,15 @@ class PendingTagsPanel(QFrame):
         btn_row2.addWidget(self.btn_ai)
         layout.addLayout(btn_row2)
 
+        self.btn_batch_ai = QPushButton("批量 AI 分拣…")
+        self.btn_batch_ai.setToolTip("批量待审 AI 分拣：出清单 → 多选 → 应用选中")
+        layout.addWidget(self.btn_batch_ai)
+
         self.btn_approve.clicked.connect(self._on_approve)
         self.btn_alias.clicked.connect(self._on_alias)
         self.btn_discard.clicked.connect(self._on_discard)
         self.btn_ai.clicked.connect(self._on_ai_suggest)
+        self.btn_batch_ai.clicked.connect(self._on_batch_ai)
 
     def _apply_style(self):
         c = self.colors
@@ -344,36 +349,189 @@ class PendingTagsPanel(QFrame):
             self.reload()
 
     def _on_ai_suggest(self):
-        """待审词 AI 建议：必须人工确认后才写库。"""
+        """待审词 AI 建议：后台调模型，完成后弹确认框。"""
+        from gui.workers.tag_ai_worker import run_tag_ai_job
+
         row = self._current_row()
         if not row:
             QMessageBox.information(self, "提示", "请先选择一条待审词。")
             return
-        sug = self._service().suggest_pending_tag(row)
-        action = getattr(sug, "action", None) or ""
-        detail = getattr(sug, "reason", None) or ""
-        if action == "link_alias":
-            detail += f"\n建议：挂为「{getattr(sug, 'recommended_standard', '')}」的别名"
-        elif action == "approve_standard":
-            detail += (
-                f"\n建议：批准为标准词"
-                f"（组 {getattr(sug, 'recommended_group_id', None) or getattr(sug, 'group_id', '')}）"
+        # 拷贝行，避免列表刷新后丢数据
+        row_copy = dict(row)
+        svc = self._service()
+
+        def work():
+            return svc.suggest_pending_tag(row_copy)
+
+        def on_ok(sug):
+            if sug is None:
+                QMessageBox.warning(self, "失败", "未获得建议。")
+                return
+            action = getattr(sug, "action", None) or ""
+            detail = getattr(sug, "reason", None) or ""
+            source = getattr(sug, "source", None) or "rule"
+            source_label = "大模型" if source == "model" else "规则降级"
+            if action == "link_alias":
+                detail += f"\n建议：挂为「{getattr(sug, 'recommended_standard', '')}」的别名"
+            elif action == "approve_standard":
+                detail += (
+                    f"\n建议：批准为标准词"
+                    f"（组 {getattr(sug, 'recommended_group_id', None) or getattr(sug, 'group_id', '')}）"
+                )
+            else:
+                detail += "\n建议：丢弃"
+            reply = QMessageBox.question(
+                self,
+                "待审词 AI 建议",
+                f"「{row_copy.get('raw_text')}」\n来源：{source_label}\n{detail}\n\n"
+                f"是否采纳该建议？\n（未确认不会写库）",
+                QMessageBox.Yes | QMessageBox.No,
             )
-        else:
-            detail += "\n建议：丢弃"
-        reply = QMessageBox.question(
+            if reply != QMessageBox.Yes:
+                return
+            if self._service().apply_pending_suggestion(sug, confirm=True):
+                self.reload()
+                self.owner.on_pending_resolved()
+            else:
+                QMessageBox.warning(self, "失败", "应用建议失败。")
+
+        def on_fail(msg: str):
+            QMessageBox.warning(self, "AI 失败", msg or "调用失败")
+
+        run_tag_ai_job(
             self,
-            "待审词 AI 建议",
-            f"「{row.get('raw_text')}」\n{detail}\n\n是否采纳该建议？\n（未确认不会写库）",
-            QMessageBox.Yes | QMessageBox.No,
+            title="待审词 AI",
+            label="正在请求 AI 建议，请稍候…\n（网络较慢时可能需要数十秒）",
+            fn=work,
+            on_ok=on_ok,
+            on_fail=on_fail,
+            busy_widgets=[self.btn_ai, self.btn_batch_ai] if hasattr(self, "btn_batch_ai") else [self.btn_ai],
         )
-        if reply != QMessageBox.Yes:
-            return
-        if self._service().apply_pending_suggestion(sug, confirm=True):
-            self.reload()
-            self.owner.on_pending_resolved()
-        else:
-            QMessageBox.warning(self, "失败", "应用建议失败。")
+
+    def _on_batch_ai(self):
+        """批量待审 AI 分拣：后台生成清单 → 多选 → 应用选中。"""
+        from PySide6.QtWidgets import (
+            QDialog,
+            QVBoxLayout,
+            QHBoxLayout,
+            QListWidget,
+            QListWidgetItem,
+            QPushButton,
+            QLabel,
+        )
+        from gui.workers.tag_ai_worker import run_tag_ai_job
+
+        svc = self._service()
+
+        def work():
+            return svc.batch_suggest_pending_tags() or []
+
+        def on_ok(suggestions):
+            if not suggestions:
+                QMessageBox.information(self, "批量分拣", "当前没有待审词。")
+                return
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("批量待审 AI 分拣")
+            dlg.resize(560, 440)
+            layout = QVBoxLayout(dlg)
+            layout.addWidget(
+                QLabel("默认不预选。勾选后点「应用选中」才写库；未选不写。")
+            )
+            lst = QListWidget()
+            layout.addWidget(lst)
+            for sug in suggestions:
+                action = getattr(sug, "action", "") or ""
+                raw = getattr(sug, "raw_text", "") or ""
+                reason = getattr(sug, "reason", "") or ""
+                source = getattr(sug, "source", "rule") or "rule"
+                src = "模型" if source == "model" else "规则"
+                if action == "link_alias":
+                    act = f"挂别名→{getattr(sug, 'recommended_standard', '')}"
+                elif action == "approve_standard":
+                    act = f"批准→{getattr(sug, 'recommended_group_id', None) or getattr(sug, 'group_id', '')}"
+                else:
+                    act = "丢弃"
+                item = QListWidgetItem(f"[{src}] {raw}  ·  {act}  ·  {reason}")
+                item.setData(Qt.UserRole, sug)
+                item.setCheckState(Qt.Unchecked)
+                lst.addItem(item)
+
+            btn_row = QHBoxLayout()
+            btn_sel_all = QPushButton("全选")
+            btn_clear = QPushButton("清空勾选")
+            btn_apply = QPushButton("应用选中")
+            btn_apply.setObjectName("primary_button")
+            btn_close = QPushButton("关闭")
+            btn_row.addWidget(btn_sel_all)
+            btn_row.addWidget(btn_clear)
+            btn_row.addStretch()
+            btn_row.addWidget(btn_apply)
+            btn_row.addWidget(btn_close)
+            layout.addLayout(btn_row)
+
+            def sel_all():
+                for i in range(lst.count()):
+                    lst.item(i).setCheckState(Qt.Checked)
+
+            def clear_sel():
+                for i in range(lst.count()):
+                    lst.item(i).setCheckState(Qt.Unchecked)
+
+            def on_apply():
+                chosen = []
+                for i in range(lst.count()):
+                    it = lst.item(i)
+                    if it.checkState() == Qt.Checked:
+                        chosen.append(it.data(Qt.UserRole))
+                if not chosen:
+                    QMessageBox.information(dlg, "提示", "未勾选任何建议。")
+                    return
+                reply = QMessageBox.question(
+                    dlg,
+                    "确认应用",
+                    f"将应用 {len(chosen)} 条建议到标签库。是否继续？",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+                result = self._service().apply_pending_suggestions_selected(
+                    chosen, confirm=True
+                )
+                msg = result.get("message") or f"已应用 {result.get('applied', 0)} 条"
+                if result.get("failed"):
+                    QMessageBox.warning(
+                        dlg,
+                        "部分失败",
+                        f"{msg}\n请检查日志后重试失败项。",
+                    )
+                else:
+                    QMessageBox.information(dlg, "完成", msg)
+                self.reload()
+                self.owner.on_pending_resolved()
+                dlg.accept()
+
+            btn_sel_all.clicked.connect(sel_all)
+            btn_clear.clicked.connect(clear_sel)
+            btn_apply.clicked.connect(on_apply)
+            btn_close.clicked.connect(dlg.reject)
+            dlg.exec()
+
+        def on_fail(msg: str):
+            QMessageBox.warning(self, "批量 AI 失败", msg or "调用失败")
+
+        busy = [self.btn_ai]
+        if hasattr(self, "btn_batch_ai"):
+            busy.append(self.btn_batch_ai)
+        run_tag_ai_job(
+            self,
+            title="批量待审 AI",
+            label="正在批量请求 AI 建议，请稍候…\n（待审条数多时会较久，界面不应卡死）",
+            fn=work,
+            on_ok=on_ok,
+            on_fail=on_fail,
+            busy_widgets=busy,
+        )
 
 
 class TagsView(QWidget):
@@ -807,60 +965,210 @@ class TagsView(QWidget):
                 if sizes and sizes[0] < 200:
                     self.body_splitter.setSizes([300, max(sizes[1], 600)])
 
+    def open_standard_tag_ai_assist(self, tag):
+        """标准词 AI 助手：后台取建议 → 对话框确认后写库。"""
+        from PySide6.QtWidgets import (
+            QDialog,
+            QVBoxLayout,
+            QHBoxLayout,
+            QLabel,
+            QCheckBox,
+            QLineEdit,
+            QPushButton,
+            QMessageBox,
+            QComboBox,
+        )
+        from gui.workers.tag_ai_worker import run_tag_ai_job
+
+        name = tag.name if hasattr(tag, "name") else str(tag)
+        dim = tag.dimension if hasattr(tag, "dimension") else ""
+        svc = self.service
+
+        def work():
+            return svc.suggest_standard_tag_assist(name, dim)
+
+        def on_ok(sug):
+            if sug is None:
+                QMessageBox.warning(self, "失败", "未获得建议。")
+                return
+            source = getattr(sug, "source", "rule") or "rule"
+            src_label = "大模型" if source == "model" else "规则降级"
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"标准词 AI 助手 — {name}")
+            dlg.resize(480, 360)
+            layout = QVBoxLayout(dlg)
+            layout.addWidget(QLabel(f"来源：{src_label}\n{getattr(sug, 'reason', '') or ''}"))
+
+            aliases_edit = QLineEdit("、".join(getattr(sug, "suggested_aliases", None) or []))
+            aliases_edit.setPlaceholderText("建议别名，顿号分隔")
+            layout.addWidget(QLabel("建议别名："))
+            layout.addWidget(aliases_edit)
+            cb_alias = QCheckBox("采纳别名")
+            cb_alias.setChecked(bool(getattr(sug, "suggested_aliases", None)))
+            layout.addWidget(cb_alias)
+
+            layout.addWidget(QLabel("建议改组："))
+            group_combo = QComboBox()
+            group_combo.addItem("（不改组）", "")
+            for g in (self.tag_config or {}).get("tag_groups", []) or []:
+                gid = (g.get("id") or "").strip()
+                if not gid or gid.lower() == "pool":
+                    continue
+                group_combo.addItem(f"{g.get('name') or gid} ({gid})", gid)
+            rg = getattr(sug, "recommended_group_id", None) or ""
+            if rg:
+                idx = group_combo.findData(rg)
+                if idx >= 0:
+                    group_combo.setCurrentIndex(idx)
+            cb_move = QCheckBox("采纳改组")
+            cb_move.setChecked(bool(rg))
+            layout.addWidget(group_combo)
+            layout.addWidget(cb_move)
+
+            btn_row = QHBoxLayout()
+            btn_ok = QPushButton("确认应用")
+            btn_cancel = QPushButton("取消")
+            btn_row.addStretch()
+            btn_row.addWidget(btn_ok)
+            btn_row.addWidget(btn_cancel)
+            layout.addLayout(btn_row)
+
+            def on_confirm():
+                if not cb_alias.isChecked() and not cb_move.isChecked():
+                    QMessageBox.information(dlg, "提示", "请至少勾选一项。")
+                    return
+                aliases = [
+                    a.strip()
+                    for a in aliases_edit.text().replace(",", "、").split("、")
+                    if a.strip()
+                ]
+                from core.tag_ai_assist import StandardTagAssistSuggestion
+
+                final = StandardTagAssistSuggestion(
+                    tag_name=name,
+                    current_group_id=str(dim or ""),
+                    suggested_aliases=aliases,
+                    recommended_group_id=group_combo.currentData() or None,
+                    reason=getattr(sug, "reason", "") or "",
+                    source=source,
+                )
+                result = self.service.apply_standard_tag_assist(
+                    final,
+                    apply_aliases=cb_alias.isChecked(),
+                    apply_regroup=cb_move.isChecked(),
+                    confirm=True,
+                )
+                if result.get("ok"):
+                    skip = result.get("aliases_skipped") or 0
+                    extra = f"；跳过标准词别名 {skip}" if skip else ""
+                    QMessageBox.information(
+                        dlg,
+                        "完成",
+                        f"别名 +{result.get('aliases_added', 0)}；改组={'是' if result.get('moved') else '否'}{extra}",
+                    )
+                    self.load_data()
+                    dlg.accept()
+                else:
+                    QMessageBox.warning(dlg, "失败", result.get("message") or "应用失败")
+
+            btn_ok.clicked.connect(on_confirm)
+            btn_cancel.clicked.connect(dlg.reject)
+            dlg.exec()
+
+        def on_fail(msg: str):
+            QMessageBox.warning(self, "标准词 AI 失败", msg or "调用失败")
+
+        run_tag_ai_job(
+            self,
+            title="标准词 AI 助手",
+            label=f"正在为「{name}」请求 AI 建议…",
+            fn=work,
+            on_ok=on_ok,
+            on_fail=on_fail,
+        )
+
     def open_synonym_audit_dialog(self):
-        """近义巡检：建议合并 → 人工确认后写库（次要运营入口）。"""
+        """近义巡检：后台生成建议 → 人工确认后写库。"""
         from PySide6.QtWidgets import (
             QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
             QPushButton, QLabel, QMessageBox,
         )
-        dlg = QDialog(self)
-        dlg.setWindowTitle("近义巡检")
-        dlg.resize(560, 420)
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("以下为可能重复的标准词建议。未确认前不会写库。"))
-        lst = QListWidget()
-        layout.addWidget(lst)
-        suggestions = self.service.audit_synonyms() or []
-        for s in suggestions:
-            aliases = "、".join(s.merge_as_aliases or [])
-            item = QListWidgetItem(f"保留「{s.keep}」← 合并 {aliases}  ({s.reason})")
-            item.setData(Qt.UserRole, s)
-            item.setCheckState(Qt.Checked)
-            lst.addItem(item)
-        if not suggestions:
-            layout.addWidget(QLabel("未发现可合并的近义对。"))
-        btn_row = QHBoxLayout()
-        btn_apply = QPushButton("确认合并勾选项")
-        btn_close = QPushButton("关闭")
-        btn_row.addWidget(btn_apply)
-        btn_row.addStretch()
-        btn_row.addWidget(btn_close)
-        layout.addLayout(btn_row)
+        from gui.workers.tag_ai_worker import run_tag_ai_job
 
-        def on_apply():
-            chosen = []
-            for i in range(lst.count()):
-                it = lst.item(i)
-                if it.checkState() == Qt.Checked:
-                    chosen.append(it.data(Qt.UserRole))
-            if not chosen:
-                QMessageBox.information(dlg, "提示", "未勾选任何建议")
-                return
-            reply = QMessageBox.question(
-                dlg, "确认合并",
-                f"将执行 {len(chosen)} 组合并（别名挂接 + 视频标签归一）。是否继续？",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-            result = self.service.apply_synonym_merge_suggestions(chosen, confirm=True)
-            QMessageBox.information(dlg, "完成", f"已应用 {result.get('applied', 0)} 组合并")
-            self.load_data()
-            dlg.accept()
+        svc = self.service
 
-        btn_apply.clicked.connect(on_apply)
-        btn_close.clicked.connect(dlg.reject)
-        dlg.exec()
+        def work():
+            return svc.audit_synonyms() or []
+
+        def on_ok(suggestions):
+            dlg = QDialog(self)
+            dlg.setWindowTitle("近义巡检")
+            dlg.resize(560, 420)
+            layout = QVBoxLayout(dlg)
+            layout.addWidget(QLabel("以下为可能重复的标准词建议。未确认前不会写库。"))
+            lst = QListWidget()
+            layout.addWidget(lst)
+            for s in suggestions:
+                aliases = "、".join(s.merge_as_aliases or [])
+                src = "模型" if getattr(s, "source", "") == "model" else "规则"
+                item = QListWidgetItem(
+                    f"[{src}] 保留「{s.keep}」← 合并 {aliases}  ({s.reason})"
+                )
+                item.setData(Qt.UserRole, s)
+                item.setCheckState(Qt.Unchecked)
+                lst.addItem(item)
+            if not suggestions:
+                layout.addWidget(QLabel("未发现可合并的近义对。"))
+            layout.addWidget(QLabel("默认不预选。勾选后点「确认合并勾选项」才写库。"))
+            btn_row = QHBoxLayout()
+            btn_apply = QPushButton("确认合并勾选项")
+            btn_close = QPushButton("关闭")
+            btn_row.addWidget(btn_apply)
+            btn_row.addStretch()
+            btn_row.addWidget(btn_close)
+            layout.addLayout(btn_row)
+
+            def on_apply():
+                chosen = []
+                for i in range(lst.count()):
+                    it = lst.item(i)
+                    if it.checkState() == Qt.Checked:
+                        chosen.append(it.data(Qt.UserRole))
+                if not chosen:
+                    QMessageBox.information(dlg, "提示", "未勾选任何建议")
+                    return
+                reply = QMessageBox.question(
+                    dlg, "确认合并",
+                    f"将执行 {len(chosen)} 组合并（别名挂接 + 视频标签归一）。是否继续？",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+                result = self.service.apply_synonym_merge_suggestions(chosen, confirm=True)
+                msg = result.get("message") or f"已应用 {result.get('applied', 0)} 组合并"
+                if result.get("failed"):
+                    QMessageBox.warning(dlg, "部分失败", msg)
+                else:
+                    QMessageBox.information(dlg, "完成", msg)
+                self.load_data()
+                dlg.accept()
+
+            btn_apply.clicked.connect(on_apply)
+            btn_close.clicked.connect(dlg.reject)
+            dlg.exec()
+
+        def on_fail(msg: str):
+            QMessageBox.warning(self, "近义巡检失败", msg or "调用失败")
+
+        run_tag_ai_job(
+            self,
+            title="近义巡检",
+            label="正在请求 AI 近义巡检，请稍候…",
+            fn=work,
+            on_ok=on_ok,
+            on_fail=on_fail,
+        )
 
     def open_cold_start_dialog(self):
         """词表加载：直接读取 词.txt 语义（分组 + 标准词 ← 别名），无分簇加工。"""
@@ -1200,6 +1508,11 @@ class TagsView(QWidget):
             # 同义词管理
             synonym_act = menu.addAction("管理别名…")
             synonym_act.triggered.connect(lambda: self.manage_tag_synonyms(current_tag))
+
+            ai_assist_act = menu.addAction("标准词 AI 助手…")
+            ai_assist_act.triggered.connect(
+                lambda: self.open_standard_tag_ai_assist(current_tag)
+            )
 
             # 人脸识别联动：标记为人物 (V6.0)
             person_act = menu.addAction("👤 标记为'人物' (用于人脸联动)")

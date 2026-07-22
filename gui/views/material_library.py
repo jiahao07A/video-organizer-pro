@@ -9,13 +9,14 @@ from PySide6.QtCore import Qt, Signal, QEvent, QObject
 from PySide6.QtGui import QKeySequence, QShortcut
 from ..widgets.filter_panel import FilterPanel
 from ..widgets.detail_panel import DetailPanel
-from ..widgets.delegates import CardDelegate, StatusDelegate, ThumbnailDelegate
+from ..widgets.delegates import CardDelegate, MaterialTagsColumnDelegate, StatusDelegate, ThumbnailDelegate
 from ..models.video_table import (
     VideoTableModel,
     COL_FILENAME,
     COL_LIBRARY_ID,
     COL_LIST_NO,
     COL_STATUS,
+    COL_TAGS,
     COL_THUMB,
 )
 from ..models.proxy_model import AdvancedSortFilterProxyModel
@@ -121,6 +122,7 @@ class MaterialLibraryView(QWidget):
         self.table_view.setColumnWidth(COL_STATUS, 80)
         self.table_view.setItemDelegateForColumn(COL_THUMB, ThumbnailDelegate(self.table_view))
         self.table_view.setItemDelegateForColumn(COL_STATUS, StatusDelegate(self.table_view))
+        self.table_view.setItemDelegateForColumn(COL_TAGS, MaterialTagsColumnDelegate(self.table_view))
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.proxy_model.layoutChanged.connect(self._refresh_list_numbers)
         self.proxy_model.modelReset.connect(self._refresh_list_numbers)

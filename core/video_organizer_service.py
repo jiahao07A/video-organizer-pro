@@ -92,6 +92,9 @@ DEFAULT_SETTINGS = {
     # 模型供应商档案列表 + 当前 id；空列表在 load 时从旧 api 迁为「默认」
     "model_providers": [],
     "current_provider_id": "",
+    # 任务模型路由（ADR-0006）：六槽 provider_id + model；空 provider 回退当前供应商
+    "task_model_routing": {},
+    "tag_ai_prompts": {},
 
     "prompts": {
         "video_classification": "你是一个视频分类专家，请根据视频帧内容将其归入最合适的分类。返回 JSON 格式，包含 category 字段。",
@@ -998,6 +1001,7 @@ class AIHandler:
             max_retries=0,
             timeout=45.0
         )
+        self._clients_by_provider: Dict[str, Any] = {}
         
         # 模型路由 - 动态获取，不再缓存到成员变量
         self.tag_lib_lock = threading.Lock()
@@ -1008,7 +1012,7 @@ class AIHandler:
         self.init_tag_libraries()
 
     def reload_client(self):
-        """设置变更后重建 OpenAI 客户端（API Key / Base URL）。"""
+        """设置变更后重建默认 OpenAI 客户端（当前供应商写穿字段）。"""
         api_key = SettingsManager.get_setting(self.settings, "api.key", "")
         base_url = SettingsManager.get_setting(self.settings, "api.base_url", "")
         self.client = OpenAI(
@@ -1017,7 +1021,34 @@ class AIHandler:
             max_retries=0,
             timeout=45.0,
         )
+        # 按供应商缓存的客户端在配置变更后失效
+        self._clients_by_provider = {}
         logger.info("AI 客户端已按最新配置重建")
+
+    def resolve_task_route(self, task_key: str) -> Dict:
+        """任务模型路由解析（ADR-0006）。"""
+        from core.model_providers import resolve_task_route
+
+        return resolve_task_route(self.settings, task_key)
+
+    def client_for_task(self, task_key: str):
+        """按任务路由返回 OpenAI 客户端（同 provider 复用缓存）。"""
+        route = self.resolve_task_route(task_key)
+        pid = str(route.get("provider_id") or "") or "_default"
+        cache = getattr(self, "_clients_by_provider", None)
+        if cache is None:
+            self._clients_by_provider = {}
+            cache = self._clients_by_provider
+        client = cache.get(pid)
+        if client is None:
+            client = OpenAI(
+                api_key=(route.get("api_key") or "EMPTY"),
+                base_url=(route.get("base_url") or None),
+                max_retries=0,
+                timeout=45.0,
+            )
+            cache[pid] = client
+        return client, route
 
     def init_tag_libraries(self):
         """同步设置或 tag_config.json 中的标签到数据库"""
@@ -1053,9 +1084,19 @@ class AIHandler:
                 for tag in tags:
                     self.db.add_tag(dim, tag, is_learned=0)
 
-    def _get_api_response(self, model: str, system_prompt: str, content_parts: List[Any], json_mode: bool = True) -> Optional[Dict]:
+    def _get_api_response(
+        self,
+        model: str,
+        system_prompt: str,
+        content_parts: List[Any],
+        json_mode: bool = True,
+        *,
+        task_key: Optional[str] = None,
+        client=None,
+    ) -> Optional[Dict]:
         """调用 AI；对瞬时错误做调用层重试（ADR-0005）。
 
+        task_key 非空时按任务模型路由选客户端与（若 model 未覆盖）模型名。
         失败时写入 self._last_api_failure: ApiCallFailure，供单条层决定是否 B 重试。
         """
         from core.analysis_job_policy import (
@@ -1065,6 +1106,14 @@ class AIHandler:
             should_retry_call,
             sleep_backoff,
         )
+
+        use_client = client
+        use_model = model
+        if task_key:
+            use_client, route = self.client_for_task(task_key)
+            use_model = (route.get("model") or model or "gemini-2.0-flash")
+        if use_client is None:
+            use_client = self.client
 
         cfg = getattr(self, "_job_retry_config", None) or RetryConfig.from_settings(self.settings)
         sleeper = getattr(self, "_retry_sleeper", None)
@@ -1087,10 +1136,10 @@ class AIHandler:
                     self._tls.last_api_failure = fail
                 return None
             attempt += 1
-            logger.info(f"正在调用 AI 模型: {model} (JSON 模式: {json_mode}, 尝试 {attempt})")
+            logger.info(f"正在调用 AI 模型: {use_model} (JSON 模式: {json_mode}, 尝试 {attempt})")
             try:
                 kwargs = {
-                    "model": model,
+                    "model": use_model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": content_parts}
@@ -1100,7 +1149,7 @@ class AIHandler:
                 if json_mode:
                     kwargs["response_format"] = {"type": "json_object"}
 
-                response = self.client.chat.completions.create(**kwargs)
+                response = use_client.chat.completions.create(**kwargs)
                 res_content = response.choices[0].message.content
 
                 if res_content is None or (isinstance(res_content, str) and not res_content.strip()):
@@ -1382,11 +1431,14 @@ class AIHandler:
                 "image_url": {"url": f"data:image/jpeg;base64,{b64_img}", "detail": "low"}
             })
 
-        # 获取模型
-        model_name = SettingsManager.get_setting(self.settings, "api.model_personalization.video_classification", "gemini-2.0-flash")
-        
+        # 任务模型路由：视频分类槽
+        route = self.resolve_task_route("video_classification")
+        model_name = route.get("model") or "gemini-2.0-flash"
+
         # 执行分析
-        data = self._get_api_response(model_name, system_prompt, content_parts)
+        data = self._get_api_response(
+            model_name, system_prompt, content_parts, task_key="video_classification"
+        )
         
         if data:
             # 归一不在此处写待审：由 _process_single_video 最终路径统一 persist，避免 B 重试重复
@@ -1422,9 +1474,15 @@ class AIHandler:
   ]
 }}
 """
-        model_name = SettingsManager.get_setting(self.settings, "api.model_personalization.tag_generation", "gemini-2.0-flash")
-        data = self._get_api_response(model_name, system_prompt, [{"type": "text", "text": user_prompt}])
-        
+        route = self.resolve_task_route("tag_generation")
+        model_name = route.get("model") or "gemini-2.0-flash"
+        data = self._get_api_response(
+            model_name,
+            system_prompt,
+            [{"type": "text", "text": user_prompt}],
+            task_key="tag_generation",
+        )
+
         if data and "recommendations" in data:
             return data["recommendations"]
         return []
@@ -1456,11 +1514,8 @@ class AIHandler:
         if not uniq:
             return [], notes
 
-        model_name = SettingsManager.get_setting(
-            self.settings,
-            "api.model_personalization.tag_generation",
-            "gemini-2.0-flash",
-        )
+        route = self.resolve_task_route("tag_generation")
+        model_name = route.get("model") or "gemini-2.0-flash"
         system_prompt = cold_start_ai_system_prompt()
         all_clusters: List[ColdStartCluster] = []
         used: Set[str] = set()
@@ -1474,6 +1529,7 @@ class AIHandler:
                 model_name,
                 system_prompt,
                 [{"type": "text", "text": user_prompt}],
+                task_key="tag_generation",
             )
             # 必须有非空 clusters 列表才算 AI 成功
             ai_clusters = (
@@ -2144,26 +2200,125 @@ class VideoOrganizerService:
         self._work_scope_exclusions = set()
         self.persist_work_scope_if_enabled()
 
+    def _list_standard_tag_names(self) -> List[str]:
+        standards: List[str] = []
+        for g in (self.tag_config or {}).get("tag_groups") or []:
+            for t in g.get("tags") or []:
+                n = t.get("name") if isinstance(t, dict) else t
+                if n:
+                    standards.append(str(n).strip())
+        return standards
+
+    def _tag_group_ids(self) -> List[str]:
+        out: List[str] = []
+        for g in (self.tag_config or {}).get("tag_groups") or []:
+            gid = str(g.get("id") or "").strip()
+            if gid and gid.lower() != "pool":
+                out.append(gid)
+        return out
+
+    def get_tag_ai_prompt(self, key: str) -> str:
+        from core.tag_ai_assist import DEFAULT_TAG_AI_PROMPTS
+
+        store = (self.settings or {}).get("tag_ai_prompts")
+        if isinstance(store, dict) and str(store.get(key) or "").strip():
+            return str(store.get(key)).strip()
+        return DEFAULT_TAG_AI_PROMPTS.get(key, "")
+
+    def set_tag_ai_prompt(self, key: str, text: str) -> None:
+        if "tag_ai_prompts" not in self.settings or not isinstance(
+            self.settings.get("tag_ai_prompts"), dict
+        ):
+            self.settings["tag_ai_prompts"] = {}
+        self.settings["tag_ai_prompts"][key] = (text or "").strip()
+
+    def set_group_local_prompt(self, group_id: str, local_prompt: str) -> None:
+        gid = str(group_id or "").strip()
+        for g in (self.tag_config or {}).get("tag_groups") or []:
+            if str(g.get("id") or "").strip() == gid:
+                rules = g.setdefault("rules", {})
+                if not isinstance(rules, dict):
+                    rules = {}
+                    g["rules"] = rules
+                rules["local_prompt"] = local_prompt or ""
+                self.save_tag_config(self.tag_config)
+                return
+
+    def get_group_local_prompts(self) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        for g in (self.tag_config or {}).get("tag_groups") or []:
+            gid = str(g.get("id") or "").strip()
+            if not gid or gid.lower() == "pool":
+                continue
+            rules = g.get("rules") if isinstance(g.get("rules"), dict) else {}
+            rows.append(
+                {
+                    "id": gid,
+                    "name": str(g.get("name") or gid),
+                    "local_prompt": str(rules.get("local_prompt") or ""),
+                }
+            )
+        return rows
+
+    def _call_tag_ai_json(self, task_key: str, system_prompt: str, user_prompt: str):
+        """标签库 AI：经任务路由调模型；失败返回 None。"""
+        if not hasattr(self, "ai") or self.ai is None:
+            return None
+        try:
+            return self.ai._get_api_response(
+                "",
+                system_prompt,
+                [{"type": "text", "text": user_prompt}],
+                task_key=task_key,
+            )
+        except Exception as e:
+            logger.warning(f"标签库 AI 调用失败 ({task_key}): {e}")
+            return None
+
     def suggest_pending_tag(
         self,
         pending_row: Dict,
         *,
         suggest_fn=None,
+        use_model: bool = True,
     ):
-        """待审词 AI/规则建议（不写库）。"""
-        from core.tag_ai_assist import rule_pending_suggestion
+        """待审词 AI/规则建议（不写库）。默认先模型，失败降级规则。"""
+        from core.tag_ai_assist import (
+            parse_pending_ai_response,
+            pending_ai_user_prompt,
+            rule_pending_suggestion,
+        )
 
-        standards: List[str] = []
-        for g in (self.tag_config or {}).get("tag_groups") or []:
-            for t in g.get("tags") or []:
-                if isinstance(t, dict):
-                    n = t.get("name")
-                else:
-                    n = t
-                if n:
-                    standards.append(str(n).strip())
-        fn = suggest_fn or rule_pending_suggestion
-        return fn(pending_row, standards)
+        standards = self._list_standard_tag_names()
+        if suggest_fn is not None:
+            return suggest_fn(pending_row, standards)
+
+        if use_model:
+            system = self.get_tag_ai_prompt("pending_tag_ai")
+            user = pending_ai_user_prompt(pending_row, standards)
+            data = self._call_tag_ai_json("pending_tag_ai", system, user)
+            parsed = parse_pending_ai_response(data, pending_row, standards)
+            if parsed is not None:
+                return parsed
+
+        return rule_pending_suggestion(pending_row, standards)
+
+    def batch_suggest_pending_tags(
+        self,
+        pending_rows: Optional[List[Dict]] = None,
+        *,
+        use_model: bool = True,
+    ) -> List:
+        """批量待审建议（不写库）。"""
+        if pending_rows is None:
+            if self.db and hasattr(self.db, "list_pending_tags"):
+                pending_rows = self.db.list_pending_tags(status="pending") or []
+            else:
+                pending_rows = []
+        return [
+            self.suggest_pending_tag(row, use_model=use_model)
+            for row in (pending_rows or [])
+        ]
 
     def apply_pending_suggestion(self, suggestion, *, confirm: bool = True) -> bool:
         """确认后应用待审建议；confirm=False 时拒绝写库（测试用）。"""
@@ -2189,18 +2344,198 @@ class VideoOrganizerService:
             return self.resolve_pending_tag(pid, "approve_standard", group_id=gid)
         return False
 
-    def audit_synonyms(self, *, audit_fn=None):
-        """近义巡检：返回合并建议列表（不写库）。"""
-        from core.tag_ai_assist import rule_synonym_audit
+    def apply_pending_suggestions_selected(
+        self, suggestions, *, confirm: bool = True
+    ) -> Dict[str, Any]:
+        """批量应用选中的待审建议。"""
+        if not confirm:
+            return {
+                "ok": False,
+                "applied": 0,
+                "failed": 0,
+                "total": 0,
+                "message": "未确认，未写库",
+            }
+        items = list(suggestions or [])
+        applied = 0
+        failed = 0
+        for sug in items:
+            if self.apply_pending_suggestion(sug, confirm=True):
+                applied += 1
+            else:
+                failed += 1
+        return {
+            "ok": failed == 0,
+            "applied": applied,
+            "failed": failed,
+            "total": len(items),
+            "message": (
+                f"成功 {applied}，失败 {failed}"
+                if failed
+                else f"已应用 {applied} 条"
+            ),
+        }
 
-        standards: List[str] = []
-        for g in (self.tag_config or {}).get("tag_groups") or []:
-            for t in g.get("tags") or []:
+    def audit_synonyms(self, *, audit_fn=None, use_model: bool = True):
+        """近义巡检：默认模型，失败规则降级（不写库）。"""
+        from core.tag_ai_assist import (
+            parse_synonym_ai_response,
+            rule_synonym_audit,
+            synonym_ai_user_prompt,
+        )
+
+        standards = self._list_standard_tag_names()
+        if audit_fn is not None:
+            return audit_fn(standards)
+
+        if use_model:
+            system = self.get_tag_ai_prompt("synonym_audit")
+            user = synonym_ai_user_prompt(standards)
+            data = self._call_tag_ai_json("synonym_audit", system, user)
+            parsed = parse_synonym_ai_response(data, standards)
+            if parsed:
+                return parsed
+
+        return rule_synonym_audit(standards)
+
+    def suggest_standard_tag_assist(
+        self,
+        tag_name: str,
+        current_group_id: str = "",
+        *,
+        assist_fn=None,
+        use_model: bool = True,
+    ):
+        """标准词 AI 助手：别名 + 改组建议（不写库）。"""
+        from core.tag_ai_assist import (
+            parse_standard_tag_ai_response,
+            rule_standard_tag_assist,
+            standard_tag_ai_user_prompt,
+        )
+
+        name = str(tag_name or "").strip()
+        gid = str(current_group_id or "").strip()
+        if not gid:
+            for g in (self.tag_config or {}).get("tag_groups") or []:
+                for t in g.get("tags") or []:
+                    n = t.get("name") if isinstance(t, dict) else t
+                    if str(n).strip() == name:
+                        gid = str(g.get("id") or "custom")
+                        break
+        if not gid:
+            gid = "custom"
+
+        existing_aliases: List[str] = []
+        if self.db and hasattr(self.db, "get_synonyms"):
+            for alias, std in (self.db.get_synonyms() or {}).items():
+                if str(std).strip() == name:
+                    existing_aliases.append(str(alias).strip())
+
+        standards = self._list_standard_tag_names()
+        if assist_fn is not None:
+            return assist_fn(name, gid, standards, existing_aliases)
+
+        if use_model:
+            system = self.get_tag_ai_prompt("standard_tag_ai")
+            user = standard_tag_ai_user_prompt(name, gid, existing_aliases)
+            data = self._call_tag_ai_json("standard_tag_ai", system, user)
+            parsed = parse_standard_tag_ai_response(
+                data, name, gid, standard_tags=standards
+            )
+            if parsed is not None:
+                return parsed
+
+        return rule_standard_tag_assist(name, gid, standards, existing_aliases)
+
+    def apply_standard_tag_assist(
+        self,
+        suggestion,
+        *,
+        apply_aliases: bool = True,
+        apply_regroup: bool = True,
+        confirm: bool = True,
+    ) -> Dict[str, Any]:
+        """确认后应用标准词助手：挂别名 / 标签移动。"""
+        if not confirm or suggestion is None:
+            return {"ok": False, "message": "未确认，未写库"}
+
+        def _get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        name = str(_get(suggestion, "tag_name") or "").strip()
+        if not name:
+            return {"ok": False, "message": "无标准词名"}
+
+        standards = set(self._list_standard_tag_names())
+        aliases_added = 0
+        aliases_skipped = 0
+        if apply_aliases:
+            for a in _get(suggestion, "suggested_aliases") or []:
+                al = str(a).strip()
+                if not al or al == name:
+                    continue
+                # 其它标准词不得挂为别名（避免双身份；合并走近义巡检）
+                if al in standards:
+                    aliases_skipped += 1
+                    logger.warning(f"跳过标准词当别名: {al}（请走近义巡检合并）")
+                    continue
+                try:
+                    self.db.add_synonym(name, al)
+                    aliases_added += 1
+                except Exception as e:
+                    logger.warning(f"挂别名失败 {al}->{name}: {e}")
+
+        moved = False
+        rg = _get(suggestion, "recommended_group_id")
+        if apply_regroup and rg and str(rg).strip() != str(_get(suggestion, "current_group_id") or ""):
+            try:
+                if hasattr(self, "move_tag_to_group"):
+                    moved = bool(self.move_tag_to_group(name, str(rg).strip()))
+                else:
+                    moved = self._move_standard_tag_group(name, str(rg).strip())
+            except Exception as e:
+                logger.warning(f"标签移动失败 {name}: {e}")
+
+        return {
+            "ok": True,
+            "aliases_added": aliases_added,
+            "aliases_skipped": aliases_skipped,
+            "moved": moved,
+        }
+
+    def _move_standard_tag_group(self, tag_name: str, target_group_id: str) -> bool:
+        name = str(tag_name or "").strip()
+        tid = str(target_group_id or "").strip()
+        if not name or not tid:
+            return False
+        cfg = self.tag_config or {}
+        groups = cfg.get("tag_groups") or []
+        found = None
+        for g in groups:
+            tags = g.get("tags") or []
+            new_tags = []
+            for t in tags:
                 n = t.get("name") if isinstance(t, dict) else t
-                if n:
-                    standards.append(str(n).strip())
-        fn = audit_fn or rule_synonym_audit
-        return fn(standards)
+                if str(n).strip() == name:
+                    found = t if isinstance(t, dict) else {"name": name}
+                else:
+                    new_tags.append(t)
+            g["tags"] = new_tags
+        if found is None:
+            return False
+        for g in groups:
+            if str(g.get("id") or "").strip() == tid:
+                g.setdefault("tags", []).append(found)
+                self.save_tag_config(cfg)
+                try:
+                    if self.db:
+                        self.db.reassign_tags_dimension([name], tid)
+                except Exception as e:
+                    logger.warning(f"DB 维度改派失败 {name}->{tid}: {e}")
+                return True
+        return False
 
     def apply_synonym_merge_suggestions(
         self, suggestions, *, confirm: bool = True
@@ -2211,9 +2546,10 @@ class VideoOrganizerService:
         from core.tag_ai_assist import apply_synonym_merges_plan
 
         if not confirm:
-            return {"ok": False, "applied": 0, "message": "未确认，未写库"}
+            return {"ok": False, "applied": 0, "failed": 0, "message": "未确认，未写库"}
         plan = apply_synonym_merges_plan(suggestions or [])
         applied = 0
+        failed = 0
         for alias, standard in plan.items():
             try:
                 self.db.add_synonym(standard, alias)
@@ -2230,10 +2566,25 @@ class VideoOrganizerService:
                         new_tags.append(t)
                     group["tags"] = new_tags
                 self.save_tag_config(cfg)
-                applied += 1
+                # 从 tags_library 表删除被合并标准词，避免「既是标准词又是别名」
+                try:
+                    if hasattr(self.db, "delete_tag_by_name"):
+                        self.db.delete_tag_by_name(alias)
+                    applied += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"删除被合并标准词 {alias} 失败: {e}")
             except Exception as e:
+                failed += 1
                 logger.warning(f"合并 {alias}->{standard} 失败: {e}")
-        return {"ok": True, "applied": applied, "plan": plan}
+        return {
+            "ok": failed == 0,
+            "applied": applied,
+            "failed": failed,
+            "total": len(plan),
+            "plan": plan,
+            "message": f"成功 {applied}，失败 {failed}" if failed else f"已应用 {applied}",
+        }
 
     # --- 备份与恢复 (V6.0) ---
     def backup_configuration(self) -> str:
@@ -3388,11 +3739,19 @@ class VideoOrganizerService:
                     return None, "用户取消"
 
                 emit_phase(AnalysisPhase.AI, attempt_b)
-                model_name = SettingsManager.get_setting(
-                    self.settings,
-                    "api.model_personalization.video_classification",
-                    "gemini-2.0-flash",
-                )
+                try:
+                    from core.model_providers import (
+                        DEFAULT_MODEL,
+                        resolve_task_route as _resolve_task_route,
+                    )
+
+                    model_name = _resolve_task_route(
+                        self.settings, "video_classification"
+                    ).get("model") or DEFAULT_MODEL
+                except Exception:
+                    from core.model_providers import DEFAULT_MODEL
+
+                    model_name = DEFAULT_MODEL
                 cache_key = f"{file_hash}_{model_name}"
                 ai_data = self.ai.analyze_video(
                     frames, cache_key=cache_key, use_cache=not force_reanalyze

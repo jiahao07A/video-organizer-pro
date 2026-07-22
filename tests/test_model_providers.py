@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""模型供应商档案：迁移、上限、删当前切换、resolve 写穿（S3）。"""
+"""模型供应商档案：迁移、上限、删当前切换、任务模型路由（S3 / ADR-0006）。"""
 import pytest
 
 from core.model_providers import (
@@ -16,6 +16,10 @@ from core.model_providers import (
     set_current_provider,
     update_provider,
     list_providers,
+    resolve_task_route,
+    set_task_route,
+    get_task_model_routing,
+    TASK_ROUTE_KEYS,
 )
 from core.video_organizer_service import SettingsManager
 
@@ -25,6 +29,7 @@ def _legacy_settings(**api_overrides):
     # 模拟旧版：无档案
     s["model_providers"] = []
     s["current_provider_id"] = ""
+    s["task_model_routing"] = {}
     s["api"]["key"] = api_overrides.get("key", "sk-legacy")
     s["api"]["base_url"] = api_overrides.get("base_url", "https://legacy.example/v1")
     s["api"]["model_personalization"] = {
@@ -68,6 +73,71 @@ def test_ensure_providers_writes_flat_api():
     assert s["api"]["model_personalization"]["tag_generation"] == "tag-x"
     cur = resolve_current_provider(s)
     assert cur["api_key"] == "sk-flat"
+
+
+def test_ensure_migrates_task_routes_from_provider_models():
+    s = _legacy_settings(cls="mig-cls", tag="mig-tag", desc="mig-desc")
+    ensure_providers(s)
+    routing = get_task_model_routing(s)
+    assert set(routing.keys()) == set(TASK_ROUTE_KEYS)
+    cur_id = s["current_provider_id"]
+    assert routing["video_classification"]["model"] == "mig-cls"
+    assert routing["tag_generation"]["model"] == "mig-tag"
+    assert routing["content_description"]["model"] == "mig-desc"
+    assert routing["video_classification"]["provider_id"] == cur_id
+    # 标签库槽默认可空 provider → resolve 回退当前
+    r = resolve_task_route(s, "pending_tag_ai")
+    assert r["provider_id"] == cur_id
+    assert r["api_key"] == "sk-legacy"
+
+
+def test_resolve_task_route_cross_provider():
+    s = _legacy_settings()
+    ensure_providers(s)
+    _, p2 = add_provider(
+        s,
+        display_name="B",
+        api_key="sk-b",
+        base_url="https://b.example/v1",
+        models={
+            "video_classification": "b-cls",
+            "tag_generation": "b-tag",
+            "content_description": "b-desc",
+        },
+    )
+    set_task_route(s, "pending_tag_ai", provider_id=p2["id"], model="cheap-model")
+    r = resolve_task_route(s, "pending_tag_ai")
+    assert r["provider_id"] == p2["id"]
+    assert r["api_key"] == "sk-b"
+    assert r["base_url"] == "https://b.example/v1"
+    assert r["model"] == "cheap-model"
+    # 分析仍走默认迁移的当前供应商
+    r_cls = resolve_task_route(s, "video_classification")
+    assert r_cls["api_key"] == "sk-legacy"
+    assert r_cls["model"] == "model-cls"
+
+
+def test_resolve_empty_provider_falls_back_to_current():
+    s = _legacy_settings()
+    ensure_providers(s)
+    set_task_route(s, "synonym_audit", provider_id="", model="syn-model")
+    r = resolve_task_route(s, "synonym_audit")
+    assert r["provider_id"] == s["current_provider_id"]
+    assert r["api_key"] == "sk-legacy"
+    assert r["model"] == "syn-model"
+
+
+def test_deleted_provider_slot_clears_and_falls_back():
+    s = _legacy_settings()
+    ensure_providers(s)
+    _, p2 = add_provider(s, display_name="Temp", api_key="sk-temp")
+    set_task_route(s, "standard_tag_ai", provider_id=p2["id"], model="x")
+    remove_provider(s, p2["id"])
+    ensure_providers(s)
+    slot = get_task_model_routing(s)["standard_tag_ai"]
+    assert slot["provider_id"] == ""
+    r = resolve_task_route(s, "standard_tag_ai")
+    assert r["api_key"] == "sk-legacy"
 
 
 def test_add_provider_limit_five():
@@ -171,6 +241,8 @@ def test_load_settings_migrates_legacy(tmp_path, monkeypatch):
     assert providers[0]["display_name"] == DEFAULT_DISPLAY_NAME
     assert providers[0]["api_key"] == "sk-from-file"
     assert loaded["current_provider_id"] == providers[0]["id"]
+    r = resolve_task_route(loaded, "video_classification")
+    assert r["model"] == "f-cls"
 
 
 def test_reload_ai_uses_current_provider_key(tmp_path):
@@ -200,3 +272,8 @@ def test_reload_ai_uses_current_provider_key(tmp_path):
     assert p2["api_key"] == "sk-alt"
     svc.reload_ai_from_settings()
     assert getattr(svc.ai.client, "api_key", None) == "sk-alt"
+    # 路由到 Alt 后 client_for_task 使用 sk-alt
+    set_task_route(svc.settings, "pending_tag_ai", provider_id=p2["id"], model="m1")
+    client, route = svc.ai.client_for_task("pending_tag_ai")
+    assert route["api_key"] == "sk-alt"
+    assert getattr(client, "api_key", None) == "sk-alt"

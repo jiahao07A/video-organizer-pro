@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QEvent, QObject
 from PySide6.QtGui import QKeySequence, QShortcut
 from ..widgets.filter_panel import FilterPanel
 from ..widgets.detail_panel import DetailPanel
-from ..widgets.delegates import CardDelegate, StatusDelegate, ThumbnailDelegate
+from ..widgets.delegates import CardDelegate, MaterialTagsColumnDelegate, StatusDelegate, ThumbnailDelegate
 from ..models.video_table import (
     VideoTableModel,
     COL_FILENAME,
@@ -178,8 +178,10 @@ class WorkstationView(QWidget):
 
         self.thumb_delegate = ThumbnailDelegate()
         self.status_delegate = StatusDelegate()
+        self.tags_delegate = MaterialTagsColumnDelegate()
         self.table_view.setItemDelegateForColumn(COL_THUMB, self.thumb_delegate)
         self.table_view.setItemDelegateForColumn(COL_STATUS, self.status_delegate)
+        self.table_view.setItemDelegateForColumn(COL_TAGS, self.tags_delegate)
 
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)

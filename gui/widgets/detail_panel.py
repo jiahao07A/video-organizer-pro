@@ -363,11 +363,13 @@ class DetailPanel(QWidget):
                     if isinstance(t_def, dict) and t_def.get("icon"):
                         lib_icons[t_name] = t_def.get("icon")
         
+        groups = {}
         for t in tags:
             cat_id = tag_to_cat.get(t, "custom")
             colors[t] = cat_color_map.get(cat_id, "#757575")
             icons[t] = lib_icons.get(t)
-        
+            groups[t] = cat_id
+
         # 拼写检查：经 service 门面委托 TagProcessor，失败不阻断详情加载
         misspelled_suggestions = {}
         if hasattr(self.service, "check_spelling"):
@@ -377,10 +379,25 @@ class DetailPanel(QWidget):
                 misspelled_suggestions = self.service.tag_processor.check_spelling(tags) or {}
             except Exception:
                 misspelled_suggestions = {}
-        
-        self.tags_widget.set_tags(tags, colors=colors,
-                                 misspelled_tags=list(misspelled_suggestions.keys()),
-                                 icons=icons)
+
+        try:
+            theme = "dark"
+            if hasattr(self.service, "settings"):
+                theme = (
+                    self.service.settings.get("ui_preferences", {}) or {}
+                ).get("theme", "dark") or "dark"
+            if hasattr(self.tags_widget, "set_theme"):
+                self.tags_widget.set_theme("light" if theme == "light" else "dark")
+        except Exception:
+            pass
+
+        self.tags_widget.set_tags(
+            tags,
+            colors=colors,
+            misspelled_tags=list(misspelled_suggestions.keys()),
+            icons=icons,
+            groups=groups,
+        )
         
         # 如果有拼写错误，在标签栏显示一个小提示
         if misspelled_suggestions:

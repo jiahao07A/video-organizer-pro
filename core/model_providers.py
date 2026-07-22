@@ -17,6 +17,25 @@ MODEL_KEYS = (
     "content_description",
 )
 
+# 任务模型路由六槽（ADR-0006）；冷启动不占槽
+TASK_ROUTE_KEYS = (
+    "video_classification",
+    "tag_generation",
+    "content_description",
+    "pending_tag_ai",
+    "synonym_audit",
+    "standard_tag_ai",
+)
+
+TASK_ROUTE_LABELS = {
+    "video_classification": "视频分类",
+    "tag_generation": "标签生成",
+    "content_description": "内容描述",
+    "pending_tag_ai": "待审词 AI",
+    "synonym_audit": "近义巡检",
+    "standard_tag_ai": "标准词 AI 助手",
+}
+
 
 class ProviderLimitError(ValueError):
     """已达供应商档案上限（最多五个）。"""
@@ -125,8 +144,163 @@ def migrate_legacy_api_to_providers(settings: Dict) -> Dict:
     return settings
 
 
+def empty_route_slot() -> Dict[str, str]:
+    return {"provider_id": "", "model": ""}
+
+
+def _normalize_route_slot(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return empty_route_slot()
+    return {
+        "provider_id": str(raw.get("provider_id") or "").strip(),
+        "model": str(raw.get("model") or "").strip(),
+    }
+
+
+def get_task_model_routing(settings: Dict) -> Dict[str, Dict[str, str]]:
+    raw = settings.get("task_model_routing")
+    if not isinstance(raw, dict):
+        return {k: empty_route_slot() for k in TASK_ROUTE_KEYS}
+    out: Dict[str, Dict[str, str]] = {}
+    for key in TASK_ROUTE_KEYS:
+        out[key] = _normalize_route_slot(raw.get(key))
+    return out
+
+
+def set_task_route(
+    settings: Dict,
+    task_key: str,
+    *,
+    provider_id: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Dict:
+    """更新单个路由槽（内存）。"""
+    if task_key not in TASK_ROUTE_KEYS:
+        raise ProviderError(f"未知任务路由槽: {task_key}")
+    ensure_providers(settings)
+    routing = get_task_model_routing(settings)
+    slot = dict(routing.get(task_key) or empty_route_slot())
+    if provider_id is not None:
+        slot["provider_id"] = str(provider_id or "").strip()
+    if model is not None:
+        slot["model"] = str(model or "").strip()
+    routing[task_key] = slot
+    settings["task_model_routing"] = routing
+    return settings
+
+
+def replace_task_model_routing(
+    settings: Dict,
+    routing: Dict[str, Any],
+) -> Dict:
+    """整表替换路由（设置 UI 保存用）。"""
+    ensure_providers(settings)
+    cleaned: Dict[str, Dict[str, str]] = {}
+    src = routing if isinstance(routing, dict) else {}
+    for key in TASK_ROUTE_KEYS:
+        cleaned[key] = _normalize_route_slot(src.get(key))
+    settings["task_model_routing"] = cleaned
+    return settings
+
+
+def migrate_task_model_routing(settings: Dict) -> Dict:
+    """
+    无路由表或槽不全时：分析三槽从当前供应商 models 填入；
+    标签库三槽空 provider_id（回退当前供应商）。
+    """
+    providers = list_providers(settings)
+    if not providers:
+        return settings
+
+    current_id = str(settings.get("current_provider_id") or "").strip()
+    ids = {p["id"] for p in providers}
+    if not current_id or current_id not in ids:
+        current_id = providers[0]["id"]
+
+    current = next((p for p in providers if p["id"] == current_id), providers[0])
+    models = _normalize_models(current.get("models"))
+
+    existing = settings.get("task_model_routing")
+    routing: Dict[str, Dict[str, str]] = {}
+    if isinstance(existing, dict):
+        for key in TASK_ROUTE_KEYS:
+            if key in existing:
+                routing[key] = _normalize_route_slot(existing.get(key))
+
+    # 首次或缺失分析槽：写入当前供应商 + 档案内模型名
+    for key in MODEL_KEYS:
+        if key not in routing:
+            routing[key] = {
+                "provider_id": current_id,
+                "model": models.get(key) or DEFAULT_MODEL,
+            }
+        else:
+            # 有槽但 model 空：用档案默认
+            if not routing[key].get("model"):
+                routing[key]["model"] = models.get(key) or DEFAULT_MODEL
+
+    for key in TASK_ROUTE_KEYS:
+        if key not in routing:
+            routing[key] = empty_route_slot()
+
+    settings["task_model_routing"] = routing
+    return settings
+
+
+def resolve_task_route(settings: Dict, task_key: str) -> Dict[str, Any]:
+    """
+    解析任务 → 供应商连接 + 模型名。
+
+    返回: task_key, provider_id, display_name, api_key, base_url, model
+    provider_id 空或无效 → 当前供应商；model 空 → 档案 models 或 DEFAULT_MODEL。
+    """
+    ensure_providers(settings)
+    if task_key not in TASK_ROUTE_KEYS:
+        # 未知槽：按当前供应商 + 默认模型
+        cur = resolve_current_provider(settings)
+        return {
+            "task_key": task_key,
+            "provider_id": cur["id"],
+            "display_name": cur.get("display_name") or "",
+            "api_key": cur.get("api_key") or "",
+            "base_url": cur.get("base_url") or "",
+            "model": DEFAULT_MODEL,
+        }
+
+    routing = get_task_model_routing(settings)
+    slot = routing.get(task_key) or empty_route_slot()
+    providers = list_providers(settings)
+    by_id = {p["id"]: p for p in providers}
+    current_id = str(settings.get("current_provider_id") or "").strip()
+    if current_id not in by_id and providers:
+        current_id = providers[0]["id"]
+
+    pid = str(slot.get("provider_id") or "").strip()
+    if not pid or pid not in by_id:
+        pid = current_id
+    provider = by_id.get(pid) or resolve_current_provider(settings)
+
+    model = str(slot.get("model") or "").strip()
+    if not model:
+        p_models = _normalize_models(provider.get("models"))
+        if task_key in MODEL_KEYS:
+            model = p_models.get(task_key) or DEFAULT_MODEL
+        else:
+            # 标签库 AI：优先档案 tag_generation，再默认
+            model = p_models.get("tag_generation") or DEFAULT_MODEL
+
+    return {
+        "task_key": task_key,
+        "provider_id": provider.get("id") or pid,
+        "display_name": provider.get("display_name") or "",
+        "api_key": provider.get("api_key") or "",
+        "base_url": provider.get("base_url") or "",
+        "model": model,
+    }
+
+
 def ensure_providers(settings: Dict) -> Dict:
-    """保证至少一条档案、当前 id 有效，并写穿扁平 api 字段。"""
+    """保证至少一条档案、当前 id 有效，任务路由齐全，并写穿扁平 api 字段。"""
     if not isinstance(settings, dict):
         raise TypeError("settings must be a dict")
 
@@ -146,6 +320,19 @@ def ensure_providers(settings: Dict) -> Dict:
     ids = {p["id"] for p in providers}
     if not current_id or current_id not in ids:
         settings["current_provider_id"] = providers[0]["id"]
+
+    migrate_task_model_routing(settings)
+    # 删供应商后：指向失效 id 的槽清空 provider_id（回退当前）
+    routing = get_task_model_routing(settings)
+    changed = False
+    for key, slot in routing.items():
+        pid = str(slot.get("provider_id") or "").strip()
+        if pid and pid not in ids:
+            slot["provider_id"] = ""
+            routing[key] = slot
+            changed = True
+    if changed:
+        settings["task_model_routing"] = routing
 
     apply_provider_to_api_flat(settings)
     return settings

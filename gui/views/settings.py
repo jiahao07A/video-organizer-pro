@@ -18,6 +18,11 @@ from core.model_providers import (
     set_current_provider,
     update_provider,
     resolve_current_provider,
+    TASK_ROUTE_KEYS,
+    TASK_ROUTE_LABELS,
+    get_task_model_routing,
+    replace_task_model_routing,
+    resolve_task_route,
 )
 
 class SettingsView(QWidget):
@@ -183,7 +188,9 @@ class SettingsView(QWidget):
         list_layout = QVBoxLayout(list_group)
 
         hint = QLabel(
-            "任意时刻只有一个「当前供应商」。分析与标签库 AI 均使用当前档案的 Key / URL / 模型名。"
+            "供应商档案只保存显示名、API Key、Base URL（最多 5 个）。"
+            "「当前供应商」是未单独配置任务时的默认回退。"
+            "下方「任务模型路由」可为每个 AI 功能跨供应商选模型。"
             "编辑后点「保存所有设置」落盘；进行中的分析本轮不中断。"
         )
         hint.setWordWrap(True)
@@ -231,23 +238,85 @@ class SettingsView(QWidget):
         form.addRow("API Base URL:", self.api_url_input)
         layout.addWidget(form_group)
 
-        model_group = QGroupBox("任务模型路由（本档案）")
+        model_group = QGroupBox("档案默认模型名（可选，供路由回退）")
         model_form = QFormLayout(model_group)
 
         self.cls_model_input = QLineEdit()
         self.tag_model_input = QLineEdit()
         self.desc_model_input = QLineEdit()
+        self.cls_model_input.setPlaceholderText("如 gemini-2.0-flash")
+        self.tag_model_input.setPlaceholderText("如 gemini-2.0-flash")
+        self.desc_model_input.setPlaceholderText("如 gemini-2.0-flash")
 
-        model_form.addRow("视频分类模型:", self.cls_model_input)
-        model_form.addRow("标签生成模型:", self.tag_model_input)
-        model_form.addRow("内容描述模型:", self.desc_model_input)
-
+        model_form.addRow("分类默认:", self.cls_model_input)
+        model_form.addRow("标签默认:", self.tag_model_input)
+        model_form.addRow("描述默认:", self.desc_model_input)
         layout.addWidget(model_group)
+
+        # —— 任务模型路由六槽 ——
+        route_group = QGroupBox("任务模型路由（跨供应商）")
+        route_layout = QVBoxLayout(route_group)
+        route_hint = QLabel(
+            "每个 AI 功能可指定供应商 + 模型名。供应商选「（默认回退）」则使用当前供应商。"
+        )
+        route_hint.setWordWrap(True)
+        route_hint.setStyleSheet("color: #888; font-size: 12px;")
+        route_layout.addWidget(route_hint)
+
+        self._route_widgets = {}
+        for key in TASK_ROUTE_KEYS:
+            row = QHBoxLayout()
+            label = QLabel(TASK_ROUTE_LABELS.get(key, key))
+            label.setMinimumWidth(100)
+            row.addWidget(label)
+            prov_combo = QComboBox()
+            prov_combo.setMinimumWidth(140)
+            model_edit = QLineEdit()
+            model_edit.setPlaceholderText("模型名")
+            row.addWidget(prov_combo, 1)
+            row.addWidget(model_edit, 1)
+            route_layout.addLayout(row)
+            self._route_widgets[key] = {"provider": prov_combo, "model": model_edit}
+
+        layout.addWidget(route_group)
         layout.addStretch()
 
         self._provider_ui_ready = True
         self._refresh_provider_list(select_id=self.settings.get("current_provider_id"))
+        self._load_task_routes_ui()
         return tab
+
+    def _load_task_routes_ui(self) -> None:
+        if not getattr(self, "_route_widgets", None):
+            return
+        ensure_providers(self.settings)
+        providers = list_providers(self.settings)
+        routing = get_task_model_routing(self.settings)
+        for key, widgets in self._route_widgets.items():
+            combo: QComboBox = widgets["provider"]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("（默认回退）", "")
+            for p in providers:
+                combo.addItem(p.get("display_name") or p["id"], p["id"])
+            slot = routing.get(key) or {}
+            pid = str(slot.get("provider_id") or "")
+            idx = combo.findData(pid)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            widgets["model"].setText(str(slot.get("model") or ""))
+            combo.blockSignals(False)
+
+    def _flush_task_routes_to_settings(self) -> None:
+        if not getattr(self, "_route_widgets", None):
+            return
+        routing = {}
+        for key, widgets in self._route_widgets.items():
+            combo: QComboBox = widgets["provider"]
+            routing[key] = {
+                "provider_id": str(combo.currentData() or ""),
+                "model": widgets["model"].text().strip(),
+            }
+        replace_task_model_routing(self.settings, routing)
 
     def _selected_provider_id(self) -> str:
         item = self.provider_list.currentItem() if hasattr(self, "provider_list") else None
@@ -336,6 +405,7 @@ class SettingsView(QWidget):
 
         if target:
             self._load_provider_form(target)
+        self._load_task_routes_ui()
 
     def _on_provider_selection_changed(self, current, previous):
         if self._suppress_provider_signals:
@@ -423,31 +493,29 @@ class SettingsView(QWidget):
             QMessageBox.warning(self, "无法删除", str(e))
 
     def create_prompts_tab(self):
-        """编辑全局 system 角色头，并预览分析时真正发出的完整提示词。"""
+        """Prompt 全中心：分析 system + 各组 local + 标签库 AI 模板 + 预览。"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        
+
         container = QWidget()
         vbox = QVBoxLayout(container)
         vbox.setSpacing(12)
 
         hint = QLabel(
-            "<b>提示词由两层组成，不是只有下面这一句：</b>"
-            "<br>① <b>全局角色头（可编辑）</b>：你在下方写的 system 开头；"
-            "<br>② <b>自动组装正文（只读预览）</b>：分类列表、各标签组 local_prompt、"
-            "标签库约束、JSON 输出结构——分析时由程序拼进 user 消息，并附上视频帧。"
-            "<br>标签组局部说明请到「标签库 → 组规则 / Prompt 配置」维护。"
-            "<br><span style='color:#888;'>旧版三份任务 Prompt 已废弃，不再参与分析。</span>"
+            "<b>全部可编辑 Prompt 中心</b>"
+            "<br>① 分析全局角色头 ② 各标签组 local_prompt ③ 标签库 AI 三模板"
+            "（待审 / 近义 / 标准词助手）。冷启动模板本轮隐藏。"
+            "<br><span style='color:#888;'>旧版 prompts.* 三键已废弃，不再参与分析。</span>"
         )
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.RichText)
         vbox.addWidget(hint)
 
-        vbox.addWidget(QLabel("<b>① 全局角色头（写入 tag_config.global_settings.system_prompt）：</b>"))
+        vbox.addWidget(QLabel("<b>① 全局角色头（tag_config.global_settings.system_prompt）</b>"))
         self.system_prompt_edit = QPlainTextEdit()
         default_system = (
             "你是一个资深的影视后期素材整理专家。请通过观察视频帧，提取精准的元数据。"
@@ -458,22 +526,68 @@ class SettingsView(QWidget):
         else:
             current = (self.service.tag_config or {}).get("global_settings", {}).get("system_prompt", "")
         if not (current or "").strip():
-            legacy_parts = [
-                SettingsManager.get_setting(self.settings, "prompts.video_classification", ""),
-                SettingsManager.get_setting(self.settings, "prompts.tag_generation", ""),
-                SettingsManager.get_setting(self.settings, "prompts.content_description", ""),
-            ]
-            legacy = "\n\n".join(p for p in legacy_parts if p)
-            current = legacy or default_system
+            current = default_system
         self.system_prompt_edit.setPlainText(current)
-        self.system_prompt_edit.setMinimumHeight(100)
-        self.system_prompt_edit.setPlaceholderText(
-            "例如角色、风格偏好、禁止事项。不必重复写 JSON 字段——下方预览会自动带上。"
-        )
+        self.system_prompt_edit.setMinimumHeight(90)
         vbox.addWidget(self.system_prompt_edit)
 
+        # ② 各组 local_prompt
+        vbox.addWidget(QLabel("<b>② 各标签组 local_prompt（写入 tag_config 各组 rules）</b>"))
+        self._local_prompt_edits = {}
+        groups = []
+        if hasattr(self.service, "get_group_local_prompts"):
+            groups = self.service.get_group_local_prompts() or []
+        if not groups:
+            for g in (self.service.tag_config or {}).get("tag_groups") or []:
+                gid = str(g.get("id") or "").strip()
+                if not gid or gid.lower() == "pool":
+                    continue
+                rules = g.get("rules") if isinstance(g.get("rules"), dict) else {}
+                groups.append(
+                    {
+                        "id": gid,
+                        "name": str(g.get("name") or gid),
+                        "local_prompt": str(rules.get("local_prompt") or ""),
+                    }
+                )
+        for row in groups:
+            gid = row["id"]
+            name = row.get("name") or gid
+            vbox.addWidget(QLabel(f"· {name}（{gid}）"))
+            edit = QPlainTextEdit()
+            edit.setPlainText(row.get("local_prompt") or "")
+            edit.setMinimumHeight(56)
+            edit.setMaximumHeight(100)
+            edit.setPlaceholderText(f"组 {gid} 的局部引导词")
+            self._local_prompt_edits[gid] = edit
+            vbox.addWidget(edit)
+
+        # ③ 标签库 AI 模板
+        from core.tag_ai_assist import DEFAULT_TAG_AI_PROMPTS
+
+        vbox.addWidget(QLabel("<b>③ 标签库 AI 模板（settings.tag_ai_prompts）</b>"))
+        self._tag_ai_prompt_edits = {}
+        tag_ai_labels = {
+            "pending_tag_ai": "待审词 AI（含批量分拣）",
+            "synonym_audit": "近义巡检",
+            "standard_tag_ai": "标准词 AI 助手",
+        }
+        for key, label in tag_ai_labels.items():
+            vbox.addWidget(QLabel(f"· {label}"))
+            edit = QPlainTextEdit()
+            if hasattr(self.service, "get_tag_ai_prompt"):
+                text = self.service.get_tag_ai_prompt(key)
+            else:
+                text = DEFAULT_TAG_AI_PROMPTS.get(key, "")
+            edit.setPlainText(text or "")
+            edit.setMinimumHeight(64)
+            edit.setMaximumHeight(120)
+            self._tag_ai_prompt_edits[key] = edit
+            vbox.addWidget(edit)
+
+        # 预览
         preview_header = QHBoxLayout()
-        preview_header.addWidget(QLabel("<b>② 完整提示词预览（与真实分析同一套组装逻辑）：</b>"))
+        preview_header.addWidget(QLabel("<b>④ 预览</b>"))
         preview_header.addStretch()
         refresh_btn = QPushButton("刷新预览")
         refresh_btn.clicked.connect(self.refresh_prompt_preview)
@@ -482,33 +596,42 @@ class SettingsView(QWidget):
 
         self.prompt_preview_edit = QPlainTextEdit()
         self.prompt_preview_edit.setReadOnly(True)
-        self.prompt_preview_edit.setMinimumHeight(280)
-        self.prompt_preview_edit.setPlaceholderText("点击「刷新预览」查看将发给模型的 system + user 全文。")
+        self.prompt_preview_edit.setMinimumHeight(220)
+        self.prompt_preview_edit.setPlaceholderText("分析完整拼装 + 标签库 AI 模板摘要")
         vbox.addWidget(self.prompt_preview_edit)
 
         note = QLabel(
-            "预览不含视频帧图片。若标签库仍是「测试氛围1」这类占位标签，"
-            "预览正文也会偏薄——那是标签库数据问题，不是提示词引擎只有一句话。"
+            "分析预览不含视频帧。标签库 AI 预览为 system 模板正文（user 含动态词表，运行时组装）。"
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 12px;")
         vbox.addWidget(note)
         vbox.addStretch()
-        
+
         scroll.setWidget(container)
         layout.addWidget(scroll)
-
-        # 进入页面即展示一次真实拼装结果
         self.refresh_prompt_preview()
         return tab
 
     def refresh_prompt_preview(self):
-        """按当前编辑框中的角色头 + 现有 tag_config 刷新完整提示词预览。"""
+        """分析完整预览 + 标签库 AI 模板摘要。"""
         if not hasattr(self, "prompt_preview_edit"):
             return
         header = ""
         if hasattr(self, "system_prompt_edit"):
             header = self.system_prompt_edit.toPlainText()
+        # 预览前把 local 写回内存 tag_config（不强制落盘）
+        if getattr(self, "_local_prompt_edits", None):
+            for gid, edit in self._local_prompt_edits.items():
+                text = edit.toPlainText()
+                for g in (self.service.tag_config or {}).get("tag_groups") or []:
+                    if str(g.get("id") or "").strip() == gid:
+                        rules = g.setdefault("rules", {})
+                        if not isinstance(rules, dict):
+                            rules = {}
+                            g["rules"] = rules
+                        rules["local_prompt"] = text
+                        break
         try:
             if hasattr(self.service, "preview_analysis_prompts"):
                 prompts = self.service.preview_analysis_prompts(header)
@@ -517,13 +640,20 @@ class SettingsView(QWidget):
                 prompts = self.service.ai.build_analysis_prompts(header)
             else:
                 prompts = {"system_prompt": header, "user_prompt": "（无法生成预览）"}
-            text = (
-                "======== [system] 发给模型的系统消息 ========\n"
-                f"{prompts.get('system_prompt', '')}\n\n"
-                "======== [user] 发给模型的用户消息（另附视频帧） ========\n"
-                f"{prompts.get('user_prompt', '')}"
-            )
-            self.prompt_preview_edit.setPlainText(text)
+            parts = [
+                "======== [分析 system] ========",
+                f"{prompts.get('system_prompt', '')}",
+                "",
+                "======== [分析 user]（另附视频帧） ========",
+                f"{prompts.get('user_prompt', '')}",
+                "",
+                "======== [标签库 AI system 模板] ========",
+            ]
+            for key, edit in (getattr(self, "_tag_ai_prompt_edits", None) or {}).items():
+                parts.append(f"--- {key} ---")
+                parts.append(edit.toPlainText().strip() or "（空）")
+                parts.append("")
+            self.prompt_preview_edit.setPlainText("\n".join(parts))
         except Exception as e:
             self.prompt_preview_edit.setPlainText(f"预览失败: {e}")
 
@@ -657,9 +787,10 @@ class SettingsView(QWidget):
 
     def apply_settings(self):
         """同步 UI 数据到 settings 字典并保存"""
-        # 模型供应商：表单 → 档案 → 写穿扁平 api
+        # 模型供应商：表单 → 档案 → 任务路由 → 写穿扁平 api
         if self._provider_ui_ready:
             self._flush_provider_form_to_settings()
+            self._flush_task_routes_to_settings()
             ensure_providers(self.settings)
         
         # Processing
@@ -690,7 +821,7 @@ class SettingsView(QWidget):
                 1,
             )
         
-        # 全局 system_prompt → tag_config（主分析真实入口）；旧 prompts.* 不再写入
+        # Prompt 全中心：system + local + 标签库 AI 模板；旧 prompts.* 不再写入
         if hasattr(self, "system_prompt_edit"):
             system_prompt = self.system_prompt_edit.toPlainText().strip()
             if hasattr(self.service, "set_system_prompt"):
@@ -698,6 +829,14 @@ class SettingsView(QWidget):
             else:
                 self.service.tag_config.setdefault("global_settings", {})["system_prompt"] = system_prompt
                 self.service.save_tag_config(self.service.tag_config)
+        if getattr(self, "_local_prompt_edits", None):
+            for gid, edit in self._local_prompt_edits.items():
+                if hasattr(self.service, "set_group_local_prompt"):
+                    self.service.set_group_local_prompt(gid, edit.toPlainText())
+        if getattr(self, "_tag_ai_prompt_edits", None):
+            for key, edit in self._tag_ai_prompt_edits.items():
+                if hasattr(self.service, "set_tag_ai_prompt"):
+                    self.service.set_tag_ai_prompt(key, edit.toPlainText())
         
         # UI & Others
         SettingsManager.update_setting(self.settings, "ui_preferences.font_size", self.font_spin.value())
@@ -744,6 +883,7 @@ class SettingsView(QWidget):
                 self.service.reload_ai_from_settings()
             if self._provider_ui_ready:
                 self._refresh_provider_list(select_id=self._selected_provider_id())
+                self._load_task_routes_ui()
             QMessageBox.information(self, "成功", "设置已保存并已应用到 AI 引擎，界面偏好将尽量立即生效。")
             self.settings_applied.emit()
         except Exception as e:
