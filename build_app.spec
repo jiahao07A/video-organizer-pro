@@ -1,42 +1,48 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
-import sys
-from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# 自动收集 PySide6, cv2, openai 等库的所有数据、二进制文件和隐藏导入
-# 这能极大提高跨机器运行的成功率
-def get_all_bundle_data(package_name):
-    datas, binaries, hiddenimports = collect_all(package_name)
-    return datas, binaries, hiddenimports
-
-# 收集列表
-packages = ['PySide6', 'cv2', 'openai', 'imagehash', 'scenedetect', 'qt_material']
+# 依赖包自身的 PyInstaller hooks 会收集运行所需的动态库和模块。
+# 不使用 collect_all：它会把 PySide6 的全部可选模块（包括 Qt3D/QtCharts 等）
+# 加入分析，导致构建时间和最终包体不必要地膨胀。
+# 只将非用户资源放入包内；.env、settings.json、tag_config.json 不得发布。
 all_datas = [
-    # 只打包非用户配置资源。严禁收集 .env、settings.json 或 tag_config.json：
-    # 它们可能含密钥、个人设置和用户词表；应用默认值由代码提供，写入配置放在 EXE 旁。
     ('词.txt', '.'),
 ]
-all_binaries = []
-all_hiddenimports = ['sqlite3', 'PIL.Image', 'PySide6.QtXml']
-
-for pkg in packages:
-    d, b, h = get_all_bundle_data(pkg)
-    all_datas.extend(d)
-    all_binaries.extend(b)
-    all_hiddenimports.extend(h)
+all_hiddenimports = [
+    'sqlite3',
+    'PIL.Image',
+    'PySide6.QtXml',
+    'PySide6.QtMultimedia',
+    'PySide6.QtMultimediaWidgets',
+]
 
 a = Analysis(
     ['video_organizer_app.py'],
     pathex=[],
-    binaries=all_binaries,
+    binaries=[],
     datas=all_datas,
     hiddenimports=all_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Optional packages pulled in by the shared Python environment but not used
+        # by this application. Excluding them keeps the Windows release practical.
+        'torch',
+        'tensorflow',
+        'transformers',
+        'sklearn',
+        'pandas',
+        'scipy',
+        'matplotlib',
+        'sympy',
+        'sqlalchemy',
+        'openpyxl',
+        'yt_dlp',
+        'sounddevice',
+        'soundfile',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
