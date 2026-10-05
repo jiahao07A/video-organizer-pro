@@ -112,7 +112,12 @@ DEFAULT_SETTINGS = {
         "last_work_scope": [],
     },
     "processing": {
-        "max_workers": 4,
+        # 分析管线并发：可较高（等 AI）；真正抽帧由 extract_parallel 限制
+        "max_workers": 16,
+        # 入库扫盘缩略图并发
+        "extract_workers": 8,
+        # 同时进行 OpenCV 抽帧的上限（过大必卡死整机 GUI）
+        "extract_parallel": 4,
         "max_frames": 10,
         "target_size": 512,
         "jpeg_quality": 80,
@@ -884,7 +889,7 @@ class VideoProcessor:
     @classmethod
     def extract_frames(cls, video_path: str, max_frames: int = 10, target_size: int = 512,
                        save_thumbnail: bool = False, use_scene_detection: bool = True) -> Dict[str, Any]:
-        logger.info(f"开始抽取视频帧: {video_path} (最大帧数: {max_frames})")
+        logger.debug(f"开始抽取视频帧: {video_path} (最大帧数: {max_frames})")
         if not os.path.exists(video_path):
             logger.warning(f"文件不存在: {video_path}")
             return {"frames": [], "thumbnail": None, "phash": ""}
@@ -1172,10 +1177,22 @@ class AIHandler:
                     self._last_api_failure = None
                     if getattr(self, "_tls", None) is not None:
                         self._tls.last_api_failure = None
+                    self._record_api_metrics(
+                        attempt=attempt,
+                        model=str(use_model or ""),
+                        task_key=task_key or "",
+                        ok=True,
+                    )
                     return data
                 self._last_api_failure = None
                 if getattr(self, "_tls", None) is not None:
                     self._tls.last_api_failure = None
+                self._record_api_metrics(
+                    attempt=attempt,
+                    model=str(use_model or ""),
+                    task_key=task_key or "",
+                    ok=True,
+                )
                 return res_content
             except Exception as e:
                 last_err = e
@@ -1184,6 +1201,14 @@ class AIHandler:
                 if len(msg) > 200:
                     msg = msg[:200] + "…"
                 retriable = is_retriable(e)
+                self._record_api_metrics(
+                    attempt=attempt,
+                    model=str(use_model or ""),
+                    task_key=task_key or "",
+                    ok=False,
+                    error=msg,
+                    retriable=retriable,
+                )
                 if not retriable:
                     fail = ApiCallFailure(
                         message=msg, retriable=False, cancelled=False
@@ -1210,6 +1235,31 @@ class AIHandler:
             if getattr(self, "_tls", None) is not None:
                 self._tls.last_api_failure = fail
         return None
+
+    def _record_api_metrics(
+        self,
+        *,
+        attempt: int,
+        model: str = "",
+        task_key: str = "",
+        ok: bool,
+        error: str = "",
+        retriable: Optional[bool] = None,
+    ) -> None:
+        tr = getattr(self, "_job_metrics", None)
+        if tr is None:
+            return
+        try:
+            tr.record_api_attempt(
+                attempt=attempt,
+                model=model,
+                task_key=task_key,
+                ok=ok,
+                error=error,
+                retriable=retriable,
+            )
+        except Exception:
+            pass
 
     def get_last_api_failure(self):
         """线程安全读取上次 API 失败。"""
@@ -1462,11 +1512,24 @@ class AIHandler:
             cached = self.db.get_cache(cache_key)
             if cached:
                 logger.info("使用 API 响应缓存（按当前词表再归一）")
+                tr = getattr(self, "_job_metrics", None)
+                if tr is not None:
+                    try:
+                        tr.record_cache(True, key=cache_key or "")
+                    except Exception:
+                        pass
                 # 键已含词表指纹；命中后再归一，防止极端键碰撞或中间层改写
                 data = dict(cached) if isinstance(cached, dict) else cached
                 if isinstance(data, dict):
                     return self.apply_tag_normalization(data, persist_pending=False)
                 return cached
+
+        tr = getattr(self, "_job_metrics", None)
+        if tr is not None and cache_key:
+            try:
+                tr.record_cache(False, key=cache_key or "")
+            except Exception:
+                pass
 
         # 与设置页预览共用同一条组装链路
         prompts = self.build_analysis_prompts()
@@ -1943,6 +2006,23 @@ class VideoOrganizerService:
         self.on_analysis_snapshot: Callable[[Dict], None] = lambda _s: None
         self._analysis_cancel = threading.Event()
         self._progress_lock = threading.Lock()
+        # GUI 进度/日志限流，避免大批量分析时信号淹没主线程
+        self._snapshot_emit_lock = threading.Lock()
+        self._last_snapshot_emit_mono = 0.0
+        self._snapshot_min_interval_sec = 0.35
+        self._ui_log_lock = threading.Lock()
+        self._last_ui_log_mono = 0.0
+        self._ui_log_min_interval_sec = 0.5
+        # OpenCV 抽帧全局闸门：与 max_workers 解耦，防止 50 路同时解码 4K 卡死整机
+        ep = int(
+            SettingsManager.get_setting(self.settings, "processing.extract_parallel", 4)
+            or 4
+        )
+        ep = max(1, min(ep, 16))
+        self._extract_parallel = ep
+        self._extract_sem = threading.Semaphore(ep)
+        self._xmp_ctx_cache = None
+        self._xmp_ctx_lock = threading.Lock()
         # 测试可注入：跳过真实 sleep
         self._retry_sleeper: Optional[Callable[[float], None]] = None
         self.processor = VideoProcessor()
@@ -1954,7 +2034,9 @@ class VideoOrganizerService:
         self.file_manager = FileManager(self.db, json_path, csv_path)
         
         # V4.0: L1 内存缓存 (三级缓存架构之一)
+        # 仅在「完整全库加载」后可直接返回；分析过程中禁止用零散写入冒充全库
         self._memory_cache = {}
+        self._memory_cache_complete = False
         self._cache_lock = threading.Lock()
         # 工作范围：当前工作台呈现与处理的路径集合（文件 + 文件夹）
         self._work_scope_paths: List[str] = []
@@ -2172,11 +2254,13 @@ class VideoOrganizerService:
         - 尚不在库：登记为 status=pending（未分析）
         - 已在库：保留既有分析结果，不覆盖
         返回本次新登记的路径列表。
+        新入库轻量缩略图抽帧使用 extract_workers 高并发（默认 100）。
         """
         registered: List[str] = []
         if not self._work_scope_paths:
             return registered
 
+        to_thumb: List[Dict] = []
         for scope_path in self._work_scope_paths:
             try:
                 found = self.file_manager.scan_videos(scope_path)
@@ -2195,46 +2279,52 @@ class VideoOrganizerService:
                     "tag_groups": {},
                 }
                 if self.db.insert_video_if_absent(record):
-                    # 入库轻量缩略图（不依赖完整 AI 分析）
-                    thumb = None
-                    try:
-                        proc = self.processor.extract_frames(
-                            abs_path,
-                            max_frames=1,
-                            target_size=SettingsManager.get_setting(
-                                self.settings, "processing.target_size", 512
-                            ),
-                            save_thumbnail=True,
-                            use_scene_detection=False,
-                        )
-                        thumb = proc.get("thumbnail")
-                        if thumb:
-                            self.db.upsert_video(
-                                {
-                                    **record,
-                                    "thumbnail": thumb,
-                                    "thumbnail_path": thumb,
-                                }
-                            )
-                            record["thumbnail"] = thumb
-                            record["thumbnail_path"] = thumb
-                    except Exception as e:
-                        logger.warning(f"入库缩略图失败 {abs_path}: {e}")
                     registered.append(abs_path)
-                    with self._cache_lock:
-                        if self._memory_cache is not None:
-                            # 仅在缓存已预热时追加，避免半缓存状态
-                            if self._memory_cache:
-                                self._memory_cache[abs_path] = {
-                                    **record,
-                                    "thumbnail_path": thumb,
-                                    "thumbnail": thumb,
-                                }
+                    to_thumb.append(dict(record))
+
+        if to_thumb:
+            extract_workers = int(
+                SettingsManager.get_setting(
+                    self.settings, "processing.extract_workers", 100
+                )
+                or 100
+            )
+            extract_workers = max(1, min(extract_workers, 512))
+            target_size = SettingsManager.get_setting(
+                self.settings, "processing.target_size", 512
+            )
+            self.log(
+                f"入库轻量抽帧：{len(to_thumb)} 条，并发 {extract_workers}"
+            )
+
+            def _thumb_one(rec: Dict):
+                abs_path = rec["path"]
+                try:
+                    proc = self.processor.extract_frames(
+                        abs_path,
+                        max_frames=1,
+                        target_size=target_size,
+                        save_thumbnail=True,
+                        use_scene_detection=False,
+                    )
+                    thumb = proc.get("thumbnail")
+                    if thumb:
+                        self.db.upsert_video(
+                            {
+                                **rec,
+                                "thumbnail": thumb,
+                                "thumbnail_path": thumb,
+                            }
+                        )
+                except Exception as e:
+                    logger.warning(f"入库缩略图失败 {abs_path}: {e}")
+
+            with ThreadPoolExecutor(max_workers=extract_workers) as executor:
+                list(executor.map(_thumb_one, to_thumb))
 
         if registered:
             # 新入库后让下次 get_all_videos 从 DB 刷新完整记录
-            with self._cache_lock:
-                self._memory_cache = {}
+            self.invalidate_video_memory_cache()
             self.log(f"工作范围扫盘：新登记 {len(registered)} 个未分析视频。")
         return registered
 
@@ -2790,9 +2880,23 @@ class VideoOrganizerService:
             self.log(f"生成故事板失败: {e}")
             return False
 
-    def log(self, message: str):
+    def log(self, message: str, *, ui: bool = True, force_ui: bool = False):
+        """写文件/logger；ui=True 时再节流转发到 GUI（force_ui 强制推送）。"""
         logger.info(message)
-        self.on_log(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        if not ui:
+            return
+        now = time.monotonic()
+        with self._ui_log_lock:
+            if (
+                not force_ui
+                and (now - self._last_ui_log_mono) < self._ui_log_min_interval_sec
+            ):
+                return
+            self._last_ui_log_mono = now
+        try:
+            self.on_log(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+        except Exception:
+            pass
 
     def load_tag_config(self) -> Dict:
         """加载标签配置，并支持从旧版本自动迁移至 v6.0"""
@@ -3332,15 +3436,49 @@ class VideoOrganizerService:
             "system_prompt_header": system_prompt_override or "",
         }
 
-    def get_all_videos(self) -> List[Dict]:
-        """V4.0: 获取所有视频，优先使用 L1 内存缓存"""
+    def invalidate_video_memory_cache(self) -> None:
+        """丢弃 L1 视频缓存，下次 get_all_videos 强制从 DB 重载。"""
         with self._cache_lock:
-            if self._memory_cache:
+            self._memory_cache = {}
+            self._memory_cache_complete = False
+
+    def _cache_put_video_row(self, path: str, row: Dict) -> None:
+        """
+        在「完整缓存」上更新单条；禁止向空缓存写入导致 get_all_videos 只返回几条。
+        路径按 normalize 对齐，避免 abspath/大小写键不一致留下旧 failed 行。
+        """
+        if not path or not isinstance(row, dict):
+            return
+        try:
+            np = normalize_work_path(path)
+        except Exception:
+            np = path
+        with self._cache_lock:
+            if not self._memory_cache_complete or not self._memory_cache:
+                return
+            updated = False
+            for k in list(self._memory_cache.keys()):
+                try:
+                    if k == path or k == np or normalize_work_path(k) == np:
+                        self._memory_cache[k] = dict(row)
+                        updated = True
+                except Exception:
+                    if k == path:
+                        self._memory_cache[k] = dict(row)
+                        updated = True
+            if not updated:
+                self._memory_cache[path] = dict(row)
+
+    def get_all_videos(self) -> List[Dict]:
+        """获取所有视频：仅完整 L1 缓存可直出，否则从 DB 全量加载。"""
+        with self._cache_lock:
+            if self._memory_cache_complete and self._memory_cache:
                 return list(self._memory_cache.values())
-        
+
         videos = self.db.get_all_videos()
         with self._cache_lock:
-            self._memory_cache = {v['path']: v for v in videos}
+            self._memory_cache = {v["path"]: v for v in videos if v.get("path")}
+            self._memory_cache_complete = True
         return videos
 
     def _save_l3_backup(self):
@@ -3365,12 +3503,7 @@ class VideoOrganizerService:
         """取消入库：从数据库中删除视频记录（不删磁盘文件）。"""
         for path in paths:
             self.db.delete_video(path)
-        with self._cache_lock:
-            if self._memory_cache:
-                for path in paths:
-                    self._memory_cache.pop(path, None)
-            else:
-                self._memory_cache = {}
+        self.invalidate_video_memory_cache()
 
     def uncatalog_videos(self, paths: List[str]):
         """产品语义：取消入库（同 delete_videos，不删磁盘）。"""
@@ -3412,8 +3545,7 @@ class VideoOrganizerService:
         """批量替换标签；selected_paths 限定操作目标集（None=全库，兼容旧调用）。"""
         self.db.bulk_replace_tags(old_tag, new_tag, selected_paths=selected_paths)
         self.db.refresh_tag_usage_counts()
-        with self._cache_lock:
-            self._memory_cache = {}
+        self.invalidate_video_memory_cache()
         scope = "全库" if selected_paths is None else f"{len(selected_paths)} 条目标"
         self.log(f"已将标签 '{old_tag}' 批量替换为 '{new_tag}'（{scope}）")
 
@@ -3428,10 +3560,44 @@ class VideoOrganizerService:
     def is_analysis_cancelled(self) -> bool:
         return self._analysis_cancel.is_set()
 
-    def _emit_analysis_snapshot(self, reducer) -> None:
+    def _emit_analysis_snapshot(self, reducer, *, force: bool = False) -> None:
+        """向 UI 推送进度快照。默认节流；force=True 用于终态/取消/任务结束。"""
+        now = time.monotonic()
+        with self._snapshot_emit_lock:
+            if (
+                not force
+                and (now - self._last_snapshot_emit_mono) < self._snapshot_min_interval_sec
+            ):
+                return
+            self._last_snapshot_emit_mono = now
+
         with self._progress_lock:
             snap = reducer.snapshot()
             d = snap.to_dict()
+        # 大批量时禁止把上千行临时态塞进 Qt 信号（主因之一）
+        try:
+            if int(d.get("overall_total") or 0) > 24:
+                d["rows"] = {}
+        except Exception:
+            d["rows"] = {}
+        # 附带实时重试/缓存指标（轻量字段，避免每次拷贝 recent_events）
+        tr = getattr(self, "_job_metrics", None)
+        if tr is not None:
+            try:
+                m = tr.counters_snapshot()
+                rates = m.get("rates") or {}
+                d["metrics"] = m
+                base_msg = d.get("message") or ""
+                extra = (
+                    f" | API {m.get('api_attempts', 0)}"
+                    f" 重试{m.get('call_retries', 0)}"
+                    f"({rates.get('call_retry_rate_pct', 0)}%)"
+                    f" 缓存命中{rates.get('cache_hit_rate_pct', 0)}%"
+                )
+                if extra not in base_msg:
+                    d["message"] = (base_msg + extra).strip(" |")
+            except Exception:
+                pass
         try:
             self.on_analysis_snapshot(d)
         except Exception as e:
@@ -3446,20 +3612,20 @@ class VideoOrganizerService:
     def _persist_analysis_success(self, res: Dict) -> int:
         """入库；可选自动写 XMP。返回 xmp 失败 0/1（未写 XMP 视为 0）。"""
         self.db.upsert_video(res)
-        with self._cache_lock:
-            if self._memory_cache is not None:
-                self._memory_cache[res["path"]] = res
+        # 仅在完整缓存上按路径对齐更新，禁止写破缓存
+        self._cache_put_video_row(res.get("path") or "", res)
         auto_xmp = SettingsManager.get_setting(
             self.settings, "processing.auto_sync_xmp_after_analysis", False
         )
         if not auto_xmp:
             return 0
         try:
-            self.sync_metadata_to_xmp([res["path"]])
+            # 单条路径：禁止走全库 get_all_videos（1700+×高并发会卡死）
+            self.sync_metadata_to_xmp([res["path"]], video_rows=[res])
             return 0
         except Exception as e:
             logger.warning(f"XMP 同步失败 {res.get('path')}: {e}")
-            self.log(f"XMP 同步失败 {os.path.basename(res.get('path') or '')}: {e}")
+            self.log(f"XMP 同步失败 {os.path.basename(res.get('path') or '')}: {e}", ui=False)
             return 1
 
     def _persist_analysis_failure(self, video_path: str, reason: str) -> None:
@@ -3478,9 +3644,8 @@ class VideoOrganizerService:
                 "last_error": reason,
             }
             self.db.upsert_video(fail_row)
-            # 清空 L1 缓存，下次 get_all_videos 从 DB 拉失败态（避免双键重复/路径形态不一致）
-            with self._cache_lock:
-                self._memory_cache = {}
+            # 仅在完整缓存上更新该条；禁止向空缓存写入导致列表只剩失败行
+            self._cache_put_video_row(video_path, fail_row)
         except Exception as e:
             logger.warning(f"写入失败状态失败 {video_path}: {e}")
 
@@ -3510,6 +3675,18 @@ class VideoOrganizerService:
         self.ai.analysis_cancel_event = self._analysis_cancel
         self.ai._retry_sleeper = self._retry_sleeper
         self.ai.settings = self.settings
+
+        from core.analysis_job_metrics import (
+            new_job_metrics,
+            persist_job_metrics,
+            setup_analysis_file_logging,
+        )
+
+        try:
+            log_path = setup_analysis_file_logging()
+            logger.info(f"分析日志文件: {log_path}")
+        except Exception as e:
+            logger.warning(f"初始化分析文件日志失败: {e}")
 
         empty = {
             "attempted": 0,
@@ -3563,9 +3740,41 @@ class VideoOrganizerService:
         # 冻结本任务配置，避免分析中途改设置搅乱 A/B 行为
         self._job_retry_config = retry_cfg
         self.ai._job_retry_config = retry_cfg
+
+        max_workers_cfg = int(
+            SettingsManager.get_setting(self.settings, "processing.max_workers", 16)
+            or 16
+        )
+        # 硬顶：过高并发对整机（含 GUI）是灾难；用户仍可到 32
+        max_workers_cfg = max(1, min(max_workers_cfg, 32))
+        # 刷新抽帧闸门（设置可能已改）
+        ep = int(
+            SettingsManager.get_setting(self.settings, "processing.extract_parallel", 4)
+            or 4
+        )
+        ep = max(1, min(ep, 16))
+        self._extract_parallel = ep
+        self._extract_sem = threading.Semaphore(ep)
+        self._xmp_ctx_cache = None
+        metrics = new_job_metrics(
+            force_reanalyze=force_reanalyze,
+            target_count=len(videos_to_process),
+            max_workers=max_workers_cfg,
+        )
+        self._job_metrics = metrics
+        self.ai._job_metrics = metrics
+        self.log(
+            f"分析任务开始 id={metrics.job_id} 目标={len(videos_to_process)} "
+            f"管线并发={max_workers_cfg} 抽帧并行={ep} 强制={force_reanalyze} "
+            f"调用层额外重试={retry_cfg.call_extra_attempts} "
+            f"单条最大尝试={retry_cfg.item_max_attempts} "
+            f"批次补跑={retry_cfg.batch_rerun_enabled}",
+            force_ui=True,
+        )
+
         reducer = ProgressReducer()
         reducer.apply("job_started", target_count=len(videos_to_process))
-        self._emit_analysis_snapshot(reducer)
+        self._emit_analysis_snapshot(reducer, force=True)
 
         total_target = len(videos_to_process)
         succeeded = 0
@@ -3578,14 +3787,16 @@ class VideoOrganizerService:
             """处理一轮；返回本轮仍失败的路径。"""
             nonlocal succeeded, failed, xmp_failed, cancelled
             reducer.apply("round_started", kind=kind, item_count=len(paths))
-            self._emit_analysis_snapshot(reducer)
+            self._emit_analysis_snapshot(reducer, force=True)
             if kind == RoundKind.RERUN:
-                self.log(f"批次补跑：{len(paths)} 条失败项")
+                self.log(f"批次补跑：{len(paths)} 条失败项", force_ui=True)
+                try:
+                    metrics.record_batch_rerun()
+                except Exception:
+                    pass
             failed_paths: List[str] = []
             rerun_candidates: List[str] = []
-            max_workers = SettingsManager.get_setting(
-                self.settings, "processing.max_workers", 4
-            )
+            max_workers = max_workers_cfg
             # 取消后不再提交新任务：用串行检查 + executor
             pending = list(paths)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -3641,7 +3852,8 @@ class VideoOrganizerService:
                                 ok=False,
                                 cancelled=self.is_analysis_cancelled(),
                             )
-                    self._emit_analysis_snapshot(reducer)
+                    # 终态后节流推送（非 force，避免每条都打满主线程）
+                    self._emit_analysis_snapshot(reducer, force=False)
             # 未提交即取消的路径
             submitted = set(future_to_video.values()) if future_to_video else set()
             for v in pending:
@@ -3653,10 +3865,10 @@ class VideoOrganizerService:
                             reducer.apply(
                                 "item_terminal", path=v, ok=False, cancelled=True
                             )
-                        self._emit_analysis_snapshot(reducer)
+                        self._emit_analysis_snapshot(reducer, force=False)
             if cancelled:
                 reducer.apply("job_cancelled")
-                self._emit_analysis_snapshot(reducer)
+                self._emit_analysis_snapshot(reducer, force=True)
             # 本轮返回「可补跑候选」；永久失败只在 failed_paths 计数
             return failed_paths, rerun_candidates
 
@@ -3687,8 +3899,12 @@ class VideoOrganizerService:
 
         if self.is_analysis_cancelled():
             cancelled = True
+            try:
+                metrics.set_cancelled()
+            except Exception:
+                pass
             reducer.apply("job_cancelled")
-            self._emit_analysis_snapshot(reducer)
+            self._emit_analysis_snapshot(reducer, force=True)
 
         self._save_l3_backup()
         self.file_manager.save_results_to_csv(self.get_all_videos())
@@ -3705,7 +3921,32 @@ class VideoOrganizerService:
             msg += " 失败摘要：" + "；".join(uniq[:5])
             if len(uniq) > 5:
                 msg += f"…（另有 {len(uniq) - 5} 条）"
-        self.log(msg)
+
+        metrics_path = ""
+        metrics_snap: Dict[str, Any] = {}
+        try:
+            metrics_path = persist_job_metrics(metrics)
+            metrics_snap = metrics.snapshot()
+            rates = metrics_snap.get("rates") or {}
+            msg += (
+                f" | API尝试 {metrics_snap.get('api_attempts', 0)}"
+                f"（调用层重试 {metrics_snap.get('call_retries', 0)}"
+                f"/{rates.get('call_retry_rate_pct', 0)}%"
+                f"，缓存命中率 {rates.get('cache_hit_rate_pct', 0)}%"
+                f"，单条重试率 {rates.get('item_retry_rate_pct', 0)}%"
+                f"，均API/条 {rates.get('avg_api_attempts_per_item', 0)}）"
+            )
+            self.log(metrics.summary_line(), force_ui=True)
+            if metrics_path:
+                self.log(f"指标已写入: {metrics_path}", force_ui=True)
+        except Exception as e:
+            logger.warning(f"落盘分析指标失败: {e}")
+
+        self.log(msg, force_ui=True)
+        # 清理绑定，避免泄漏到后续非分析任务
+        self._job_metrics = None
+        self.ai._job_metrics = None
+        self._xmp_ctx_cache = None
         return {
             "attempted": total_target,
             "succeeded": succeeded,
@@ -3716,6 +3957,9 @@ class VideoOrganizerService:
             "batch_rerun": rerun_done,
             "cancelled": cancelled,
             "message": msg,
+            "metrics": metrics_snap,
+            "metrics_path": metrics_path,
+            "job_id": getattr(metrics, "job_id", ""),
         }
 
     def _process_single_video(
@@ -3741,52 +3985,94 @@ class VideoOrganizerService:
         )
         max_b = cfg.item_max_attempts
         last_reason = "未知原因"
+        metrics = getattr(self, "_job_metrics", None)
+        if metrics is not None:
+            try:
+                metrics.record_item_start(video_path)
+            except Exception:
+                pass
+
+        _item_finished = False
+
+        def finish_item(ok: bool, reason: str = "", *, extract_fail: bool = False) -> None:
+            nonlocal _item_finished
+            if _item_finished or metrics is None:
+                return
+            _item_finished = True
+            try:
+                metrics.record_item_result(
+                    ok=ok, path=video_path, reason=reason, extract_fail=extract_fail
+                )
+            except Exception:
+                pass
 
         def emit_phase(phase, attempt_b: int):
             if progress_reducer is None:
                 return
             try:
                 with self._progress_lock:
+                    # 大批量不维护 per-path 行文案，降低锁竞争与内存
+                    if getattr(progress_reducer, "overall_total", 0) > 24:
+                        path = video_path
+                        # 只记 in-flight 粗计数：用轻量 phase 事件但不扩 rows
+                        from core.analysis_job_policy import normalize_progress_path
+                        p = normalize_progress_path(path)
+                        if p:
+                            progress_reducer.in_flight_paths.add(p)
+                        return
                     progress_reducer.apply(
                         "item_phase",
                         path=video_path,
                         phase=phase,
                         attempt_b=attempt_b,
                     )
-                self._emit_analysis_snapshot(progress_reducer)
+                # 阶段变更不主动推 UI（终态/节流推送即可）
             except Exception:
                 pass
 
         for attempt_b in range(1, max_b + 1):
             if self.is_analysis_cancelled():
+                finish_item(False, "用户取消")
                 return None, "用户取消"
             try:
                 filename = os.path.basename(video_path)
+                if metrics is not None:
+                    try:
+                        metrics.record_item_attempt(attempt_b, video_path)
+                    except Exception:
+                        pass
                 self.log(
                     f"正在处理: {filename}"
                     + (" [强制]" if force_reanalyze else "")
-                    + (f" [单条尝试 {attempt_b}/{max_b}]" if attempt_b > 1 else "")
+                    + (f" [单条尝试 {attempt_b}/{max_b}]" if attempt_b > 1 else ""),
+                    ui=False,  # 仅写日志文件，不刷 GUI
                 )
 
                 emit_phase(AnalysisPhase.EXTRACT, attempt_b)
                 if not os.path.exists(video_path):
+                    finish_item(False, "文件不存在")
                     return None, "文件不存在"
 
                 file_hash = self.processor.get_file_hash(video_path)
 
-                proc_res = self.processor.extract_frames(
-                    video_path,
-                    max_frames=SettingsManager.get_setting(
-                        self.settings, "processing.max_frames", 10
-                    ),
-                    target_size=SettingsManager.get_setting(
-                        self.settings, "processing.target_size", 512
-                    ),
-                    save_thumbnail=True,
-                    use_scene_detection=SettingsManager.get_setting(
-                        self.settings, "processing.enable_scene_detection", True
-                    ),
-                )
+                # 抽帧闸门：高 max_workers 时也只允许少数路同时 OpenCV 解码
+                with self._extract_sem:
+                    if self.is_analysis_cancelled():
+                        finish_item(False, "用户取消")
+                        return None, "用户取消"
+                    proc_res = self.processor.extract_frames(
+                        video_path,
+                        max_frames=SettingsManager.get_setting(
+                            self.settings, "processing.max_frames", 10
+                        ),
+                        target_size=SettingsManager.get_setting(
+                            self.settings, "processing.target_size", 512
+                        ),
+                        save_thumbnail=True,
+                        use_scene_detection=SettingsManager.get_setting(
+                            self.settings, "processing.enable_scene_detection", True
+                        ),
+                    )
                 frames = proc_res.get("frames", [])
                 thumbnail_path = proc_res.get("thumbnail")
                 phash = proc_res.get("phash", "")
@@ -3797,9 +4083,11 @@ class VideoOrganizerService:
                     # 抽帧失败：默认可 B 再试一次（场景检测偶发空），但次数受 item_max 限制
                     if should_retry_item(attempt_b, item_max_attempts=max_b):
                         continue
+                    finish_item(False, last_reason, extract_fail=True)
                     return None, last_reason
 
                 if self.is_analysis_cancelled():
+                    finish_item(False, "用户取消")
                     return None, "用户取消"
 
                 emit_phase(AnalysisPhase.AI, attempt_b)
@@ -3828,23 +4116,28 @@ class VideoOrganizerService:
 
                 if not ai_data:
                     if self.is_analysis_cancelled():
+                        finish_item(False, "用户取消")
                         return None, "用户取消"
                     fail = self.ai.get_last_api_failure() if hasattr(self.ai, "get_last_api_failure") else getattr(self.ai, "_last_api_failure", None)
                     if fail is not None:
                         if fail.cancelled:
+                            finish_item(False, "用户取消")
                             return None, "用户取消"
                         last_reason = fail.message or "AI 调用失败"
                         self.log(f"处理失败 {filename}: {last_reason}")
                         # 不可重试（鉴权等）→ 禁止 B 层再试
                         if not fail.retriable:
+                            finish_item(False, last_reason)
                             return None, last_reason
                         if should_retry_item(attempt_b, item_max_attempts=max_b):
                             continue
+                        finish_item(False, last_reason)
                         return None, last_reason
                     last_reason = "AI 未返回有效分析结果"
                     self.log(f"处理失败 {filename}: {last_reason}")
                     if should_retry_item(attempt_b, item_max_attempts=max_b):
                         continue
+                    finish_item(False, last_reason)
                     return None, last_reason
 
                 emit_phase(AnalysisPhase.NORMALIZE, attempt_b)
@@ -3899,6 +4192,7 @@ class VideoOrganizerService:
                         ai_data.get("summary", ""),
                     )
 
+                finish_item(True)
                 return {
                     "path": video_path,
                     "filename": filename,
@@ -3924,14 +4218,18 @@ class VideoOrganizerService:
                     last_reason = last_reason[:200] + "…"
                 self.log(f"处理失败 {video_path}: {last_reason}")
                 if self.is_analysis_cancelled():
+                    finish_item(False, "用户取消")
                     return None, "用户取消"
                 # 不可恢复：不 B 重试
                 if not is_retriable(e) and not is_retriable(last_reason):
+                    finish_item(False, last_reason)
                     return None, last_reason
                 if should_retry_item(attempt_b, item_max_attempts=max_b):
                     continue
+                finish_item(False, last_reason)
                 return None, last_reason
 
+        finish_item(False, last_reason)
         return None, last_reason
 
     def find_physical_file(self, video_data: Dict, index: Dict[str, str]) -> Optional[str]:
@@ -4188,21 +4486,47 @@ class VideoOrganizerService:
             self.log(f"导出 ALE 失败: {e}")
             return False
 
-    def sync_metadata_to_xmp(self, selected_paths: Optional[List[str]] = None):
+    def sync_metadata_to_xmp(
+        self,
+        selected_paths: Optional[List[str]] = None,
+        *,
+        video_rows: Optional[List[Dict]] = None,
+    ):
         """
         为视频生成 XMP 侧边文件，优化了达芬奇与 PR 的双重兼容性。
         V6.0: 增加对全局导出方案的支持，并支持数据库驱动的层级标签。
         人物 Region / 层级 lookup 缺失时安全降级，不得抛 NameError。
+
+        video_rows: 可选，直接传入已有视频字典列表，避免 get_all_videos 全表扫描。
         """
         from core.analysis_targets import path_status_key
 
-        videos = self.db.get_all_videos()
-        if selected_paths is not None:
+        if video_rows is not None:
+            videos = list(video_rows)
+        elif selected_paths is not None:
             allow = {path_status_key(p) for p in selected_paths if p}
-            videos = [
-                v for v in videos
-                if path_status_key(v.get("path", "")) in allow
-            ]
+            # 小批量按路径取单条，避免全库加载
+            if 0 < len(allow) <= 32:
+                videos = []
+                for p in selected_paths:
+                    if not p:
+                        continue
+                    row = self.db.get_video_by_path(p)
+                    if not row:
+                        try:
+                            row = self.db.get_video_by_path(os.path.abspath(p))
+                        except Exception:
+                            row = None
+                    if row:
+                        videos.append(row)
+            else:
+                videos = self.db.get_all_videos()
+                videos = [
+                    v for v in videos
+                    if path_status_key(v.get("path", "")) in allow
+                ]
+        else:
+            videos = self.db.get_all_videos()
             
         # 获取全局导出设置
         global_settings = self.tag_config.get("global_settings", {}) if self.tag_config else {}
@@ -4210,26 +4534,42 @@ class VideoOrganizerService:
         use_hierarchical = export_schemes.get("xmp_hierarchical", True)
         prefix_category = export_schemes.get("xmp_prefix_category", True)
 
-        # 建立标签库以供转换 + 层级 / 人物集合（必须在本函数内构建，禁止未定义名）
-        tags_detail = self.db.get_tags_detail() or []
-        zh_to_en = {t["tag_name"]: t.get("name_en") for t in tags_detail if t.get("name_en")}
-        en_to_zh = {t.get("name_en"): t["tag_name"] for t in tags_detail if t.get("name_en")}
-
-        tag_lookup: Dict[str, Dict] = {}
-        id_lookup: Dict[Any, Dict] = {}
-        person_tags: set = set()
-        _person_dims = frozenset({"subject", "主体", "person", "人物", "people"})
-        for t in tags_detail:
-            name = t.get("tag_name")
-            if not name:
-                continue
-            tag_lookup[name] = t
-            tid = t.get("id")
-            if tid is not None:
-                id_lookup[tid] = t
-            dim = str(t.get("dimension") or "").strip().lower()
-            if t.get("is_person") or dim in _person_dims:
-                person_tags.add(name)
+        # 标签库上下文：分析任务内复用，避免每条视频都扫 tags 表
+        with self._xmp_ctx_lock:
+            cached = self._xmp_ctx_cache
+        if cached is None:
+            tags_detail = self.db.get_tags_detail() or []
+            zh_to_en = {t["tag_name"]: t.get("name_en") for t in tags_detail if t.get("name_en")}
+            en_to_zh = {t.get("name_en"): t["tag_name"] for t in tags_detail if t.get("name_en")}
+            tag_lookup: Dict[str, Dict] = {}
+            id_lookup: Dict[Any, Dict] = {}
+            person_tags: set = set()
+            _person_dims = frozenset({"subject", "主体", "person", "人物", "people"})
+            for t in tags_detail:
+                name = t.get("tag_name")
+                if not name:
+                    continue
+                tag_lookup[name] = t
+                tid = t.get("id")
+                if tid is not None:
+                    id_lookup[tid] = t
+                dim = str(t.get("dimension") or "").strip().lower()
+                if t.get("is_person") or dim in _person_dims:
+                    person_tags.add(name)
+            cached = {
+                "zh_to_en": zh_to_en,
+                "en_to_zh": en_to_zh,
+                "tag_lookup": tag_lookup,
+                "id_lookup": id_lookup,
+                "person_tags": person_tags,
+            }
+            with self._xmp_ctx_lock:
+                self._xmp_ctx_cache = cached
+        zh_to_en = cached["zh_to_en"]
+        en_to_zh = cached["en_to_zh"]
+        tag_lookup = cached["tag_lookup"]
+        id_lookup = cached["id_lookup"]
+        person_tags = cached["person_tags"]
         
         # 确定目标语言 (V6.0)
         target_lang = global_settings.get("language", "zh-CN")
@@ -4399,7 +4739,7 @@ class VideoOrganizerService:
             except Exception as e:
                 self.log(f"生成 XMP 失败 {video_path}: {e}")
                 
-        self.log(f"元数据同步完成，生成了 {success_count} 个 XMP 文件。")
+        self.log(f"元数据同步完成，生成了 {success_count} 个 XMP 文件。", ui=False)
         return success_count
 
     def plan_physical_migration(
@@ -4499,8 +4839,7 @@ class VideoOrganizerService:
             except Exception as e:
                 self.log(f"迁移过程出错 {filename}: {e}")
 
-        with self._cache_lock:
-            self._memory_cache = {}
+        self.invalidate_video_memory_cache()
         self.log(f"物理整理完成，成功迁移: {success_count}")
         return success_count
 

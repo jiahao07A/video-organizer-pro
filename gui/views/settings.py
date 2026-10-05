@@ -102,8 +102,41 @@ class SettingsView(QWidget):
         proc_form = QFormLayout(proc_group)
         
         self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(1, 16)
-        self.workers_spin.setValue(SettingsManager.get_setting(self.settings, "processing.max_workers", 4))
+        self.workers_spin.setRange(1, 32)
+        self.workers_spin.setValue(
+            int(SettingsManager.get_setting(self.settings, "processing.max_workers", 16) or 16)
+        )
+        self.workers_spin.setToolTip(
+            "分析管线并发（等 AI 的任务数）。过大不会加快抽帧，反而卡死整机。建议 8～16，硬顶 32。"
+        )
+
+        self.extract_parallel_spin = QSpinBox()
+        self.extract_parallel_spin.setRange(1, 16)
+        self.extract_parallel_spin.setValue(
+            int(
+                SettingsManager.get_setting(
+                    self.settings, "processing.extract_parallel", 4
+                )
+                or 4
+            )
+        )
+        self.extract_parallel_spin.setToolTip(
+            "同时 OpenCV 解码抽帧的路数。4K 素材建议 2～4；过大必导致整机/GUI 卡死。"
+        )
+
+        self.extract_workers_spin = QSpinBox()
+        self.extract_workers_spin.setRange(1, 32)
+        self.extract_workers_spin.setValue(
+            int(
+                SettingsManager.get_setting(
+                    self.settings, "processing.extract_workers", 8
+                )
+                or 8
+            )
+        )
+        self.extract_workers_spin.setToolTip(
+            "工作范围入库时缩略图抽帧并发。建议 4～8。"
+        )
         
         self.frames_spin = QSpinBox()
         self.frames_spin.setRange(1, 50)
@@ -119,9 +152,9 @@ class SettingsView(QWidget):
         self.audio_cb = QCheckBox("启用音频转录 (Whisper)")
         self.audio_cb.setChecked(SettingsManager.get_setting(self.settings, "processing.enable_audio_transcription", False))
 
-        self.auto_xmp_cb = QCheckBox("分析成功后自动同步 XMP 侧车（默认关闭）")
+        self.auto_xmp_cb = QCheckBox("分析成功后自动同步 XMP 侧车（大批量建议关闭）")
         self.auto_xmp_cb.setToolTip(
-            "关闭时：仅分析落库，不在磁盘写 .xmp；可用工作台「同步元数据」手动生成。"
+            "开启后每成功一条就写 .xmp，大批量分析会显著拖慢并加重卡顿。建议关，分析完再手动同步。"
         )
         self.auto_xmp_cb.setChecked(
             bool(SettingsManager.get_setting(
@@ -129,7 +162,9 @@ class SettingsView(QWidget):
             ))
         )
         
-        proc_form.addRow("并发处理线程:", self.workers_spin)
+        proc_form.addRow("分析管线并发:", self.workers_spin)
+        proc_form.addRow("同时抽帧路数:", self.extract_parallel_spin)
+        proc_form.addRow("入库抽帧并发:", self.extract_workers_spin)
         proc_form.addRow("AI 分析抽帧数:", self.frames_spin)
         proc_form.addRow("JPEG 压缩质量:", self.quality_spin)
         proc_form.addRow(self.scene_detect_cb)
@@ -806,6 +841,12 @@ class SettingsView(QWidget):
         
         # Processing
         SettingsManager.update_setting(self.settings, "processing.max_workers", self.workers_spin.value())
+        SettingsManager.update_setting(
+            self.settings, "processing.extract_parallel", self.extract_parallel_spin.value()
+        )
+        SettingsManager.update_setting(
+            self.settings, "processing.extract_workers", self.extract_workers_spin.value()
+        )
         SettingsManager.update_setting(self.settings, "processing.max_frames", self.frames_spin.value())
         SettingsManager.update_setting(self.settings, "processing.jpeg_quality", self.quality_spin.value())
         SettingsManager.update_setting(self.settings, "processing.enable_scene_detection", self.scene_detect_cb.isChecked())

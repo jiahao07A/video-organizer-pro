@@ -223,6 +223,8 @@ def test_cancel_skips_batch_rerun(service: VideoOrganizerService, tmp_path: Path
 def test_xmp_fail_still_success(service: VideoOrganizerService, tmp_path: Path, monkeypatch):
     v = _touch(tmp_path / "x.mp4")
     service.db.upsert_video({"path": v, "filename": "x.mp4", "status": "pending", "tags": []})
+    # 默认分析后不写 XMP；本测需开启自动同步才能走到失败计数
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = True
 
     def ok(path, force_reanalyze=False, progress_reducer=None, retry_cfg=None):
         return {

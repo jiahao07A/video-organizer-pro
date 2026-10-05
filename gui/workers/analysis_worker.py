@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, Qt
 from core.video_organizer_service import VideoOrganizerService
+import time
 
 
 def analysis_task_succeeded(result) -> bool:
@@ -28,7 +29,7 @@ def analysis_task_succeeded(result) -> bool:
 
 
 class AnalysisWorker(QThread):
-    """异步分析 Worker"""
+    """异步分析 Worker（进度/日志向 GUI 节流，避免大批量卡死主线程）。"""
     progress_updated = Signal(int, str)  # 兼容：总进度百分比 + 文案
     snapshot_updated = Signal(dict)  # 结构化进度快照
     task_finished = Signal(bool, str)
@@ -39,6 +40,12 @@ class AnalysisWorker(QThread):
         self.input_path = input_path
         self.force_reanalyze = force_reanalyze
         self._cancel_requested = False
+        self._last_log_emit = 0.0
+        self._last_snapshot_emit = 0.0
+        self._log_interval = 0.3
+        self._snapshot_interval = 0.3
+        self._pending_log = ""
+        self._pending_snap = None
 
     def request_cancel(self):
         self._cancel_requested = True
@@ -48,7 +55,13 @@ class AnalysisWorker(QThread):
             pass
 
     def handle_log(self, msg):
-        self.progress_updated.emit(-1, msg)
+        # 节流：高频「正在处理」日志合并，防止 QueuedConnection 淹没 GUI 事件循环
+        now = time.monotonic()
+        self._pending_log = msg or ""
+        if (now - self._last_log_emit) < self._log_interval:
+            return
+        self._last_log_emit = now
+        self.progress_updated.emit(-1, self._pending_log)
 
     def handle_progress(self, current, total):
         # 有结构化 snapshot 时由 handle_snapshot 驱动 UI，避免双通道抖动
@@ -64,6 +77,18 @@ class AnalysisWorker(QThread):
         if not isinstance(snap, dict):
             return
         self._saw_snapshot = True
+        # 永远不向 GUI 传递上千行临时态
+        snap = dict(snap)
+        snap["rows"] = {}
+        now = time.monotonic()
+        self._pending_snap = snap
+        force = bool(snap.get("cancelled")) or (
+            int(snap.get("overall_done") or 0) >= int(snap.get("overall_total") or 0)
+            and int(snap.get("overall_total") or 0) > 0
+        )
+        if not force and (now - self._last_snapshot_emit) < self._snapshot_interval:
+            return
+        self._last_snapshot_emit = now
         self.snapshot_updated.emit(snap)
         op = int(snap.get("overall_percent") or 0)
         msg = snap.get("message") or ""
@@ -79,6 +104,11 @@ class AnalysisWorker(QThread):
             result = self.service.run_analysis(
                 self.input_path, force_reanalyze=self.force_reanalyze
             )
+            # 冲刷节流中的最后一条日志/快照
+            if self._pending_log:
+                self.progress_updated.emit(-1, self._pending_log)
+            if self._pending_snap:
+                self.snapshot_updated.emit(self._pending_snap)
             if isinstance(result, dict):
                 msg = result.get("message") or "分析任务已完成"
                 ok = analysis_task_succeeded(result)

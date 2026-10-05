@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import time
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QLabel, QSplitter, QStackedWidget, QTableView, QListView,
@@ -863,12 +864,25 @@ class WorkstationView(QWidget):
         """消费结构化分析进度快照（总/子进度 + 行临时态）。"""
         if not isinstance(snap, dict):
             return
+        now = time.monotonic()
+        last = getattr(self, "_last_snap_ui_mono", 0.0)
+        force = bool(snap.get("cancelled"))
+        overall = int(snap.get("overall_percent") or 0)
+        sub = int(snap.get("sub_percent") or 0)
         msg = snap.get("message") or ""
+        if not force and (now - last) < 0.2:
+            # 轻量更新进度条，跳过整表 status 刷新
+            self.progress_bar.setVisible(True)
+            self.sub_progress_bar.setVisible(True)
+            self.progress_bar.setValue(overall)
+            self.sub_progress_bar.setValue(sub)
+            if msg:
+                self.status_label.setText(msg)
+            return
+        self._last_snap_ui_mono = now
         if msg:
             self.status_label.setText(msg)
             self.status_message.emit(msg)
-        overall = int(snap.get("overall_percent") or 0)
-        sub = int(snap.get("sub_percent") or 0)
         self.progress_bar.setVisible(True)
         self.sub_progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
@@ -1186,8 +1200,12 @@ class WorkstationView(QWidget):
         self.status_label.setText(message)
         if hasattr(self.model, "clear_temp_status_map"):
             self.model.clear_temp_status_map()
-        # 部分成功时库内已有更新，失败也要刷新列表状态
+        # 强制丢弃 L1 缓存并从 DB 重载，避免分析中零散写入导致 status 仍显示 failed
         if "模拟" not in (message or ""):
+            try:
+                self.service.invalidate_video_memory_cache()
+            except Exception:
+                pass
             self.load_data()
         if success:
             QMessageBox.information(self, "任务完成", message)

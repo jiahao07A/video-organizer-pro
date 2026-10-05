@@ -282,13 +282,17 @@ class StatusDelegate(QStyledItemDelegate):
             "待分析": ("#FFA500", "#FFF7E6"),
             "pending": ("#FFA500", "#FFF7E6"),
             "分析中": ("#1890FF", "#E6F7FF"),
+            "重试": ("#1890FF", "#E6F7FF"),
             "已完成": ("#52C41A", "#F6FFED"),
             "analyzed": ("#52C41A", "#F6FFED"),
+            "成功": ("#52C41A", "#F6FFED"),
             "failed": ("#F5222D", "#FFF1F0"),
+            "失败": ("#F5222D", "#FFF1F0"),
             "error": ("#F5222D", "#FFF1F0"),
             "edited": ("#722ED1", "#F9F0FF"),
             "xmp": ("#EB2F96", "#FFF0F6"),
             "renamed": ("#13C2C2", "#E6FFFB"),
+            "已取消": ("#8C8C8C", "#F5F5F5"),
         }
 
         border_color, bg_color = ("#8C8C8C", "#F5F5F5")

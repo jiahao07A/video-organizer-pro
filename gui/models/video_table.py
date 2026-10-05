@@ -36,12 +36,54 @@ class VideoTableModel(QAbstractTableModel):
         self.temp_status_by_path = {}
 
     def set_temp_status_map(self, mapping: dict):
-        """更新分析行临时态并刷新状态列。"""
-        self.temp_status_by_path = dict(mapping or {})
-        if self.rowCount() > 0:
+        """更新分析行临时态并刷新状态列（映射未变则不 emit，减轻大批量重绘）。"""
+        new_map = dict(mapping or {})
+        if new_map == self.temp_status_by_path:
+            return
+        old = self.temp_status_by_path
+        self.temp_status_by_path = new_map
+        n = self.rowCount()
+        if n <= 0:
+            return
+        # 小变更时只刷新受影响行；大变更/清空时整列刷新
+        changed_paths = set(old.keys()) ^ set(new_map.keys())
+        for p in set(old.keys()) & set(new_map.keys()):
+            if old.get(p) != new_map.get(p):
+                changed_paths.add(p)
+        if len(changed_paths) > 40 or not changed_paths:
             tl = self.index(0, COL_STATUS)
-            br = self.index(self.rowCount() - 1, COL_STATUS)
+            br = self.index(n - 1, COL_STATUS)
             self.dataChanged.emit(tl, br, [Qt.DisplayRole])
+            return
+        # 按 path 找行
+        path_to_row = {}
+        for i, v in enumerate(self.videos):
+            p = v.get("path") or ""
+            if p:
+                path_to_row[p] = i
+                try:
+                    from core.video_organizer_service import normalize_work_path
+                    path_to_row[normalize_work_path(p)] = i
+                except Exception:
+                    pass
+        rows = set()
+        for p in changed_paths:
+            if p in path_to_row:
+                rows.add(path_to_row[p])
+            # 兼容大小写/斜杠差异：遍历匹配成本高，退化整列
+            if len(rows) == 0 and len(changed_paths) <= 8:
+                for i, v in enumerate(self.videos):
+                    vp = v.get("path") or ""
+                    if vp == p or vp.replace("\\", "/").lower() == str(p).replace("\\", "/").lower():
+                        rows.add(i)
+        if not rows:
+            tl = self.index(0, COL_STATUS)
+            br = self.index(n - 1, COL_STATUS)
+            self.dataChanged.emit(tl, br, [Qt.DisplayRole])
+            return
+        for r in rows:
+            idx = self.index(r, COL_STATUS)
+            self.dataChanged.emit(idx, idx, [Qt.DisplayRole])
 
     def clear_temp_status_map(self):
         self.set_temp_status_map({})
