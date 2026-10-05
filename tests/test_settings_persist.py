@@ -8,6 +8,7 @@ from core.video_organizer_service import (
     DEFAULT_SETTINGS,
     SettingsManager,
     get_settings_file_path,
+    get_tag_config_file_path,
 )
 
 
@@ -46,6 +47,26 @@ def test_save_and_load_api_settings(tmp_path: Path, monkeypatch):
     assert loaded["api"]["model_personalization"]["tag_generation"] == "my-tag-model"
     # 默认值未被污染
     assert DEFAULT_SETTINGS["api"]["key"] == ""
+
+
+def test_frozen_tag_config_path_is_next_to_executable(tmp_path: Path, monkeypatch):
+    import core.video_organizer_service as service_module
+
+    executable = tmp_path / "VideoOrganizer.exe"
+    monkeypatch.setattr(service_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(service_module.sys, "executable", str(executable))
+
+    assert get_tag_config_file_path() == str(tmp_path / "tag_config.json")
+
+
+def test_development_tag_config_path_uses_project_root(tmp_path: Path, monkeypatch):
+    import core.video_organizer_service as service_module
+
+    monkeypatch.setattr(service_module, "_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.delattr(service_module.sys, "frozen", raising=False)
+    monkeypatch.delattr(service_module.sys, "_MEIPASS", raising=False)
+
+    assert get_tag_config_file_path() == str(tmp_path / "tag_config.json")
 
 
 def test_reload_ai_client_uses_new_key(tmp_path: Path):

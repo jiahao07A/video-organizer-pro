@@ -69,6 +69,14 @@ def get_settings_file_path() -> str:
     return os.path.join(_PROJECT_ROOT, "settings.json")
 
 
+def get_tag_config_file_path() -> str:
+    """可写标签配置路径；打包后放在可执行文件旁，避免改动 PyInstaller 资源目录。"""
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath(".")
+        return os.path.join(base, "tag_config.json")
+    return os.path.join(_PROJECT_ROOT, "tag_config.json")
+
+
 SETTINGS_FILE = get_settings_file_path()
 RESULTS_FILE_JSON = "video_analysis_results.json"
 RESULTS_FILE_CSV = "video_analysis_results.csv"
@@ -77,7 +85,7 @@ THUMBNAILS_DIR = ".thumbnails"
 DB_FILE = "video_organizer.db"
 ENV_FILE = get_resource_path(".env")
 DICTIONARY_FILE = os.path.join(_PROJECT_ROOT, "词.txt")
-TAG_CONFIG_FILE = os.path.join(_PROJECT_ROOT, "tag_config.json")
+TAG_CONFIG_FILE = get_tag_config_file_path()
 
 DEFAULT_SETTINGS = {
     "api": {

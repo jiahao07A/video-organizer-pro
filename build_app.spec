@@ -14,10 +14,9 @@ def get_all_bundle_data(package_name):
 # 收集列表
 packages = ['PySide6', 'cv2', 'openai', 'imagehash', 'scenedetect', 'qt_material']
 all_datas = [
-    ('.env', '.'),
+    # 只打包非用户配置资源。严禁收集 .env、settings.json 或 tag_config.json：
+    # 它们可能含密钥、个人设置和用户词表；应用默认值由代码提供，写入配置放在 EXE 旁。
     ('词.txt', '.'),
-    ('settings.json', '.'),
-    ('tag_config.json', '.'),
 ]
 all_binaries = []
 all_hiddenimports = ['sqlite3', 'PIL.Image', 'PySide6.QtXml']
