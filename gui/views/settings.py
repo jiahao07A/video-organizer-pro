@@ -25,8 +25,16 @@ from core.model_providers import (
     resolve_task_route,
 )
 
+from gui.models.settings_catalog import (
+    AUTOSAVE,
+    list_categories,
+    search_entries,
+)
+from gui.services.settings_controller import SettingsController
+
+
 class SettingsView(QWidget):
-    """设置视图 - 全面重构的高级设置系统"""
+    """设置视图 - 可搜索目录 + 按用户任务分类导航的高级设置系统"""
     settings_applied = Signal()
 
     def __init__(self, service: VideoOrganizerService, parent=None):
@@ -35,6 +43,17 @@ class SettingsView(QWidget):
         self.settings = service.settings
         self._provider_ui_ready = False
         self._suppress_provider_signals = False
+        # 普通界面偏好：防抖自动保存并显示状态
+        self.prefs_controller = SettingsController(service, parent=self)
+        self.prefs_controller.pending.connect(
+            lambda: self._set_save_status("界面偏好有改动，正在保存…")
+        )
+        self.prefs_controller.saved.connect(self._set_save_status)
+        self.prefs_controller.save_failed.connect(
+            lambda msg: self._set_save_status(f"界面偏好保存失败：{msg}", error=True)
+        )
+        self._search_widget_map = {}
+        self._entry_status_labels = {}
         self.setup_ui()
 
     def setup_ui(self):
@@ -45,6 +64,9 @@ class SettingsView(QWidget):
         title = QLabel("系统设置")
         title.setStyleSheet("font-size: 22px; font-weight: bold; color: #ce9178;")
         layout.addWidget(title)
+
+        # 可搜索设置目录：按用户任务分类导航
+        layout.addWidget(self._build_search_bar())
         
         self.tabs = QTabWidget()
         self.tabs.setObjectName("settings_tabs")
@@ -63,11 +85,18 @@ class SettingsView(QWidget):
         
         # 5. 导出模板 (V6.0 MEGA UPDATE)
         self.tabs.addTab(self.create_export_tab(), "导出模板")
+
+        # 所有页签建立后，为普通界面偏好绑定防抖自动保存
+        self.register_autosave_widgets()
         
         layout.addWidget(self.tabs)
         
         # 底部按钮
         btn_layout = QHBoxLayout()
+
+        self.save_status_label = QLabel("")
+        self.save_status_label.setObjectName("settings_save_status")
+        btn_layout.addWidget(self.save_status_label)
         
         self.save_btn = QPushButton("保存所有设置")
         self.save_btn.setObjectName("primary_button")
@@ -84,6 +113,323 @@ class SettingsView(QWidget):
         btn_layout.addStretch()
         btn_layout.addWidget(self.save_btn)
         layout.addLayout(btn_layout)
+
+    # —— 可搜索设置目录 ——
+
+    def _build_search_bar(self) -> QWidget:
+        box = QGroupBox("设置目录")
+        outer = QVBoxLayout(box)
+        outer.setSpacing(8)
+
+        row = QHBoxLayout()
+        self.settings_search_input = QLineEdit()
+        self.settings_search_input.setPlaceholderText("搜索设置，例如「主题」「API Key」「重命名」…")
+        self.settings_search_input.setClearButtonEnabled(True)
+        self.settings_search_input.textChanged.connect(self._on_settings_search)
+        row.addWidget(self.settings_search_input, 1)
+        outer.addLayout(row)
+
+        cat_row = QHBoxLayout()
+        cat_row.setSpacing(6)
+        cat_row.addWidget(QLabel("分类:"))
+        for cat in list_categories():
+            btn = QPushButton(cat.title)
+            btn.setToolTip(cat.description)
+            btn.clicked.connect(
+                lambda _checked=False, cid=cat.id: self._on_category_jump(cid)
+            )
+            cat_row.addWidget(btn)
+        cat_row.addStretch()
+        outer.addLayout(cat_row)
+
+        self.settings_search_results = QListWidget()
+        self.settings_search_results.setObjectName("settings_search_results")
+        self.settings_search_results.setMaximumHeight(140)
+        self.settings_search_results.itemActivated.connect(self._on_search_result_activated)
+        self.settings_search_results.itemClicked.connect(self._on_search_result_activated)
+        self.settings_search_results.hide()
+        outer.addWidget(self.settings_search_results)
+        return box
+
+    def _on_settings_search(self, text: str) -> None:
+        query = (text or "").strip()
+        if not query:
+            self.settings_search_results.hide()
+            self.settings_search_results.clear()
+            return
+        matches = search_entries(query)
+        self.settings_search_results.clear()
+        if not matches:
+            item = QListWidgetItem("未找到匹配设置")
+            item.setFlags(Qt.NoItemFlags)
+            self.settings_search_results.addItem(item)
+        else:
+            for m in matches[:40]:
+                item = QListWidgetItem(
+                    f"[{m.category.title}] {m.entry.label}"
+                    f"    — {m.entry.effect}"
+                )
+                item.setData(Qt.UserRole, m.entry.widget_key)
+                self.settings_search_results.addItem(item)
+        self.settings_search_results.show()
+
+    def _on_search_result_activated(self, item: QListWidgetItem) -> None:
+        widget_key = item.data(Qt.UserRole)
+        if widget_key:
+            self.focus_setting(widget_key)
+
+    def _on_category_jump(self, category_id: str) -> None:
+        matches = [m for m in search_entries("") if m.category.id == category_id]
+        if not matches:
+            return
+        first = matches[0]
+        self.tabs.setCurrentIndex(first.entry.tab_index)
+        self.focus_setting(first.entry.widget_key)
+
+    def register_setting_widget(self, widget_key: str, widget) -> None:
+        """登记设置控件，供搜索定位与内联保存状态展示。"""
+        if widget is None:
+            return
+        self._search_widget_map[widget_key] = widget
+        if hasattr(widget, "setProperty"):
+            widget.setProperty("settings_widget_key", widget_key)
+        if hasattr(widget, "setToolTip"):
+            from gui.models.settings_catalog import get_entry_by_widget
+
+            entry = get_entry_by_widget(widget_key)
+            if entry is not None:
+                widget.setToolTip(entry.effect)
+
+    def _accumulate_ancestors(self, widget, seen, visited) -> None:
+        node = widget
+        while node is not None and id(node) not in visited:
+            visited.add(id(node))
+            seen.append(node)
+            node = node.parentWidget()
+
+    def _accumulate_descendants(self, widget, seen, visited) -> None:
+        stack = [widget]
+        while stack:
+            node = stack.pop()
+            if node is None or id(node) in visited:
+                continue
+            visited.add(id(node))
+            seen.append(node)
+            children = getattr(node, "children", None)
+            if callable(children):
+                stack.extend(
+                    [c for c in children() if isinstance(c, QWidget)]
+                )
+
+    def _bind_setting_target(self, widget, target) -> None:
+        """给注册的持久化控件绑定变更信号，使其防抖自动保存。
+
+        兼容复合控件：容器（如缩略图尺寸的 QHBoxLayout 包装）会向上找到
+        所属页签容器、向下收集内部控件，避免因信号判断过严而漏绑。
+        """
+        seen = []
+        visited = set()
+
+        target_widget = self._as_widget(target)
+        if target_widget is None:
+            return
+        self._accumulate_ancestors(target_widget, seen, visited)
+        # 布局本身不是 QWidget，向下收集要基于其父容器；
+        # 用独立 visited2 避免根节点被祖先遍历占用而跳过子树。
+        self._accumulate_descendants(target_widget, seen, set())
+        for node in seen:
+            node.installEventFilter(self)
+            self._connect_autosave_signals(node)
+
+    @staticmethod
+    def _as_widget(obj):
+        """把布局或控件统一解析成 QWidget。"""
+        if isinstance(obj, QWidget):
+            return obj
+        parent = getattr(obj, "parentWidget", None)
+        if callable(parent):
+            return parent()
+        parent = getattr(obj, "parent", None)
+        if callable(parent):
+            resolved = parent()
+            if isinstance(resolved, QWidget):
+                return resolved
+        return None
+
+    def _connect_autosave_signals(self, widget) -> None:
+        if getattr(widget, "_settings_autosave_bound", False):
+            return
+        bound = False
+        if isinstance(widget, QLineEdit):
+            widget.textChanged.connect(self._on_pref_changed)
+            bound = True
+        elif isinstance(widget, QSpinBox):
+            widget.valueChanged.connect(self._on_pref_changed)
+            bound = True
+        elif isinstance(widget, QCheckBox):
+            widget.toggled.connect(self._on_pref_changed)
+            bound = True
+        elif isinstance(widget, QComboBox):
+            widget.currentIndexChanged.connect(self._on_pref_changed)
+            bound = True
+        elif isinstance(widget, QPlainTextEdit):
+            widget.textChanged.connect(self._on_pref_changed)
+            bound = True
+        elif isinstance(widget, QListWidget):
+            widget.currentRowChanged.connect(self._on_pref_changed)
+            bound = True
+        if bound:
+            widget._settings_autosave_bound = True
+
+    def register_autosave_widgets(self) -> None:
+        """为「普通界面偏好」控件登记并绑定防抖自动保存。"""
+        for entry in search_entries(""):
+            if entry.entry.save_mode != AUTOSAVE:
+                continue
+            widget = self._search_widget_map.get(entry.entry.widget_key)
+            if widget is not None:
+                self._bind_setting_target(widget, widget)
+
+    def focus_setting(self, widget_key: str) -> bool:
+        """跳到并高亮某个设置项。返回是否找到。"""
+        widget = self._search_widget_map.get(widget_key)
+        if widget is None:
+            return False
+        from gui.models.settings_catalog import get_entry_by_widget
+
+        entry = get_entry_by_widget(widget_key)
+        if entry is not None:
+            self.tabs.setCurrentIndex(entry.tab_index)
+        parent = widget.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                parent.ensureWidgetVisible(widget)
+                break
+            parent = parent.parentWidget()
+        widget.setFocus(Qt.OtherFocusReason)
+        widgets = [widget] + self._collect_child_widgets(widget)
+        for node in widgets:
+            if node.property("settings_highlight"):
+                node.setProperty("settings_highlight", False)
+                node.style().unpolish(node)
+                node.style().polish(node)
+        for node in widgets:
+            if hasattr(node, "setProperty"):
+                node.setProperty("settings_highlight", True)
+                node.style().unpolish(node)
+                node.style().polish(node)
+        return True
+
+    def _collect_child_widgets(self, widget) -> list:
+        found = []
+        stack = [widget]
+        while stack:
+            node = stack.pop()
+            children = getattr(node, "children", None)
+            if callable(children):
+                for child in children():
+                    if isinstance(child, QWidget):
+                        found.append(child)
+                        stack.append(child)
+        return found
+
+    def _on_pref_changed(self, *_args) -> None:
+        self.prefs_controller.schedule_save(self._collect_autosave_prefs)
+
+    def _collect_autosave_prefs(self) -> None:
+        """把普通界面偏好控件当前值同步进 settings（内存）。
+
+        只覆盖 AUTOSAVE 条目；不写入任何敏感/路由/导出键。
+        """
+        from gui.models.settings_catalog import AUTOSAVE, search_entries
+
+        for match in search_entries(""):
+            entry = match.entry
+            if entry.save_mode != AUTOSAVE:
+                continue
+            widget = self._search_widget_map.get(entry.widget_key)
+            if widget is None:
+                continue
+            value = self._read_widget_value(entry.widget_key, widget)
+            if value is None:
+                continue
+            SettingsManager.update_setting(self.settings, entry.key, value)
+
+    def _read_widget_value(self, widget_key: str, widget):
+        try:
+            if widget_key == "thumbnail_size":
+                w = getattr(self, "thumb_w_spin", None)
+                h = getattr(self, "thumb_h_spin", None)
+                if w is None or h is None:
+                    return None
+                return [int(w.value()), int(h.value())]
+            if isinstance(widget, QSpinBox):
+                return int(widget.value())
+            if isinstance(widget, QCheckBox):
+                return bool(widget.isChecked())
+            if isinstance(widget, QComboBox):
+                return widget.currentData() or widget.currentText()
+            if isinstance(widget, QLineEdit):
+                return widget.text()
+            if isinstance(widget, QPlainTextEdit):
+                return widget.toPlainText()
+        except Exception:
+            return None
+        return None
+
+    def _set_save_status(self, text: str, error: bool = False) -> None:
+        if not hasattr(self, "save_status_label"):
+            return
+        self.save_status_label.setText(text)
+        color = "#f48771" if error else "#89d185"
+        self.save_status_label.setStyleSheet(
+            f"color: {color}; font-size: 12px;"
+        )
+
+    def _on_rename_changed(self) -> None:
+        """重命名模式的唯一真实入口：同步到导出页签控件。"""
+        if hasattr(self, "filename_tmpl") and hasattr(self, "pattern_input"):
+            if self.filename_tmpl.text() != self.pattern_input.text():
+                self.filename_tmpl.setText(self.pattern_input.text())
+        self.prefs_controller.schedule_save(
+            lambda: SettingsManager.update_setting(
+                self.settings, "rename_pattern", self.pattern_input.text().strip()
+            )
+        )
+
+    def eventFilter(self, obj, event):
+        if event.type() in (
+            event.Type.FocusIn,
+            event.Type.MouseButtonPress,
+            event.Type.Enter,
+        ):
+            widget_key = None
+            if hasattr(obj, "property"):
+                widget_key = obj.property("settings_widget_key")
+            if not widget_key and hasattr(obj, "objectName"):
+                widget_key = obj.objectName()
+            entry = None
+            if widget_key:
+                from gui.models.settings_catalog import get_entry_by_widget
+
+                entry = get_entry_by_widget(widget_key)
+            if entry is not None:
+                if event.type() == event.Type.FocusIn:
+                    self._set_save_status(f"{entry.label}：{entry.effect}")
+                self._highlight_catalog_entry(entry.widget_key)
+        return super().eventFilter(obj, event)
+
+    def _highlight_catalog_entry(self, widget_key: str) -> None:
+        results = getattr(self, "settings_search_results", None)
+        if results is None or not results.isVisible():
+            return
+        for row in range(results.count()):
+            item = results.item(row)
+            if item.data(Qt.UserRole) == widget_key:
+                results.setCurrentItem(item)
+                break
+
+    # —— 页签 ——
 
     def create_general_tab(self):
         tab = QWidget()
@@ -208,12 +554,13 @@ class SettingsView(QWidget):
         retry_form.addRow(self.batch_rerun_cb)
         form.addRow(retry_group)
         
-        # 重命名规则
+        # 自动重命名规则：重命名模式的唯一真实入口（导出页签仅同步展示）
         rename_group = QGroupBox("自动重命名规则")
         rename_form = QFormLayout(rename_group)
         
         self.pattern_input = QLineEdit(SettingsManager.get_setting(self.settings, "rename_pattern", ""))
         self.pattern_input.setPlaceholderText("{category}-{tags}-{summary}-{original_name}")
+        self.pattern_input.textChanged.connect(self._on_rename_changed)
         
         rename_form.addRow("命名模式:", self.pattern_input)
         rename_form.addRow(QLabel("可用变量: {category}, {tags}, {summary}, {original_name}"))
@@ -221,6 +568,21 @@ class SettingsView(QWidget):
         
         scroll.setWidget(container)
         layout.addWidget(scroll)
+
+        if hasattr(self, "thumb_w_spin"):
+            self.register_setting_widget("thumbnail_size", self.thumb_w_spin)
+        self.register_setting_widget("workers", self.workers_spin)
+        self.register_setting_widget("extract_parallel", self.extract_parallel_spin)
+        self.register_setting_widget("extract_workers", self.extract_workers_spin)
+        self.register_setting_widget("frames", self.frames_spin)
+        self.register_setting_widget("quality", self.quality_spin)
+        self.register_setting_widget("scene_detect", self.scene_detect_cb)
+        self.register_setting_widget("audio", self.audio_cb)
+        self.register_setting_widget("auto_xmp", self.auto_xmp_cb)
+        self.register_setting_widget("call_extra", self.call_extra_spin)
+        self.register_setting_widget("item_max", self.item_max_spin)
+        self.register_setting_widget("batch_rerun", self.batch_rerun_cb)
+        self.register_setting_widget("rename_pattern", self.pattern_input)
         return tab
 
     def create_ai_tab(self):
@@ -229,19 +591,21 @@ class SettingsView(QWidget):
 
         ensure_providers(self.settings)
 
-        # —— 供应商列表 ——
-        list_group = QGroupBox("模型供应商（最多 5 个）")
-        list_layout = QVBoxLayout(list_group)
-
+        # 敏感配置：保留明确保存区提示
         hint = QLabel(
+            "以上均为敏感配置，修改后需点底部「保存所有设置」才会落盘并重建 AI 客户端。"
             "供应商档案只保存显示名、API Key、Base URL（最多 5 个）。"
             "「当前供应商」是未单独配置任务时的默认回退。"
             "下方「任务模型路由」可为每个 AI 功能跨供应商选模型。"
-            "编辑后点「保存所有设置」落盘；进行中的分析本轮不中断。"
+            "进行中的分析本轮不中断。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 12px;")
-        list_layout.addWidget(hint)
+        layout.addWidget(hint)
+
+        # —— 供应商列表 ——
+        list_group = QGroupBox("模型供应商（最多 5 个）")
+        list_layout = QVBoxLayout(list_group)
 
         row = QHBoxLayout()
         self.provider_list = QListWidget()
@@ -330,6 +694,9 @@ class SettingsView(QWidget):
         self._provider_ui_ready = True
         self._refresh_provider_list(select_id=self.settings.get("current_provider_id"))
         self._load_task_routes_ui()
+        self.register_setting_widget("api_key", self.api_key_input)
+        self.register_setting_widget("api_url", self.api_url_input)
+        self.register_setting_widget("provider_list", self.provider_list)
         return tab
 
     def _load_task_routes_ui(self) -> None:
@@ -351,6 +718,8 @@ class SettingsView(QWidget):
             combo.setCurrentIndex(idx if idx >= 0 else 0)
             widgets["model"].setText(str(slot.get("model") or ""))
             combo.blockSignals(False)
+            if key == TASK_ROUTE_KEYS[0]:
+                self.register_setting_widget("task_routing", combo)
 
     def _flush_task_routes_to_settings(self) -> None:
         if not getattr(self, "_route_widgets", None):
@@ -493,6 +862,7 @@ class SettingsView(QWidget):
                 pass
             if hasattr(self.service, "reload_ai_from_settings"):
                 self.service.reload_ai_from_settings()
+            self._set_save_status("已切换当前供应商并保存")
         except ProviderError as e:
             QMessageBox.warning(self, "无法切换", str(e))
 
@@ -556,6 +926,8 @@ class SettingsView(QWidget):
             "<br>① 分析全局角色头 ② 各标签组 local_prompt ③ 标签库 AI 三模板"
             "（待审 / 近义 / 标准词助手）。冷启动模板本轮隐藏。"
             "<br><span style='color:#888;'>旧版 prompts.* 三键已废弃，不再参与分析。</span>"
+            "<br><span style='color:#888;'>修改后需点底部「保存所有设置」才会写入；"
+            "「刷新预览」只展示当前输入，不会写盘。</span>"
         )
         hint.setWordWrap(True)
         hint.setTextFormat(Qt.RichText)
@@ -656,28 +1028,22 @@ class SettingsView(QWidget):
 
         scroll.setWidget(container)
         layout.addWidget(scroll)
+        # 展示当前已保存配置；预览不写入 local_prompt
         self.refresh_prompt_preview()
+        self.register_setting_widget("system_prompt", self.system_prompt_edit)
         return tab
 
     def refresh_prompt_preview(self):
-        """分析完整预览 + 标签库 AI 模板摘要。"""
+        """分析完整预览 + 标签库 AI 模板摘要。
+
+        只读取当前输入用于展示，**不会**把 local_prompt 写回内存或磁盘，
+        避免「刷新预览」意外持久化未保存的编辑。
+        """
         if not hasattr(self, "prompt_preview_edit"):
             return
         header = ""
         if hasattr(self, "system_prompt_edit"):
             header = self.system_prompt_edit.toPlainText()
-        # 预览前把 local 写回内存 tag_config（不强制落盘）
-        if getattr(self, "_local_prompt_edits", None):
-            for gid, edit in self._local_prompt_edits.items():
-                text = edit.toPlainText()
-                for g in (self.service.tag_config or {}).get("tag_groups") or []:
-                    if str(g.get("id") or "").strip() == gid:
-                        rules = g.setdefault("rules", {})
-                        if not isinstance(rules, dict):
-                            rules = {}
-                            g["rules"] = rules
-                        rules["local_prompt"] = text
-                        break
         try:
             if hasattr(self.service, "preview_analysis_prompts"):
                 prompts = self.service.preview_analysis_prompts(header)
@@ -715,6 +1081,11 @@ class SettingsView(QWidget):
         layout = QFormLayout(container)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(15)
+
+        hint = QLabel("以下为普通界面偏好，修改后会自动保存，无需点「保存所有设置」。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 12px;")
+        layout.addRow(hint)
         
         self.font_spin = QSpinBox()
         self.font_spin.setRange(10, 30)
@@ -770,6 +1141,14 @@ class SettingsView(QWidget):
         
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
+
+        self.register_setting_widget("font_size", self.font_spin)
+        self.register_setting_widget("thumbnail_size", thumb_layout)
+        self.register_setting_widget("theme", self.theme_combo)
+        self.register_setting_widget("default_view", self.default_view_combo)
+        self.register_setting_widget("sidebar_width", self.sidebar_spin)
+        self.register_setting_widget("detail_panel_expanded", self.detail_expanded_cb)
+        self.register_setting_widget("remember_work_scope", self.remember_scope_cb)
         return tab
 
     def create_export_tab(self):
@@ -784,19 +1163,24 @@ class SettingsView(QWidget):
         form = QFormLayout(container)
         form.setSpacing(15)
         
-        # 1. 重命名模板
+        # 1. 重命名模板（镜像常规页签的唯一入口；编辑请到「常规」）
         rename_group = QGroupBox("文件名模板")
         rename_form = QFormLayout(rename_group)
         
         self.filename_tmpl = QLineEdit()
         pattern = SettingsManager.get_setting(self.settings, "rename_pattern", "{category}-{tags}-{summary}-{original_name}")
         self.filename_tmpl.setText(pattern)
+        self.filename_tmpl.setReadOnly(True)
+        self.filename_tmpl.setToolTip("重命名模式在「常规 → 自动重命名规则」中编辑，这里仅同步展示。")
         
         vars_hint = QLabel("变量: {date}, {category}, {tags}, {summary}, {original_name}")
         vars_hint.setStyleSheet("color: #888; font-size: 11px;")
+        mirror_hint = QLabel("编辑入口：常规 → 自动重命名规则（此处仅同步展示实际保存值）。")
+        mirror_hint.setStyleSheet("color: #888; font-size: 11px;")
         
         rename_form.addRow("模式:", self.filename_tmpl)
         rename_form.addRow("", vars_hint)
+        rename_form.addRow("", mirror_hint)
         form.addRow(rename_group)
         
         # 2. XMP 导出设置
@@ -829,10 +1213,16 @@ class SettingsView(QWidget):
         
         scroll.setWidget(container)
         layout.addWidget(scroll)
+
+        self.register_setting_widget("rename_pattern", self.filename_tmpl)
+        self.register_setting_widget("xmp_lang", self.xmp_lang_combo)
+        self.register_setting_widget("xmp_hierarchical", self.xmp_hierarchical_cb)
+        self.register_setting_widget("xmp_prefix_category", self.xmp_prefix_cat_cb)
+        self.register_setting_widget("ale_columns", self.ale_columns_edit)
         return tab
 
     def apply_settings(self):
-        """同步 UI 数据到 settings 字典并保存"""
+        """同步 UI 数据到 settings 字典并保存（敏感配置的明确保存区）"""
         # 模型供应商：表单 → 档案 → 任务路由 → 写穿扁平 api
         if self._provider_ui_ready:
             self._flush_provider_form_to_settings()
@@ -895,7 +1285,7 @@ class SettingsView(QWidget):
                 if hasattr(self.service, "set_tag_ai_prompt"):
                     self.service.set_tag_ai_prompt(key, edit.toPlainText())
         
-        # UI & Others
+        # UI & Others（普通偏好此处兜底，防抖自动保存已覆盖）
         SettingsManager.update_setting(self.settings, "ui_preferences.font_size", self.font_spin.value())
         SettingsManager.update_setting(self.settings, "ui_preferences.thumbnail_size", [self.thumb_w_spin.value(), self.thumb_h_spin.value()])
         if hasattr(self, "theme_combo"):
@@ -922,8 +1312,9 @@ class SettingsView(QWidget):
             if self.remember_scope_cb.isChecked():
                 self.service.persist_work_scope_if_enabled()
         
-        # V6.0 Export Templates
-        SettingsManager.update_setting(self.settings, "rename_pattern", self.filename_tmpl.text().strip())
+        # V6.0 Export Templates：重命名模式以「常规」页签入口为准
+        if hasattr(self, "pattern_input"):
+            SettingsManager.update_setting(self.settings, "rename_pattern", self.pattern_input.text().strip())
         SettingsManager.update_setting(self.settings, "global_settings.language", self.xmp_lang_combo.currentText())
         SettingsManager.update_setting(self.settings, "global_settings.export_schemes.xmp_hierarchical", self.xmp_hierarchical_cb.isChecked())
         SettingsManager.update_setting(self.settings, "global_settings.export_schemes.xmp_prefix_category", self.xmp_prefix_cat_cb.isChecked())
@@ -941,9 +1332,11 @@ class SettingsView(QWidget):
             if self._provider_ui_ready:
                 self._refresh_provider_list(select_id=self._selected_provider_id())
                 self._load_task_routes_ui()
+            self._set_save_status("所有设置已保存并已应用")
             QMessageBox.information(self, "成功", "设置已保存并已应用到 AI 引擎，界面偏好将尽量立即生效。")
             self.settings_applied.emit()
         except Exception as e:
+            self._set_save_status(f"保存失败：{e}", error=True)
             QMessageBox.critical(self, "错误", f"保存设置失败: {e}")
 
     def reset_to_defaults(self):
@@ -966,9 +1359,12 @@ class SettingsView(QWidget):
                 if w:
                     w.deleteLater()
             self._provider_ui_ready = False
+            self._search_widget_map = {}
             self.tabs.addTab(self.create_general_tab(), "常规")
             self.tabs.addTab(self.create_ai_tab(), "AI 引擎")
             self.tabs.addTab(self.create_prompts_tab(), "Prompt 模板")
             self.tabs.addTab(self.create_interface_tab(), "界面")
             self.tabs.addTab(self.create_export_tab(), "导出模板")
+            self.register_autosave_widgets()
+            self.register_setting_widget("rename_pattern", self.pattern_input)
             QMessageBox.information(self, "已重置", "设置已重置为默认值，请点击「保存所有设置」以写入磁盘。")

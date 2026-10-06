@@ -24,6 +24,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Set, Union, Any, Callable
 from openai import OpenAI
+from core.video_catalog import VideoCatalog, VideoQuery
 
 # 资源路径处理函数
 def get_resource_path(relative_path):
@@ -326,6 +327,12 @@ class DatabaseManager:
                         value TEXT
                     )
                 """)
+                # List pages must be able to order and narrow large libraries
+                # without scanning an unindexed timestamp column.
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_timestamp_id ON videos(timestamp DESC, id DESC)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_status_timestamp ON videos(status, timestamp DESC, id DESC)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_category_timestamp ON videos(category, timestamp DESC, id DESC)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)")
                 conn.commit()
 
     def execute_query(self, query: str, params: tuple = ()) -> List[Dict]:
@@ -423,6 +430,46 @@ class DatabaseManager:
             return None
         return self._row_to_video_dict(rows[0])
 
+    @staticmethod
+    def _normalized_lookup_path(path: str) -> str:
+        return os.path.normcase(os.path.abspath(str(path))).replace("\\", "/").lower()
+
+    def get_video_statuses_by_paths(self, paths: List[str]) -> List[Dict]:
+        """只读取分析目标所需的 path/status 列，避免分析前加载全库。"""
+        values = [str(path) for path in paths or [] if path]
+        rows: List[Dict] = []
+        for start in range(0, len(values), 400):
+            chunk = values[start:start + 400]
+            placeholders = ", ".join("?" for _ in chunk)
+            normalized = [self._normalized_lookup_path(path) for path in chunk]
+            rows.extend(
+                self.execute_query(
+                    f"SELECT path, status FROM videos "
+                    f"WHERE path IN ({placeholders}) OR "
+                    f"lower(replace(path, char(92), '/')) IN ({placeholders})",
+                    tuple(chunk) + tuple(normalized),
+                )
+            )
+        return rows
+
+    def get_videos_by_paths(self, paths: List[str]) -> List[Dict]:
+        """按路径批量读取完整视频记录，不扫描无关素材。"""
+        values = [str(path) for path in paths or [] if path]
+        rows = []
+        for start in range(0, len(values), 400):
+            chunk = values[start:start + 400]
+            placeholders = ", ".join("?" for _ in chunk)
+            normalized = [self._normalized_lookup_path(path) for path in chunk]
+            rows.extend(
+                self.execute_query(
+                    f"SELECT * FROM videos "
+                    f"WHERE path IN ({placeholders}) OR "
+                    f"lower(replace(path, char(92), '/')) IN ({placeholders})",
+                    tuple(chunk) + tuple(normalized),
+                )
+            )
+        return [self._row_to_video_dict(row) for row in rows]
+
     def _row_to_video_dict(self, row) -> Dict:
         d = dict(row)
         try:
@@ -457,15 +504,87 @@ class DatabaseManager:
         return d
 
     def insert_video_if_absent(self, video_data: Dict) -> bool:
-        """仅当路径尚不在库时插入；已存在则不改写任何字段（含分析结果）。"""
-        path = video_data.get("path")
-        if not path:
-            return False
-        rows = self.execute_query("SELECT 1 FROM videos WHERE path = ? LIMIT 1", (path,))
-        if rows:
-            return False
-        self.upsert_video(video_data)
-        return True
+        """仅当路径尚不在库时插入；已存在则不改写任何字段。"""
+        return bool(self.insert_videos_if_absent([video_data]))
+
+    def insert_videos_if_absent(self, video_data: List[Dict]) -> List[Dict]:
+        """批量登记新视频，并按输入顺序返回实际新插入的记录。
+
+        扫盘可能一次发现数万条文件。将逐条 ``SELECT`` + ``INSERT``
+        合并为一次锁定、一次事务，避免每条记录都创建连接和提交事务。
+        """
+        records = []
+        seen = set()
+        for row in video_data or []:
+            path = row.get("path") if isinstance(row, dict) else None
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            records.append(row)
+        if not records:
+            return []
+
+        paths = [row["path"] for row in records]
+        existing = set()
+        query = """
+            SELECT path FROM videos WHERE path IN ({})
+        """
+        insert_query = """
+            INSERT INTO videos (
+                path, filename, file_hash, phash, category, summary, tags,
+                transcription, status, thumbnail, manual_override, metadata_injected,
+                raw_metadata, emotion, composition, rating, quality_score,
+                is_proxy_needed, proxy_path, face_clusters, vector_id, tag_groups, tag_weights
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO NOTHING
+        """
+
+        def params(row: Dict):
+            tags = row.get("tags", [])
+            metadata = row.get("raw_metadata", {})
+            tag_groups = row.get("tag_groups", {})
+            return (
+                row.get("path"),
+                row.get("filename"),
+                row.get("file_hash"),
+                row.get("phash"),
+                row.get("category"),
+                row.get("summary"),
+                json.dumps(tags, ensure_ascii=False) if isinstance(tags, list) else tags,
+                row.get("transcription"),
+                row.get("status"),
+                row.get("thumbnail_path") or row.get("thumbnail"),
+                1 if row.get("manual_override") else 0,
+                1 if row.get("metadata_injected") else 0,
+                json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else metadata,
+                None,
+                None,
+                0,
+                None,
+                0,
+                row.get("proxy_path"),
+                json.dumps(row.get("face_clusters", []), ensure_ascii=False),
+                row.get("vector_id"),
+                json.dumps(tag_groups, ensure_ascii=False) if isinstance(tag_groups, dict) else tag_groups,
+                json.dumps({}, ensure_ascii=False),
+            )
+
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # SQLite defaults to a 999-variable limit on many installs;
+                # keep existence checks below that limit.
+                for start in range(0, len(paths), 500):
+                    chunk = paths[start:start + 500]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    cursor.execute(query.format(placeholders), tuple(chunk))
+                    existing.update(row[0] for row in cursor.fetchall())
+                new_records = [row for row in records if row["path"] not in existing]
+                if new_records:
+                    cursor.executemany(insert_query, [params(row) for row in new_records])
+                    conn.commit()
+                return new_records
 
     def get_all_videos(self) -> List[Dict]:
         rows = self.execute_query("SELECT * FROM videos ORDER BY timestamp DESC")
@@ -2006,6 +2125,7 @@ class VideoOrganizerService:
         results_csv: Optional[str] = None,
     ):
         self.db = DatabaseManager(db_path) if db_path else DatabaseManager()
+        self.catalog = VideoCatalog(self.db)
         self.settings = settings or SettingsManager.load_settings(self.db)
         self.tag_config = self.load_tag_config()
         self.on_log = on_log or (lambda m: print(m))
@@ -2268,7 +2388,7 @@ class VideoOrganizerService:
         if not self._work_scope_paths:
             return registered
 
-        to_thumb: List[Dict] = []
+        candidates: List[Dict] = []
         for scope_path in self._work_scope_paths:
             try:
                 found = self.file_manager.scan_videos(scope_path)
@@ -2277,18 +2397,20 @@ class VideoOrganizerService:
                 continue
             for video_path in found:
                 abs_path = os.path.abspath(video_path)
-                record = {
-                    "path": abs_path,
-                    "filename": os.path.basename(abs_path),
-                    "status": "pending",
-                    "tags": [],
-                    "category": None,
-                    "summary": None,
-                    "tag_groups": {},
-                }
-                if self.db.insert_video_if_absent(record):
-                    registered.append(abs_path)
-                    to_thumb.append(dict(record))
+                candidates.append(
+                    {
+                        "path": abs_path,
+                        "filename": os.path.basename(abs_path),
+                        "status": "pending",
+                        "tags": [],
+                        "category": None,
+                        "summary": None,
+                        "tag_groups": {},
+                    }
+                )
+
+        to_thumb = self.db.insert_videos_if_absent(candidates)
+        registered = [row["path"] for row in to_thumb]
 
         if to_thumb:
             extract_workers = int(
@@ -2335,6 +2457,81 @@ class VideoOrganizerService:
             self.invalidate_video_memory_cache()
             self.log(f"工作范围扫盘：新登记 {len(registered)} 个未分析视频。")
         return registered
+
+    def query_video_page(
+        self,
+        filter_params: Optional[Dict[str, Any]] = None,
+        *,
+        scope_paths: Optional[List[str]] = None,
+        offset: int = 0,
+        limit: int = 100,
+        order_by: str = "timestamp",
+        descending: bool = True,
+    ):
+        """Query a bounded list page without loading full video records."""
+        query = VideoQuery.from_filter_params(
+            filter_params,
+            scope_paths=scope_paths,
+            excluded_paths=(
+                list(getattr(self, "_work_scope_exclusions", set()) or set())
+                if scope_paths is not None else []
+            ),
+            order_by=order_by,
+            descending=descending,
+        )
+        return self.catalog.list_page(query, offset=offset, limit=limit)
+
+    def count_videos_for_query(
+        self,
+        filter_params: Optional[Dict[str, Any]] = None,
+        *,
+        scope_paths: Optional[List[str]] = None,
+        order_by: str = "timestamp",
+        descending: bool = True,
+    ) -> int:
+        """Count all rows matching a list query, independent of pagination."""
+        query = VideoQuery.from_filter_params(
+            filter_params,
+            scope_paths=scope_paths,
+            excluded_paths=(
+                list(getattr(self, "_work_scope_exclusions", set()) or set())
+                if scope_paths is not None else []
+            ),
+            order_by=order_by,
+            descending=descending,
+        )
+        return self.catalog.count(query)
+
+    def resolve_visible_video_paths(
+        self,
+        filter_params: Optional[Dict[str, Any]] = None,
+        *,
+        scope_paths: Optional[List[str]] = None,
+        order_by: str = "timestamp",
+        descending: bool = True,
+    ) -> List[str]:
+        """Resolve every visible path for operation targets, not only loaded rows."""
+        query = VideoQuery.from_filter_params(
+            filter_params,
+            scope_paths=scope_paths,
+            excluded_paths=(
+                list(getattr(self, "_work_scope_exclusions", set()) or set())
+                if scope_paths is not None else []
+            ),
+            order_by=order_by,
+            descending=descending,
+        )
+        return self.catalog.resolve_visible_paths(query)
+
+    def get_work_scope_video_paths(self) -> List[str]:
+        """Resolve work-scope paths with a narrow SQL projection."""
+        if not self._work_scope_paths:
+            return []
+        return self.resolve_visible_video_paths({}, scope_paths=list(self._work_scope_paths))
+
+    def get_video_detail(self, path: str) -> Optional[Dict[str, Any]]:
+        """Load a complete video row only when a detail view needs it."""
+        return self.catalog.get_detail(path)
 
     def get_videos_in_work_scope(self) -> List[Dict]:
         """已入库且属于当前工作范围的视频；空范围返回空列表。"""
@@ -3714,7 +3911,8 @@ class VideoOrganizerService:
             return empty
 
         all_videos = [os.path.abspath(p) for p in all_videos if p]
-        status_map = build_path_status_map(self.db.get_all_videos())
+        status_rows = self.db.get_video_statuses_by_paths(all_videos)
+        status_map = build_path_status_map(status_rows)
         status_map_norm: Dict[str, str] = {}
         for k, v in status_map.items():
             try:
@@ -4411,10 +4609,11 @@ class VideoOrganizerService:
 
     def export_to_fcpx_xml(self, output_path: str, selected_paths: Optional[List[str]] = None):
         """导出 FCPX XML；selected_paths 限定导出集合（None 表示调用方已筛好则应显式传入）。"""
-        videos = self.db.get_all_videos()
-        if selected_paths is not None:
-            allow = {normalize_work_path(p) for p in selected_paths}
-            videos = [v for v in videos if normalize_work_path(v.get("path", "")) in allow]
+        videos = (
+            self.db.get_all_videos()
+            if selected_paths is None
+            else self.db.get_videos_by_paths(selected_paths)
+        )
         xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
 <fcpxml version="1.8">
@@ -4448,13 +4647,11 @@ class VideoOrganizerService:
         ALE 是一种通用的、基于制表符分隔的格式，达芬奇对其支持非常出色。
         selected_paths 语义与 FCPX 一致：None=不按路径裁剪；[]=空集合；列表=规范化路径筛选。
         """
-        videos = self.db.get_all_videos()
-        if selected_paths is not None:
-            allow = {normalize_work_path(p) for p in selected_paths if p}
-            videos = [
-                v for v in videos
-                if normalize_work_path(v.get("path", "")) in allow
-            ]
+        videos = (
+            self.db.get_all_videos()
+            if selected_paths is None
+            else self.db.get_videos_by_paths(selected_paths)
+        )
             
         if not videos:
             self.log("没有可导出的视频数据。")
@@ -4507,32 +4704,11 @@ class VideoOrganizerService:
 
         video_rows: 可选，直接传入已有视频字典列表，避免 get_all_videos 全表扫描。
         """
-        from core.analysis_targets import path_status_key
 
         if video_rows is not None:
             videos = list(video_rows)
         elif selected_paths is not None:
-            allow = {path_status_key(p) for p in selected_paths if p}
-            # 小批量按路径取单条，避免全库加载
-            if 0 < len(allow) <= 32:
-                videos = []
-                for p in selected_paths:
-                    if not p:
-                        continue
-                    row = self.db.get_video_by_path(p)
-                    if not row:
-                        try:
-                            row = self.db.get_video_by_path(os.path.abspath(p))
-                        except Exception:
-                            row = None
-                    if row:
-                        videos.append(row)
-            else:
-                videos = self.db.get_all_videos()
-                videos = [
-                    v for v in videos
-                    if path_status_key(v.get("path", "")) in allow
-                ]
+            videos = self.db.get_videos_by_paths(selected_paths)
         else:
             videos = self.db.get_all_videos()
             
@@ -4758,13 +4934,11 @@ class VideoOrganizerService:
         """
         物理整理模拟预览：返回 [{old_path, new_path, category, filename}, ...]，不改磁盘。
         """
-        videos = self.db.get_all_videos()
-        if selected_paths is not None:
-            allow = {normalize_work_path(p) for p in selected_paths if p}
-            videos = [
-                v for v in videos
-                if normalize_work_path(v.get("path", "")) in allow
-            ]
+        videos = (
+            self.db.get_all_videos()
+            if selected_paths is None
+            else self.db.get_videos_by_paths(selected_paths)
+        )
 
         plan: List[Dict[str, str]] = []
         used_dest: set = set()

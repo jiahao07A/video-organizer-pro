@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QLabel, QSplitter, QStackedWidget, QTableView, QListView,
     QHeaderView, QAbstractItemView, QMessageBox,
 )
-from PySide6.QtCore import Qt, Signal, QEvent, QObject
+from PySide6.QtCore import Qt, Signal, QEvent, QObject, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from ..widgets.filter_panel import FilterPanel
 from ..widgets.detail_panel import DetailPanel
@@ -22,6 +22,7 @@ from ..models.video_table import (
 from ..models.proxy_model import AdvancedSortFilterProxyModel
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from gui.styles import normalize_theme
+from ..workers.catalog_worker import run_catalog_query
 
 
 class _ClearSelectionOnEmptyClickFilter(QObject):
@@ -50,8 +51,20 @@ class MaterialLibraryView(QWidget):
         super().__init__(parent)
         self.service = service
         self.settings = service.settings
+        self._query_generation = 0
+        self._page_offset = 0
+        self._page_total = 0
+        self._page_limit = 100
+        self._page_loading = False
+        self._order_by = "timestamp"
+        self._descending = True
+        self._filter_params = {}
+        self._query_debounce = QTimer(self)
+        self._query_debounce.setSingleShot(True)
+        self._query_debounce.setInterval(180)
+        self._query_debounce.timeout.connect(self._load_query_page)
+        self._query_pending = False
         self.setup_ui()
-        self.apply_default_view()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -107,7 +120,12 @@ class MaterialLibraryView(QWidget):
         self.proxy_model.setFilterKeyColumn(-1)
         self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.table_view.setModel(self.proxy_model)
-        self.table_view.setSortingEnabled(True)
+        # Ordering is performed by the SQL catalog, not by sorting only the
+        # currently loaded page in QSortFilterProxyModel.
+        self.table_view.setSortingEnabled(False)
+        self._order_by = "timestamp"
+        self._descending = True
+
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table_view.setAlternatingRowColors(True)
@@ -129,6 +147,7 @@ class MaterialLibraryView(QWidget):
         self.proxy_model.rowsInserted.connect(lambda *_: self._refresh_list_numbers())
         self.proxy_model.rowsRemoved.connect(lambda *_: self._refresh_list_numbers())
         header.sortIndicatorChanged.connect(lambda *_: self._refresh_list_numbers())
+        self.table_view.verticalScrollBar().valueChanged.connect(self._maybe_fetch_more)
         self.view_stack.addWidget(self.table_view)
 
         self.card_view = QListView()
@@ -141,6 +160,9 @@ class MaterialLibraryView(QWidget):
         self.card_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.card_view.setItemDelegate(CardDelegate(self.card_view))
         self.card_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        self.card_view.verticalScrollBar().valueChanged.connect(
+            lambda value: self._maybe_fetch_more(value, self.card_view)
+        )
         self.view_stack.addWidget(self.card_view)
 
         self._wire_selection_ux(self.table_view)
@@ -206,12 +228,89 @@ class MaterialLibraryView(QWidget):
             self.view_switch_btn.setText("切换视图")
 
     def filter_text_changed(self, text):
-        self.proxy_model.set_filter_params({"text": text})
-        self._refresh_list_numbers()
+        self._filter_params = dict(self._filter_params)
+        self._filter_params["text"] = text
+        self.proxy_model.set_filter_params({})
+        self._schedule_query_reload()
 
     def apply_advanced_filter(self, params):
-        self.proxy_model.set_filter_params(params)
-        self._refresh_list_numbers()
+        self._filter_params = dict(params or {})
+        self._filter_params["text"] = self.search_input.text()
+        self.proxy_model.set_filter_params({})
+        self._schedule_query_reload()
+
+    def _schedule_query_reload(self):
+        self._query_pending = True
+        self._query_debounce.start()
+
+    def _query_scope_paths(self):
+        # Material library is deliberately not bounded by work scope.
+        return None
+
+    def _query_params(self):
+        return dict(self._filter_params)
+
+    def _load_query_page(self, *, reset=True):
+        if not self._query_pending and reset:
+            return
+        self._query_pending = False
+        if reset:
+            self._query_generation += 1
+            generation = self._query_generation
+            offset = 0
+            self._page_offset = 0
+            self._page_total = 0
+        else:
+            generation = self._query_generation
+            offset = self._page_offset
+        params = self._query_params()
+        scope = self._query_scope_paths()
+        self._page_loading = True
+        if reset:
+            self.status_label.setText("正在查询素材库…")
+
+        def on_ok(page):
+            if generation != self._query_generation:
+                return
+            self._page_loading = False
+            if reset:
+                self.model.update_data(page.rows)
+            else:
+                self.model.append_data(page.rows)
+            self._page_offset = page.offset + len(page.rows)
+            self._page_total = page.total_count
+            self._refresh_list_numbers()
+            self.status_label.setText(f"素材库共 {page.total_count} 条，已加载 {self._page_offset} 条")
+            self.status_message.emit(self.status_label.text())
+
+        def on_fail(message):
+            if generation != self._query_generation:
+                return
+            self._page_loading = False
+            self.status_label.setText(f"查询失败：{message}")
+            self.status_message.emit(self.status_label.text())
+
+        run_catalog_query(
+            self,
+            fn=lambda: self.service.query_video_page(
+                params,
+                scope_paths=scope,
+                offset=offset,
+                limit=self._page_limit,
+                order_by=self._order_by,
+                descending=self._descending,
+            ),
+            on_ok=on_ok,
+            on_fail=on_fail,
+        )
+
+    def _maybe_fetch_more(self, value, view=None):
+        view = view or self.table_view
+        bar = view.verticalScrollBar()
+        if self._page_loading or self._page_offset >= self._page_total:
+            return
+        if value >= max(0, bar.maximum() - 12):
+            self._load_query_page(reset=False)
 
     def _refresh_list_numbers(self):
         """按当前可见顺序刷新列表序号；防重入，避免卡死 UI。"""
@@ -249,11 +348,9 @@ class MaterialLibraryView(QWidget):
             self._list_no_refreshing = False
 
     def load_data(self):
-        videos = self.service.get_all_videos()
-        self.model.update_data(videos)
-        self._refresh_list_numbers()
-        self.status_label.setText(f"素材库共 {len(videos)} 条")
-        self.status_message.emit(self.status_label.text())
+        self._query_pending = True
+        self._load_query_page(reset=True)
+
 
     def _get_selected_paths(self) -> list:
         if self.view_stack.currentWidget() == self.card_view:
@@ -272,19 +369,17 @@ class MaterialLibraryView(QWidget):
                 paths.append(p)
         return paths
 
+    def _current_filter_params(self) -> dict:
+        params = dict(self._filter_params or {})
+        params["text"] = self.search_input.text()
+        return params
+
     def _get_visible_paths(self) -> list:
-        paths = []
-        for visual in range(self.proxy_model.rowCount()):
-            src = self.proxy_model.mapToSource(self.proxy_model.index(visual, 0)).row()
-            if not (0 <= src < len(self.model.videos)):
-                continue
-            p = self.model.videos[src].get("path")
-            if p:
-                paths.append(p)
-        return paths
+        """Resolve the full filtered result, not only rows loaded in the view."""
+        return self.service.resolve_visible_video_paths(self._current_filter_params(), scope_paths=None)
 
     def _resolve_batch_targets(self) -> list:
-        """素材库操作目标：有选中用选中，无选中用可见；无工作范围约束。"""
+        """素材库操作目标：有选中用选中，无选中用完整可见结果。"""
         return self.service.resolve_operation_target_paths(
             self._get_selected_paths() or None,
             self._get_visible_paths(),

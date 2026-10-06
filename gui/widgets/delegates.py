@@ -334,6 +334,7 @@ class TagChipDelegate(QStyledItemDelegate):
         # 数据获取
         name = index.data(Qt.DisplayRole)
         usage_count = index.data(Qt.UserRole + 4) # TagListModel.USAGE_ROLE
+        aliases = index.data(Qt.UserRole + 10) or []  # TagListModel.ALIASES_ROLE
         is_selected = option.state & QStyle.State_Selected
         is_hover = option.state & QStyle.State_MouseOver
 
@@ -363,6 +364,9 @@ class TagChipDelegate(QStyledItemDelegate):
         display_text = name
         if usage_count is not None and usage_count > 0:
             display_text = f"{name} ({usage_count})"
+        if aliases:
+            joined = "、".join(str(a) for a in aliases)
+            display_text = f"{display_text}  ⟵ {joined}"
         
         text_rect = rect.adjusted(self.padding, 0, -self.padding, 0)
         if is_hover:
@@ -386,9 +390,12 @@ class TagChipDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
         name = index.data(Qt.DisplayRole) or ""
         usage_count = index.data(Qt.UserRole + 4)
+        aliases = index.data(Qt.UserRole + 10) or []
         display_text = name
         if usage_count is not None and usage_count > 0:
             display_text = f"{name} ({usage_count})"
+        if aliases:
+            display_text = f"{display_text}  ⟵ {'、'.join(str(a) for a in aliases)}"
         
         font_metrics = option.fontMetrics
         text_width = font_metrics.horizontalAdvance(display_text)

@@ -131,43 +131,75 @@ class MainWindow(QMainWindow):
 
         self.content_stack = QStackedWidget()
         self.content_stack.setContentsMargins(0, 0, 0, 0)
-        
-        self.workstation_page = WorkstationView(self.service)
-        self.library_page = MaterialLibraryView(self.service)
-        self.tags_page = TagsView(self.service)
-        self.settings_page = SettingsView(self.service)
-        
-        self.settings_page.settings_applied.connect(self.on_settings_applied)
-        self.library_page.work_scope_changed.connect(self.workstation_page.load_data)
-        
-        self.content_stack.addWidget(self.workstation_page)
-        self.content_stack.addWidget(self.library_page)
-        self.content_stack.addWidget(self.tags_page)
-        self.content_stack.addWidget(self.settings_page)
-        
+        self._page_placeholders = []
+        self.workstation_page = None
+        self.library_page = None
+        self.tags_page = None
+        self.settings_page = None
+        for _ in range(4):
+            placeholder = QWidget()
+            self._page_placeholders.append(placeholder)
+            self.content_stack.addWidget(placeholder)
         self.main_layout.addWidget(self.content_stack)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("准备就绪")
-        
+
         self.global_progress = QProgressBar()
         self.global_progress.setMaximumWidth(200)
         self.global_progress.setVisible(False)
         self.status_bar.addPermanentWidget(self.global_progress)
 
-        self.workstation_page.status_message.connect(self.status_bar.showMessage)
-        self.workstation_page.progress_updated.connect(self.update_global_progress)
-        self.library_page.status_message.connect(self.status_bar.showMessage)
-
+        # 只创建默认页；其余页面在首次进入时创建并缓存。
+        self._ensure_page(0)
         self.workstation_page.load_data()
-        self.workstation_page.apply_default_view()
-        self.library_page.apply_default_view()
         expanded = SettingsManager.get_setting(
             self.settings, "ui_preferences.detail_panel_expanded", True
         )
         self.workstation_page.detail_panel.setVisible(bool(expanded))
-        self.library_page.detail_panel.setVisible(bool(expanded))
+
+    def _ensure_page(self, index: int):
+        """首次进入时创建页面，并保留页面实例供后续切换复用。"""
+        attrs = ("workstation_page", "library_page", "tags_page", "settings_page")
+        if index < 0 or index >= len(attrs):
+            return None
+        attr = attrs[index]
+        page = getattr(self, attr, None)
+        if page is not None:
+            return page
+
+        factories = (WorkstationView, MaterialLibraryView, TagsView, SettingsView)
+        page = factories[index](self.service)
+        placeholder = self._page_placeholders[index]
+        self.content_stack.removeWidget(placeholder)
+        self.content_stack.insertWidget(index, page)
+        self._page_placeholders[index] = None
+        if placeholder is not None:
+            placeholder.deleteLater()
+        setattr(self, attr, page)
+
+        if index == 0:
+            page.status_message.connect(self.status_bar.showMessage)
+            page.progress_updated.connect(self.update_global_progress)
+        elif index == 1:
+            page.status_message.connect(self.status_bar.showMessage)
+            page.work_scope_changed.connect(self.workstation_page.load_data)
+        elif index == 3:
+            page.settings_applied.connect(self.on_settings_applied)
+
+        if hasattr(page, "apply_default_view"):
+            page.apply_default_view()
+        if hasattr(page, "detail_panel"):
+            expanded = SettingsManager.get_setting(
+                self.settings, "ui_preferences.detail_panel_expanded", True
+            )
+            page.detail_panel.setVisible(bool(expanded))
+        if hasattr(page, "apply_theme"):
+            page.apply_theme(normalize_theme(
+                SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
+            ))
+        return page
 
     def refresh_presets(self):
         self.preset_combo.blockSignals(True)
@@ -197,11 +229,14 @@ class MainWindow(QMainWindow):
             self.on_settings_applied()
 
     def switch_page(self, index):
-        self.content_stack.setCurrentIndex(index)
+        page = self._ensure_page(index)
+        if page is None:
+            return
+        self.content_stack.setCurrentWidget(page)
         if index == 0:
-            self.workstation_page.load_data()
+            page.load_data()
         elif index == 1:
-            self.library_page.load_data()
+            page.load_data()
 
     def update_global_progress(self, value):
         if value < 0:
