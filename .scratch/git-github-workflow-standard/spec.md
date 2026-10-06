@@ -52,8 +52,11 @@ PR: 待创建
 
 ## Comments
 
-### 2026-10-06 完成规范草案与模板
+### 2026-10-06 完成规范、模板与验证
 
 - 已先读取现有领域、ADR、Agent、Issue tracker、triage labels、`.scratch/` 议题和 Git 历史。
 - 已在独立分支 `docs/git-github-workflow-standard` 上新增规范与 GitHub 模板。
-- 待执行文档结构、链接、模板 front matter 和工作区状态检查。
+- 核心规范提交为 `e2d78cf`，GitHub 模板提交为 `98c1b6d`。
+- `git diff --check` 已通过；文档相对链接、Issue 模板 front matter 和 PR 模板结构已检查。
+- 已确认开始任务时已有的脚本、压缩包和其他未跟踪文件仍未加入本次提交。
+- 本地变更已完成；远程 GitHub Issue 和 PR 仍由维护者按本规范创建。
