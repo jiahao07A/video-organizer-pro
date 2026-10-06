@@ -52,11 +52,10 @@ PR: 待创建
 
 ## Comments
 
-### 2026-10-06 完成规范、模板与验证
+### 2026-10-06 增加简体中文优先规则
 
-- 已先读取现有领域、ADR、Agent、Issue tracker、triage labels、`.scratch/` 议题和 Git 历史。
-- 已在独立分支 `docs/git-github-workflow-standard` 上新增规范与 GitHub 模板。
-- 核心规范提交为 `e2d78cf`，GitHub 模板提交为 `98c1b6d`。
-- `git diff --check` 已通过；文档相对链接、Issue 模板 front matter 和 PR 模板结构已检查。
-- 已确认开始任务时已有的脚本、压缩包和其他未跟踪文件仍未加入本次提交。
-- 本地变更已完成；远程 GitHub Issue 和 PR 仍由维护者按本规范创建。
+- 规则适用于 GitHub Issue 标题与正文、Issue 评论、PR 标题与正文、`.scratch/` 规格记录和今后新增或大幅修改的 `docs/` 文档。
+- 简体中文是权威版本；英文仅作为可选参照。
+- GitHub 标签、Conventional Commits 字段、分支名、命令、路径、代码符号和原始错误消息保留原格式。
+- 已更新工作流正文、`AGENTS.md`、Issue/PR 模板、本地 Issue tracker 说明、`triage-labels.md` 和 `domain.md`。
+- 历史 Issue、评论、提交消息和历史文档不做追溯改写。

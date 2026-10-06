@@ -1,17 +1,17 @@
-# Domain Docs
+# 领域文档规则
 
-This repository uses a single-context documentation layout.
+本仓库使用单一上下文的文档布局。
 
-## Before exploring
+## 开始探索前
 
-Read these files when they exist:
+在开始分析代码或设计方案前，相关文件存在时必须先阅读：
 
-- `CONTEXT.md` at the repository root
-- `docs/adr/` for architectural decisions related to the area being changed
+- 项目根目录的 `CONTEXT.md`
+- `docs/adr/` 中与当前工作相关的架构决策记录
 
-If they do not exist, proceed without creating them upfront. The domain-modeling flow creates them when terminology or an important decision needs to be recorded.
+如果这些文件不存在，可以继续工作，不必预先创建。只有在术语或重要决策需要正式记录时，领域建模流程才会创建它们。
 
-## File structure
+## 目录结构
 
 ```text
 /
@@ -22,10 +22,12 @@ If they do not exist, proceed without creating them upfront. The domain-modeling
 └── src/
 ```
 
-## Use the glossary vocabulary
+## 使用术语表
 
-When naming a domain concept in an issue, proposal, or test, use the term defined in `CONTEXT.md`. If the needed term is missing or ambiguous, resolve it through domain modeling before spreading a new term.
+在 Issue、spec、PR、代码注释和其他项目文档中，必须使用 `CONTEXT.md` 已定义的领域术语。如果需要的术语缺失或含义不清，应先通过领域建模确定，再推广新术语。
 
-## Flag ADR conflicts
+本文件和后续领域文档优先使用简体中文。英文可以作为括号中的术语参照，但不能让英文版本取代中文定义。
 
-If a proposed change contradicts an existing ADR, surface that conflict explicitly instead of silently overriding the decision.
+## 标记 ADR 冲突
+
+如果提议的改动与已有 ADR 冲突，必须明确指出冲突，不能静默覆盖已有决策。应创建新的决策记录，或明确记录新决策对旧决策的取代关系。

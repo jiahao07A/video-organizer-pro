@@ -1,11 +1,13 @@
-# Triage Labels
+# Triage 标签
 
-The skills speak in terms of five canonical triage roles.
+工程技能使用以下五个规范 triage 标签表示议题当前需要什么处理：
 
-| Label in engineering skills | Label in this repo | Meaning |
-| ---------------------------- | ------------------ | ------- |
-| `needs-triage`               | `needs-triage`     | Maintainer needs to evaluate this issue |
-| `needs-info`                 | `needs-info`       | Waiting on reporter for more information |
-| `ready-for-agent`            | `ready-for-agent`  | Fully specified and ready for an agent |
-| `ready-for-human`            | `ready-for-human`  | Requires human implementation |
-| `wontfix`                    | `wontfix`          | Will not be actioned |
+| 标签 | 含义 |
+| --- | --- |
+| `needs-triage` | 新提交的议题，维护者尚未完成范围和优先级判断 |
+| `needs-info` | 等待报告者或需求方补充复现信息、产品决定或其他输入 |
+| `ready-for-agent` | 范围、约束和验收标准已经明确，可以交给代理或开发者实现 |
+| `ready-for-human` | 需要维护者或用户亲自决定、操作或实现 |
+| `wontfix` | 明确不处理；关闭前必须记录原因 |
+
+同一 GitHub Issue 同一时间只保留一个 triage 标签。可以追加项目类型、领域或优先级标签，但不能用自定义标签替代上述五个规范标签。

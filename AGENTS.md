@@ -6,7 +6,7 @@ Issues and specs for this repo are tracked as local Markdown files under `.scrat
 
 ### Git and GitHub workflow
 
-Development scope, branch isolation, commit checkpoints, Pull Request review, merge rules, GitHub Issue templates, comments, debugging, and rollback are defined in `docs/agents/git-github-workflow.md`. Read it before starting any development task.
+开发范围、分支隔离、commit 检查点、拉取请求评审、合并规则、GitHub Issue 模板、评论、调试和回滚，统一定义在 `docs/agents/git-github-workflow.md` 中。开始任何开发任务前都必须阅读该文件。面向项目的新增文档，以及 GitHub Issue、评论和 PR 内容，应优先使用简体中文；英文仅作为可选参照。
 
 ### Triage labels
 
