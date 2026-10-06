@@ -42,6 +42,7 @@ PR: 待创建
 - [x] GitHub Issue 模板要求范围、验收、风险和验证信息；
 - [x] PR 模板要求 Issue 关联、验证、风险、回滚和合并前检查；
 - [x] 没有覆盖用户已有的无关工作区文件。
+- [x] 本地文档与模板已完成，等待创建 GitHub Issue、推送分支和创建 PR 进行人工审阅。
 
 ## 相关既有规范
 
@@ -56,6 +57,16 @@ PR: 待创建
 - `docs/adr/0004-tag-normalize-hard-filter-pending.md`
 - `docs/adr/0005-analysis-retry-and-progress.md`
 - `docs/adr/0006-task-model-routing.md`
+
+## 下一步
+
+以下路径已批准作为本规范进入远程协作的下一步；执行这些操作前仍需由维护者确认远程仓库权限和 Issue 编号：
+
+- [ ] 创建 GitHub Issue，补充 Issue 编号并链接本地 spec；
+- [ ] 推送 `docs/git-github-workflow-standard` 分支；
+- [ ] 创建 Draft PR，填写中文优先的 PR 正文并链接 Issue；
+- [ ] 由维护者完成人工审阅，确认是否转为可合并 PR；
+- [ ] 合并后补充 PR 编号、合并 commit、最终验证结果和遗留风险。
 
 ## Comments
 
@@ -73,8 +84,9 @@ PR: 待创建
 - 明确 Subagent 不负责重新规划范围或决定未决策的架构方案；主 Agent 必须复核差异、验证结果并负责最终提交和 PR。
 - 已将 Subagent 规范接入 `AGENTS.md` 和 Git/GitHub 工作流入口。
 
-### 2026-10-06 根据 review 修复本地记录
+### 2026-10-06 根据 review 优化文档结构
 
-- 将本地 spec 状态从 `resolved` 调整为 `ready-for-human`，因为远程 Issue 和 PR 尚未创建，尚未满足最终关闭条件。
-- 将实际修改过的 `docs/agents/triage-labels.md` 与 `docs/agents/domain.md` 补入“范围内”清单。
-- 本次修复只更新本地工作流记录，没有修改产品代码或开始任务时已有的未跟踪文件。
+- 将 `AGENTS.md` 的全部入口说明统一为简体中文优先。
+- 将完整的 GitHub Issue、评论、分支、commit、PR、合并、调试和回滚规则保留在 `git-github-workflow.md`，`issue-tracker.md` 只保留 `.scratch/` 的本地目录、字段和追加方式。
+- 暂不在 `.github/ISSUE_TEMPLATE/config.yml` 添加 `contact_links`，避免在规范尚未合入远程 `main` 前提供可能失效的链接。
+- 下一步批准路径：创建 GitHub Issue → 推送当前分支 → 创建 Draft PR → 由维护者人工审阅。

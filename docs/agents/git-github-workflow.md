@@ -353,12 +353,11 @@ PR 模板位于 `.github/pull_request_template.md`。写“测试通过”时必
 
 ## 8. `.scratch/` 与 GitHub Issue 的衔接
 
-现有仓库使用 `.scratch/<feature-slug>/` 保存本地规格和实现议题，这一规则继续有效：
+`.scratch/` 的目录、字段、评论追加和 Wayfinding 操作，以 [`issue-tracker.md`](./issue-tracker.md) 为准。本节只规定它与 GitHub Issue、分支和 PR 的关系：
 
-```text
-.scratch/<feature-slug>/spec.md
-.scratch/<feature-slug>/issues/01-<slug>.md
-```
+- GitHub Issue：任务身份、共享范围、讨论、方案决定、PR 关联和关闭总结；
+- `.scratch/` spec：完整目标、范围内/范围外、拆分顺序、依赖、验收矩阵和交接信息；
+- `.scratch/` 子议题：一个可以独立实现和验证的执行单元。
 
 推荐在本地 spec 顶部增加：
 
@@ -368,15 +367,9 @@ PR: #456（完成后补充）
 Branch: feat/123-short-slug
 ```
 
-二者职责如下：
+两类记录必须相互链接，不能形成竞争的事实来源。如果内容不一致，先在 GitHub Issue 中记录最新决定，再同步本地 spec/议题后继续实现。Issue 关闭前，必须确认本地记录已经写入 PR、合并 commit、验证结果和遗留风险。
 
-- GitHub Issue：任务身份、共享讨论、状态变化、方案决定、PR 关联和关闭总结；
-- `.scratch/` spec：完整范围、拆分顺序、依赖、验收矩阵和代理/开发者交接细节；
-- `.scratch/` 子议题：可执行的实现单元，保留现有 `Status:` 行和 `## Comments` 追加式记录。
-
-两边出现差异时，先在 GitHub Issue 评论中确认最新决定，再立即同步本地 spec/议题；不能让实现者根据两个相互矛盾的范围继续开发。Issue 关闭前，必须确认本地记录已写入对应 PR、commit、验证和遗留风险。
-
-本地状态可以使用仓库已有的 `claimed`、`resolved` 等执行状态，但它们不替代 GitHub 的五个规范 triage 标签。`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human` 和 `wontfix` 的含义只能按 [`triage-labels.md`](./triage-labels.md) 使用。
+本地 `claimed`、`resolved` 等执行状态不能替代 GitHub 的五个规范 triage 标签。标签定义以 [`triage-labels.md`](./triage-labels.md) 为准。
 
 ## 9. 从任务到合并的标准清单
 

@@ -64,6 +64,8 @@ GitHub Issue 是共享的任务身份和协作记录；详细执行记录继续�
 
 新增的本地评论、交接说明和 `.scratch/` 规格记录，应优先使用简体中文。英文可以作为参照放在后面，但简体中文是权威版本。命令、路径、分支名、Issue 标签、commit 标识、代码符号和原始错误消息保持原格式。
 
+完整的 Issue、评论、分支、commit、PR、合并、调试和回滚规则见 [`git-github-workflow.md`](./git-github-workflow.md)；本文件只规定 `.scratch/` 本地记录的目录、字段和追加方式。
+
 ## Wayfinding 操作
 
 以下操作供 `/wayfinder` 使用：
