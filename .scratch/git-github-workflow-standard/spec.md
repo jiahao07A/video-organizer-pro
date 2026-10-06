@@ -1,6 +1,6 @@
 # Git 与 GitHub 工作流规范
 
-Status: resolved
+Status: ready-for-human
 Created: 2026-10-06
 Feature-slug: `git-github-workflow-standard`
 
@@ -17,6 +17,8 @@ PR: 待创建
 - 新增 `docs/agents/git-github-workflow.md` 作为完整规范；
 - 新增 `docs/agents/subagent-workflow.md`，规定 Subagent 的调用时机、调用前信息门槛、执行指令、分支/工作区、验证和审查责任；
 - 更新 `docs/agents/issue-tracker.md`，说明 `.scratch/` 与 GitHub Issue 的衔接；
+- 更新 `docs/agents/triage-labels.md`，将规范标签说明统一为简体中文并保留标签原文；
+- 更新 `docs/agents/domain.md`，将领域文档规则统一为简体中文并保留英文术语参照；
 - 新增 `.github/ISSUE_TEMPLATE/` 下的 Bug、Feature、Task 模板和配置；
 - 新增 `.github/pull_request_template.md`；
 - 检查新文档与 `CONTEXT.md`、`docs/adr/`、既有本地议题约定的一致性。
@@ -70,3 +72,9 @@ PR: 待创建
 - 明确功能开发、debug、fix、重构、测试和文档修改等任务，必须由主 Agent 先调查、决策并编写完整执行包，再交给 Subagent。
 - 明确 Subagent 不负责重新规划范围或决定未决策的架构方案；主 Agent 必须复核差异、验证结果并负责最终提交和 PR。
 - 已将 Subagent 规范接入 `AGENTS.md` 和 Git/GitHub 工作流入口。
+
+### 2026-10-06 根据 review 修复本地记录
+
+- 将本地 spec 状态从 `resolved` 调整为 `ready-for-human`，因为远程 Issue 和 PR 尚未创建，尚未满足最终关闭条件。
+- 将实际修改过的 `docs/agents/triage-labels.md` 与 `docs/agents/domain.md` 补入“范围内”清单。
+- 本次修复只更新本地工作流记录，没有修改产品代码或开始任务时已有的未跟踪文件。
