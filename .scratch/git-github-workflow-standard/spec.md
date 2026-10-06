@@ -15,6 +15,7 @@ PR: 待创建
 ## 范围内
 
 - 新增 `docs/agents/git-github-workflow.md` 作为完整规范；
+- 新增 `docs/agents/subagent-workflow.md`，规定 Subagent 的调用时机、调用前信息门槛、执行指令、分支/工作区、验证和审查责任；
 - 更新 `docs/agents/issue-tracker.md`，说明 `.scratch/` 与 GitHub Issue 的衔接；
 - 新增 `.github/ISSUE_TEMPLATE/` 下的 Bug、Feature、Task 模板和配置；
 - 新增 `.github/pull_request_template.md`；
@@ -33,6 +34,9 @@ PR: 待创建
 - [x] 规范明确主干禁止直接开发，所有功能通过分支和 PR；
 - [x] 规范明确 commit 检查点、消息格式、敏感信息和生成产物边界；
 - [x] 规范明确 GitHub Issue 与 `.scratch/` 的双向链接和同步责任；
+- [x] 规范明确 Subagent 的调用边界：搜索类任务可以提前委派，其他任务必须由主 Agent 先调查并制定完整执行方案；
+- [x] Subagent 规范要求执行指令具体到文件、符号、行为、步骤、验证、风险和返回格式；
+- [x] Subagent 规范明确主 Agent 对实际差异、验证、Issue/PR 记录和最终提交承担责任；
 - [x] GitHub Issue 模板要求范围、验收、风险和验证信息；
 - [x] PR 模板要求 Issue 关联、验证、风险、回滚和合并前检查；
 - [x] 没有覆盖用户已有的无关工作区文件。
@@ -41,6 +45,7 @@ PR: 待创建
 
 - `CONTEXT.md`
 - `docs/agents/issue-tracker.md`
+- `docs/agents/subagent-workflow.md`
 - `docs/agents/triage-labels.md`
 - `docs/agents/domain.md`
 - `docs/adr/0001-workbench-library-work-scope.md`
@@ -58,4 +63,10 @@ PR: 待创建
 - 简体中文是权威版本；英文仅作为可选参照。
 - GitHub 标签、Conventional Commits 字段、分支名、命令、路径、代码符号和原始错误消息保留原格式。
 - 已更新工作流正文、`AGENTS.md`、Issue/PR 模板、本地 Issue tracker 说明、`triage-labels.md` 和 `domain.md`。
-- 历史 Issue、评论、提交消息和历史文档不做追溯改写。
+### 2026-10-06 增加 Subagent 调用规范
+
+- 新增 `docs/agents/subagent-workflow.md`。
+- 明确搜索类任务是唯一可以在主 Agent 未完成完整方案前委派的例外。
+- 明确功能开发、debug、fix、重构、测试和文档修改等任务，必须由主 Agent 先调查、决策并编写完整执行包，再交给 Subagent。
+- 明确 Subagent 不负责重新规划范围或决定未决策的架构方案；主 Agent 必须复核差异、验证结果并负责最终提交和 PR。
+- 已将 Subagent 规范接入 `AGENTS.md` 和 Git/GitHub 工作流入口。

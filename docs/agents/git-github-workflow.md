@@ -8,6 +8,7 @@ Status: adopted
 - [Triage 标签](./triage-labels.md)：议题处理阶段使用的五个规范标签。
 - [项目领域词汇](../../CONTEXT.md)：产品和技术文档中必须使用的业务术语。
 - `docs/adr/`：已经接受的架构决策。新方案若改变已有决策，必须先提出新的决策记录或明确说明取代关系。
+- [Subagent 调用规范](./subagent-workflow.md)：规定调用时机、调用前的信息门槛、执行指令和主 Agent 的审查责任。
 
 ### 1.1 语言标准
 
