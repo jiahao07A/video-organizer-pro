@@ -1,6 +1,6 @@
 # Git 与 GitHub 工作流规范
 
-Status: ready-for-human
+Status: resolved
 Created: 2026-10-06
 Feature-slug: `git-github-workflow-standard`
 
@@ -19,7 +19,7 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 - 更新 `docs/agents/issue-tracker.md`，说明 `.scratch/` 与 GitHub Issue 的衔接；
 - 更新 `docs/agents/triage-labels.md`，将规范标签说明统一为简体中文并保留标签原文；
 - 更新 `docs/agents/domain.md`，将领域文档规则统一为简体中文并保留英文术语参照；
-- 新增 `.github/ISSUE_TEMPLATE/` 下的 Bug、Feature、Task 模板和配置；
+- 新增 `.github/ISSUE_TEMPLATE/` 下的 Bug、Feature、Task、Docs 模板和配置；
 - 新增 `.github/pull_request_template.md`；
 - 检查新文档与 `CONTEXT.md`、`docs/adr/`、既有本地议题约定的一致性。
 
@@ -27,8 +27,8 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 
 - 不修改产品代码、数据库、标签规则或已有 ADR；
 - 不清理工作区原有未跟踪脚本、压缩包或其他本地文件；
-- 不代替维护者创建、配置或关闭远程 GitHub Issue；
-- 不改变现有分支历史或直接合并到 `main`。
+- 不配置 GitHub 分支保护、CI 必需检查或远程凭据；
+- 不改写现有分支历史，不通过本地合并绕过文档 PR。GUI 的一次性主干集成授权与结果记录在 Issue #3，本 PR 不包含该产品代码改动。
 
 ## 验收标准
 
@@ -42,7 +42,7 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 - [x] GitHub Issue 模板要求范围、验收、风险和验证信息；
 - [x] PR 模板要求 Issue 关联、验证、风险、回滚和合并前检查；
 - [x] 没有覆盖用户已有的无关工作区文件。
-- [x] 本地文档与模板已完成，等待创建 GitHub Issue、推送分支和创建 PR 进行人工审阅。
+- [x] 本地文档与模板已完成，GitHub Issue #1 与 PR #2 已创建；本轮审阅和合并前验证完成后按维护者授权通过 GitHub 合并。
 
 ## 相关既有规范
 
@@ -60,13 +60,13 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 
 ## 下一步
 
-以下路径已批准作为本规范进入远程协作的下一步；执行这些操作前仍需由维护者确认远程仓库权限和 Issue 编号：
+原进入远程协作的步骤已执行。2026-10-07 维护者明确授权本轮复核通过后直接通过 GitHub 合并 PR #2；不修改未来默认 PR 规则：
 
 - [x] 创建 GitHub Issue，补充 Issue 编号并链接本地 spec；
 - [x] 推送 `docs/git-github-workflow-standard` 分支；
 - [x] 创建 Draft PR，填写中文优先的 PR 正文并链接 Issue；
-- [ ] 由维护者完成人工审阅，确认是否转为可合并 PR；
-- [ ] 合并后补充 PR 编号、合并 commit、最终验证结果和遗留风险。
+- [x] 按维护者本轮授权完成规范与规格终审，文档及模板可通过 GitHub 合并；
+- [x] 本地记录已提供 PR #2 与 Issue #1 的永久链接；最终合并 SHA 与关闭总结在对应远程记录中追加，避免提交内自引用尚未生成的 SHA。
 
 ## Comments
 
@@ -102,3 +102,16 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 - 将完整的 GitHub Issue、评论、分支、commit、PR、合并、调试和回滚规则保留在 `git-github-workflow.md`，`issue-tracker.md` 只保留 `.scratch/` 的本地目录、字段和追加方式。
 - 暂不在 `.github/ISSUE_TEMPLATE/config.yml` 添加 `contact_links`，避免在规范尚未合入远程 `main` 前提供可能失效的链接。
 - 下一步批准路径：创建 GitHub Issue → 推送当前分支 → 创建 Draft PR → 由维护者人工审阅。
+
+### 2026-10-07 本轮终审、验证记录与合并交接
+
+- 维护者明确要求先将 GUI 独立修复并直接集成主干，再复核 PR #2，通过后直接在 GitHub 合并。
+- GUI 已作为单一提交 `269961bb92974f6a1b6daff94147597a117c72a5` 集成到远程 `main`，验证与一次性授权见 Issue #3；此授权不改变未来默认工作流规则。
+- 文档分支以 merge 同步 `main`，冲突中的产品文件全部保留已验证主干版本，不重写共享分支历史。最终 PR 净差异只有原范围内的 13 个文档/模板/入口文件。
+- 本轮复核分别对照仓库规范与 Issue #1/spec。补齐 Bug 模板修复范围、风险回滚和验证计划，Docs 模板风险回滚，Feature 模板验证计划；同步已过时的 Issue/PR 创建状态和 Docs 模板范围。
+- 13 个文件的 YAML/front matter、四类模板字段、13 个 Markdown 相对链接、代码围栏和行尾空白检查通过。
+- 同步主干后本轮重新运行完整 `python -m pytest -q`：234 通过，130.19 秒；产品代码相对 `origin/main` 无差异。产品原始素材、数据库和个人配置未进入提交。
+- 最终审阅：规范维度与规格维度均无剩余阻断问题；没有声称取得独立 GitHub approval 或完成多人实操/分支保护/CI 配置验收。
+- 采用 GitHub squash merge：PR 历史包含已由主干单提交整合替代的旧 GUI 提交，不使用 rebase 重放旧 GUI；仅合并已审阅的文档净差异。
+- 合并结果和完整 SHA 在 [PR #2](https://github.com/jiahao07A/video-organizer-pro/pull/2) 与 [Issue #1](https://github.com/jiahao07A/video-organizer-pro/issues/1) 的关闭总结中追加。本文件状态表示文档实现与本轮验证完成；远程合并以 GitHub 记录为准。
+- 回滚：对 PR #2 的 squash commit 使用新的 revert 分支/PR；不回滚独立 GUI 提交。遗留限制：真实多人协作、分支保护和 CI 必需检查尚未配置/实操验收，不作为本轮已完成内容。
