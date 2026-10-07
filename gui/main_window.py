@@ -187,6 +187,7 @@ class MainWindow(QMainWindow):
             page.work_scope_changed.connect(self.workstation_page.load_data)
         elif index == 3:
             page.settings_applied.connect(self.on_settings_applied)
+            page.ui_preferences_applied.connect(self.apply_ui_preferences)
 
         if hasattr(page, "apply_default_view"):
             page.apply_default_view()
@@ -250,8 +251,8 @@ class MainWindow(QMainWindow):
                 self.global_progress.setValue(value)
 
     def on_settings_applied(self):
-        self.refresh_style()
-        # 确保 AI 客户端与最新 settings 一致
+        self.apply_ui_preferences()
+        # 敏感设置显式保存时才重建 AI 客户端。
         if hasattr(self.service, "reload_ai_from_settings"):
             try:
                 self.service.reload_ai_from_settings()
@@ -261,11 +262,14 @@ class MainWindow(QMainWindow):
             self.workstation_page.detail_panel.refresh_tag_completer()
         if hasattr(self.library_page, "detail_panel"):
             self.library_page.detail_panel.refresh_tag_completer()
+
+    def apply_ui_preferences(self):
+        """应用成功保存的普通偏好，不修改模型连接或未保存敏感配置。"""
+        self.refresh_style()
         if hasattr(self.workstation_page, "apply_default_view"):
             self.workstation_page.apply_default_view()
         if hasattr(self.library_page, "apply_default_view"):
             self.library_page.apply_default_view()
-        # 详情默认展开/收起
         expanded = SettingsManager.get_setting(
             self.settings, "ui_preferences.detail_panel_expanded", True
         )

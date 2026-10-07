@@ -15,6 +15,15 @@ COL_CATEGORY = 4
 COL_TAGS = 5
 COL_STATUS = 6
 
+# 表头只决定 SQL 排序；代理模型不能仅对已加载的一页重新排序。
+CATALOG_SORT_COLUMNS = {
+    COL_LIST_NO: "timestamp",
+    COL_LIBRARY_ID: "id",
+    COL_FILENAME: "filename",
+    COL_CATEGORY: "category",
+    COL_STATUS: "status",
+}
+
 # 旧 8 列方案中的「选择」列索引（仅用于偏好迁移，勿作数据列）
 LEGACY_COL_CHECK = 0
 LEGACY_COLUMN_COUNT = 8

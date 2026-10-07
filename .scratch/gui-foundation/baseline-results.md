@@ -1,6 +1,7 @@
 # GUI 基线结果
 
-日期：2026-10-05  
+日期：2026-10-05
+
 环境：Windows 10.0.26200、Intel Core Ultra 9 275HX、Python 3.13.12、PySide6 6.10.2
 
 ## 口径

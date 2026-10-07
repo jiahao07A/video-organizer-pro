@@ -12,6 +12,7 @@ from ..widgets.detail_panel import DetailPanel
 from ..widgets.delegates import CardDelegate, MaterialTagsColumnDelegate, StatusDelegate, ThumbnailDelegate
 from ..models.video_table import (
     VideoTableModel,
+    CATALOG_SORT_COLUMNS,
     COL_FILENAME,
     COL_LIBRARY_ID,
     COL_LIST_NO,
@@ -52,6 +53,7 @@ class MaterialLibraryView(QWidget):
         self.service = service
         self.settings = service.settings
         self._query_generation = 0
+        self._detail_generation = 0
         self._page_offset = 0
         self._page_total = 0
         self._page_limit = 100
@@ -146,7 +148,10 @@ class MaterialLibraryView(QWidget):
         self.proxy_model.modelReset.connect(self._refresh_list_numbers)
         self.proxy_model.rowsInserted.connect(lambda *_: self._refresh_list_numbers())
         self.proxy_model.rowsRemoved.connect(lambda *_: self._refresh_list_numbers())
-        header.sortIndicatorChanged.connect(lambda *_: self._refresh_list_numbers())
+        header.setSortIndicator(-1, Qt.DescendingOrder)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sortIndicatorChanged.connect(self._on_catalog_sort_changed)
         self.table_view.verticalScrollBar().valueChanged.connect(self._maybe_fetch_more)
         self.view_stack.addWidget(self.table_view)
 
@@ -239,6 +244,19 @@ class MaterialLibraryView(QWidget):
         self.proxy_model.set_filter_params({})
         self._schedule_query_reload()
 
+    def _on_catalog_sort_changed(self, column, order):
+        # 缩略图和标签列没有定义 SQL 排序，保留当前有效排序指示。
+        if column not in CATALOG_SORT_COLUMNS and column != -1:
+            header = self.table_view.horizontalHeader()
+            header.blockSignals(True)
+            previous = next((c for c, key in CATALOG_SORT_COLUMNS.items() if key == self._order_by), -1)
+            header.setSortIndicator(previous, Qt.DescendingOrder if self._descending else Qt.AscendingOrder)
+            header.blockSignals(False)
+            return
+        self._order_by = CATALOG_SORT_COLUMNS.get(column, "timestamp")
+        self._descending = order == Qt.DescendingOrder
+        self._schedule_query_reload()
+
     def _schedule_query_reload(self):
         self._query_pending = True
         self._query_debounce.start()
@@ -307,7 +325,7 @@ class MaterialLibraryView(QWidget):
     def _maybe_fetch_more(self, value, view=None):
         view = view or self.table_view
         bar = view.verticalScrollBar()
-        if self._page_loading or self._page_offset >= self._page_total:
+        if self._query_pending or self._page_loading or self._page_offset >= self._page_total:
             return
         if value >= max(0, bar.maximum() - 12):
             self._load_query_page(reset=False)
@@ -376,7 +394,10 @@ class MaterialLibraryView(QWidget):
 
     def _get_visible_paths(self) -> list:
         """Resolve the full filtered result, not only rows loaded in the view."""
-        return self.service.resolve_visible_video_paths(self._current_filter_params(), scope_paths=None)
+        return self.service.resolve_visible_video_paths(
+            self._current_filter_params(), scope_paths=None,
+            order_by=self._order_by, descending=self._descending,
+        )
 
     def _resolve_batch_targets(self) -> list:
         """素材库操作目标：有选中用选中，无选中用完整可见结果。"""
@@ -410,24 +431,36 @@ class MaterialLibraryView(QWidget):
         self.work_scope_changed.emit()
 
     def on_selection_changed(self, selected, deselected):
+        self._detail_generation += 1
+        generation = self._detail_generation
         if self.view_stack.currentWidget() == self.card_view:
             indexes = self.card_view.selectionModel().selectedIndexes()
         else:
             indexes = self.table_view.selectionModel().selectedRows()
+        self.detail_panel.save_btn.setEnabled(False)
         if not indexes:
             return
-        rows = sorted(list(set(idx.row() for idx in indexes)))
+        rows = sorted(set(idx.row() for idx in indexes))
         if len(rows) > 1:
-            selected_videos = []
-            for row in rows:
-                proxy_idx = self.proxy_model.index(row, 0)
-                source_idx = self.proxy_model.mapToSource(proxy_idx)
-                selected_videos.append(self.model.videos[source_idx.row()])
+            selected_videos = [
+                self.model.videos[self.proxy_model.mapToSource(self.proxy_model.index(row, 0)).row()]
+                for row in rows
+            ]
             self.detail_panel.load_video_data(selected_videos)
-        else:
-            proxy_idx = self.proxy_model.index(rows[0], 0)
-            source_idx = self.proxy_model.mapToSource(proxy_idx)
-            self.detail_panel.load_video_data(self.model.videos[source_idx.row()])
+            return
+        source_idx = self.proxy_model.mapToSource(self.proxy_model.index(rows[0], 0))
+        path = self.model.videos[source_idx.row()]["path"]
+
+        def on_ok(detail):
+            if generation == self._detail_generation and detail:
+                self.detail_panel.load_video_data(detail)
+
+        run_catalog_query(
+            self,
+            fn=lambda: self.service.get_video_detail(path),
+            on_ok=on_ok,
+            worker_key="_detail_worker",
+        )
 
     def accumulate_selected_to_scope(self):
         paths = self._resolve_batch_targets()

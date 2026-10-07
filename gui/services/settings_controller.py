@@ -27,6 +27,7 @@ class SettingsController(QObject):
         super().__init__(parent)
         self.service = service
         self._debounce_ms = max(0, int(debounce_ms))
+        self._dirty = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(self._debounce_ms)
@@ -43,21 +44,24 @@ class SettingsController(QObject):
         """
         if callable(mutate):
             mutate()
+        self._dirty = True
         self.pending.emit()
         self._timer.start()
 
     def flush(self) -> bool:
-        """立即写盘（若已有待保存改动）。返回是否成功。"""
-        had_pending = self._timer.isActive()
+        """立即保存待保存改动；单次定时器 timeout 时 isActive 已为 False。"""
         self._timer.stop()
+        if not self._dirty:
+            return True
         try:
             SettingsManager.save_settings(self.service.settings, self.service.db)
         except Exception as exc:  # noqa: BLE001 - 保存失败需反馈给用户
             self.save_failed.emit(str(exc))
             return False
-        if had_pending:
-            self.saved.emit("界面偏好已保存")
+        self._dirty = False
+        self.saved.emit("界面偏好已保存")
         return True
 
     def cancel(self) -> None:
         self._timer.stop()
+        self._dirty = False

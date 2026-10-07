@@ -30,33 +30,28 @@ def run_catalog_query(
     fn: Callable[[], Any],
     on_ok: Callable[[Any], None],
     on_fail: Optional[Callable[[str], None]] = None,
+    worker_key: str = "_catalog_worker",
 ) -> CatalogQueryWorker:
-    """Start a query and keep the worker alive on the view."""
-    existing = getattr(parent, "_catalog_worker", None)
+    """启动查询；分页与详情可使用独立 worker_key，避免互相覆盖生命周期。"""
+    existing = getattr(parent, worker_key, None)
     if existing is not None and existing.isRunning():
         existing.requestInterruption()
 
     worker = CatalogQueryWorker(fn, parent)
-    parent._catalog_worker = worker
-
-    def finish_ok(payload):
-        try:
-            on_ok(payload)
-        finally:
-            worker.deleteLater()
-            if getattr(parent, "_catalog_worker", None) is worker:
-                parent._catalog_worker = None
+    setattr(parent, worker_key, worker)
 
     def finish_error(message):
-        try:
-            if on_fail:
-                on_fail(message)
-        finally:
-            worker.deleteLater()
-            if getattr(parent, "_catalog_worker", None) is worker:
-                parent._catalog_worker = None
+        if on_fail:
+            on_fail(message)
 
-    worker.completed.connect(finish_ok)
+    def cleanup():
+        if getattr(parent, worker_key, None) is worker:
+            setattr(parent, worker_key, None)
+        worker.deleteLater()
+
+    # completed 早于线程退出；等 finished 再销毁 QThread。
+    worker.completed.connect(on_ok)
     worker.failed.connect(finish_error)
+    worker.finished.connect(cleanup)
     worker.start()
     return worker

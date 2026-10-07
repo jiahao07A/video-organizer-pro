@@ -47,7 +47,13 @@ STATUS_ALIASES = {
 
 
 def _path_key(path: str) -> str:
-    return os.path.normcase(os.path.abspath(str(path)))
+    absolute = os.path.normcase(os.path.abspath(str(path)))
+    return absolute.replace("\\", "/") if os.name == "nt" else absolute
+
+
+def _sql_path_key() -> str:
+    """与路径参数使用同一套 Windows 大小写/斜杠规则，不改写库内路径。"""
+    return "LOWER(REPLACE(path, CHAR(92), '/'))" if os.name == "nt" else "path"
 
 
 def _as_iso(value: Any) -> Optional[str]:
@@ -144,8 +150,11 @@ class VideoQuery:
         p = params or {}
         statuses: List[str] = []
         for raw in p.get("analysis_statuses") or ():
-            status = STATUS_ALIASES.get(str(raw), str(raw).lower())
-            statuses.append(status)
+            value = str(raw).strip()
+            if value in ("未命名", "unnamed", "not_renamed"):
+                statuses.extend(("pending", "analyzed"))
+            else:
+                statuses.append(STATUS_ALIASES.get(value, value.lower()))
         return cls(
             text=_clean_text(p.get("text")),
             categories=tuple(_clean_text(x) for x in p.get("categories") or () if _clean_text(x)),
@@ -157,7 +166,10 @@ class VideoQuery:
             tag_match_mode="all" if p.get("tag_match_mode") == "all" else "any",
             summary_empty=str(p.get("summary_empty") or "any"),
             alias_map=dict(p.get("alias_map") or {}),
-            scope_paths=tuple(str(x) for x in scope_paths or () if str(x).strip()),
+            scope_paths=(
+                None if scope_paths is None
+                else tuple(str(x) for x in scope_paths if str(x).strip())
+            ),
             excluded_paths=tuple(str(x) for x in excluded_paths or () if str(x).strip()),
             order_by=order_by,
             descending=descending,
@@ -219,10 +231,13 @@ class VideoCatalog:
             params.append(query.date_end)
 
         if query.only_dup:
-            # The legacy UI exposed this filter but the videos schema has no
-            # persisted duplicate flag. Returning no rows is safer than
-            # silently treating every item as a duplicate.
-            clauses.append("1 = 0")
+            # 内容哈希相同才认定重复；单帧 phash 不能代表整段视频相同。
+            # 在全库识别重复组，再与当前筛选/工作范围求交。
+            clauses.append(
+                "file_hash IN (SELECT file_hash FROM videos "
+                "WHERE file_hash IS NOT NULL AND TRIM(file_hash) <> '' "
+                "GROUP BY file_hash HAVING COUNT(*) > 1)"
+            )
 
         if query.tags:
             expanded: List[List[str]] = []
@@ -255,45 +270,42 @@ class VideoCatalog:
             clauses.append(scope_clause)
             params.extend(scope_params)
 
-        excluded = [_path_key(p) for p in query.excluded_paths]
+        excluded = [_path_key(p) for p in query.excluded_paths if p]
         if excluded:
-            placeholders = ", ".join("?" for _ in excluded)
-            # Paths are normalized when they are registered. The OR form
-            # also preserves compatibility with older rows on case-sensitive
-            # filesystems.
-            clauses.append(f"path NOT IN ({placeholders})")
-            params.extend(excluded)
+            # 排除列表可能很大，使用一个 JSON 参数避免 SQLite 变量上限。
+            clauses.append(f"{_sql_path_key()} NOT IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(excluded, ensure_ascii=False))
 
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
     @staticmethod
-    def _scope_clause(scope_paths: Sequence[str]) -> Tuple[str, List[str]]:
+    def _scope_clause(scope_paths: Optional[Sequence[str]]) -> Tuple[str, List[str]]:
+        # None 表示素材库全库；空集合表示空工作范围，必须返回空。
+        if scope_paths is None:
+            return "", []
         clauses: List[str] = []
         params: List[str] = []
-        for raw in scope_paths or ():
+        column = _sql_path_key()
+        for raw in scope_paths:
             path = str(raw).strip()
             if not path:
                 continue
-            absolute = os.path.abspath(path)
+            absolute = _path_key(path)
             if os.path.isfile(path):
-                clauses.append("path = ?")
+                clauses.append(f"{column} = ?")
                 params.append(absolute)
-                continue
-            if os.path.isdir(path):
-                prefix = absolute.rstrip(os.sep) + os.sep
-                clauses.append("(path = ? OR path LIKE ? ESCAPE '\\')")
-                params.extend([absolute, _escape_like(prefix) + "%"])
                 continue
             _, ext = os.path.splitext(path)
-            if ext.lower() in VIDEO_EXTENSIONS:
-                clauses.append("path = ?")
+            if not os.path.isdir(path) and ext.lower() in VIDEO_EXTENSIONS:
+                clauses.append(f"{column} = ?")
                 params.append(absolute)
             else:
-                prefix = absolute.rstrip(os.sep) + os.sep
-                clauses.append("(path = ? OR path LIKE ? ESCAPE '\\')")
+                separator = "/" if os.name == "nt" else os.sep
+                prefix = absolute.rstrip(separator) + separator
+                clauses.append(f"({column} = ? OR {column} LIKE ? ESCAPE '\\')")
                 params.extend([absolute, _escape_like(prefix) + "%"])
         if not clauses:
-            return "", []
+            return "1 = 0", []
         return "(" + " OR ".join(clauses) + ")", params
 
     def _order(self, query: VideoQuery) -> str:

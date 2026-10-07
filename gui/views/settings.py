@@ -36,6 +36,7 @@ from gui.services.settings_controller import SettingsController
 class SettingsView(QWidget):
     """设置视图 - 可搜索目录 + 按用户任务分类导航的高级设置系统"""
     settings_applied = Signal()
+    ui_preferences_applied = Signal()  # 普通偏好应用不触发 AI 客户端重建。
 
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
@@ -48,7 +49,7 @@ class SettingsView(QWidget):
         self.prefs_controller.pending.connect(
             lambda: self._set_save_status("界面偏好有改动，正在保存…")
         )
-        self.prefs_controller.saved.connect(self._set_save_status)
+        self.prefs_controller.saved.connect(self._on_preferences_saved)
         self.prefs_controller.save_failed.connect(
             lambda msg: self._set_save_status(f"界面偏好保存失败：{msg}", error=True)
         )
@@ -354,6 +355,17 @@ class SettingsView(QWidget):
             if value is None:
                 continue
             SettingsManager.update_setting(self.settings, entry.key, value)
+
+        prefs = self.settings.setdefault("ui_preferences", {})
+        if prefs.get("remember_work_scope"):
+            prefs["last_work_scope"] = self.service.get_work_scope_paths()
+            prefs["last_work_scope_exclusions"] = list(
+                getattr(self.service, "_work_scope_exclusions", set())
+            )
+
+    def _on_preferences_saved(self, message: str) -> None:
+        self._set_save_status(message)
+        self.ui_preferences_applied.emit()
 
     def _read_widget_value(self, widget_key: str, widget):
         try:

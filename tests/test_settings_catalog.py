@@ -29,7 +29,9 @@ def qt_app():
 
 
 @pytest.fixture
-def service(tmp_path):
+def service(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.video_organizer_service.TAG_CONFIG_FILE", str(tmp_path / "tags.json"))
+    monkeypatch.setattr("core.video_organizer_service.get_settings_file_path", lambda: str(tmp_path / "settings.json"))
     return VideoOrganizerService(
         settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,

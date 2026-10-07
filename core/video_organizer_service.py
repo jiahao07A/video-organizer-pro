@@ -333,6 +333,7 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_status_timestamp ON videos(status, timestamp DESC, id DESC)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_category_timestamp ON videos(category, timestamp DESC, id DESC)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_file_hash ON videos(file_hash)")
                 conn.commit()
 
     def execute_query(self, query: str, params: tuple = ()) -> List[Dict]:

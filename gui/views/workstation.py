@@ -16,6 +16,7 @@ from ..widgets.detail_panel import DetailPanel
 from ..widgets.delegates import CardDelegate, MaterialTagsColumnDelegate, StatusDelegate, ThumbnailDelegate
 from ..models.video_table import (
     VideoTableModel,
+    CATALOG_SORT_COLUMNS,
     COL_FILENAME,
     COL_LIBRARY_ID,
     COL_LIST_NO,
@@ -64,6 +65,7 @@ class WorkstationView(QWidget):
         self.settings = service.settings
         self.worker = None
         self._query_generation = 0
+        self._detail_generation = 0
         self._page_offset = 0
         self._page_total = 0
         self._page_limit = 100
@@ -207,7 +209,10 @@ class WorkstationView(QWidget):
         self.proxy_model.modelReset.connect(self._refresh_list_numbers)
         self.proxy_model.rowsInserted.connect(lambda *_: self._refresh_list_numbers())
         self.proxy_model.rowsRemoved.connect(lambda *_: self._refresh_list_numbers())
-        header.sortIndicatorChanged.connect(lambda *_: self._refresh_list_numbers())
+        header.setSortIndicator(-1, Qt.DescendingOrder)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sortIndicatorChanged.connect(self._on_catalog_sort_changed)
         self.table_view.verticalScrollBar().valueChanged.connect(self._maybe_fetch_more)
 
         table_layout.addWidget(self.table_view)
@@ -347,6 +352,8 @@ class WorkstationView(QWidget):
         return self.service.resolve_visible_video_paths(
             self._current_filter_params(),
             scope_paths=self._work_scope_query_paths(),
+            order_by=self._order_by,
+            descending=self._descending,
         )
 
     def _current_filter_params(self) -> dict:
@@ -555,6 +562,19 @@ class WorkstationView(QWidget):
         self.proxy_model.set_filter_params({})
         self._schedule_query_reload()
 
+    def _on_catalog_sort_changed(self, column, order):
+        # 缩略图和标签列没有定义 SQL 排序，保留当前有效排序指示。
+        if column not in CATALOG_SORT_COLUMNS and column != -1:
+            header = self.table_view.horizontalHeader()
+            header.blockSignals(True)
+            previous = next((c for c, key in CATALOG_SORT_COLUMNS.items() if key == self._order_by), -1)
+            header.setSortIndicator(previous, Qt.DescendingOrder if self._descending else Qt.AscendingOrder)
+            header.blockSignals(False)
+            return
+        self._order_by = CATALOG_SORT_COLUMNS.get(column, "timestamp")
+        self._descending = order == Qt.DescendingOrder
+        self._schedule_query_reload()
+
     def _schedule_query_reload(self):
         self._query_pending = True
         self._query_debounce.start()
@@ -617,7 +637,7 @@ class WorkstationView(QWidget):
     def _maybe_fetch_more(self, value, view=None):
         view = view or self.table_view
         bar = view.verticalScrollBar()
-        if self._page_loading or self._page_offset >= self._page_total:
+        if self._query_pending or self._page_loading or self._page_offset >= self._page_total:
             return
         if value >= max(0, bar.maximum() - 12):
             self._load_query_page(reset=False)
@@ -680,7 +700,14 @@ class WorkstationView(QWidget):
         scope = self.service.get_work_scope_paths()
         self._refresh_scope_path_ui()
         if not scope:
+            # 空范围也要使进行中的旧查询失效，防止结果迟到后恢复旧行。
+            self._query_generation += 1
+            self._detail_generation += 1
+            self._page_loading = False
+            self._page_offset = 0
+            self._page_total = 0
             self._query_pending = False
+            self._query_debounce.stop()
             self.model.update_data([])
             self.status_label.setText("请先设定工作范围：点击「浏览」选择文件或文件夹")
             self.status_message.emit(self.status_label.text())
@@ -690,29 +717,37 @@ class WorkstationView(QWidget):
 
 
     def on_selection_changed(self, selected, deselected):
+        self._detail_generation += 1
+        generation = self._detail_generation
         if self.view_stack.currentWidget() == self.card_view:
             indexes = self.card_view.selectionModel().selectedIndexes()
         else:
             indexes = self.table_view.selectionModel().selectedRows()
-
+        self.detail_panel.save_btn.setEnabled(False)
         if not indexes:
             return
-
-        rows = sorted(list(set(idx.row() for idx in indexes)))
-
+        rows = sorted(set(idx.row() for idx in indexes))
         if len(rows) > 1:
-            selected_videos = []
-            for row in rows:
-                proxy_idx = self.proxy_model.index(row, 0)
-                source_idx = self.proxy_model.mapToSource(proxy_idx)
-                selected_videos.append(self.model.videos[source_idx.row()])
+            selected_videos = [
+                self.model.videos[self.proxy_model.mapToSource(self.proxy_model.index(row, 0)).row()]
+                for row in rows
+            ]
             self.detail_panel.load_video_data(selected_videos)
-        elif len(rows) == 1:
-            proxy_idx = self.proxy_model.index(rows[0], 0)
-            source_idx = self.proxy_model.mapToSource(proxy_idx)
-            video_data = self.model.videos[source_idx.row()]
-            self.video_selected.emit(video_data)
-            self.detail_panel.load_video_data(video_data)
+            return
+        source_idx = self.proxy_model.mapToSource(self.proxy_model.index(rows[0], 0))
+        path = self.model.videos[source_idx.row()]["path"]
+
+        def on_ok(detail):
+            if generation == self._detail_generation and detail:
+                self.video_selected.emit(detail)
+                self.detail_panel.load_video_data(detail)
+
+        run_catalog_query(
+            self,
+            fn=lambda: self.service.get_video_detail(path),
+            on_ok=on_ok,
+            worker_key="_detail_worker",
+        )
 
     def show_context_menu(self, pos):
         sender = self.sender()

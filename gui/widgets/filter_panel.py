@@ -71,6 +71,7 @@ class FilterPanel(QFrame):
         self.date_end.dateChanged.connect(self._on_date_value_changed)
 
         self.dup_cb = QCheckBox("仅显示重复项")
+        self.dup_cb.setToolTip("全库中非空文件内容哈希相同的素材；未计算哈希或仅单帧相似的素材不认定重复。")
         self.dup_cb.stateChanged.connect(self.emit_filter)
 
         # 用 toggled(bool)，避免 stateChanged 的 int/CheckState 比较失败导致永远不启用
