@@ -14,6 +14,7 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 
 ## 范围内
 
+- 更新 `AGENTS.md` 作为协作入口说明；
 - 新增 `docs/agents/git-github-workflow.md` 作为完整规范；
 - 新增 `docs/agents/subagent-workflow.md`，规定 Subagent 的调用时机、调用前信息门槛、执行指令、分支/工作区、验证和审查责任；
 - 更新 `docs/agents/issue-tracker.md`，说明 `.scratch/` 与 GitHub Issue 的衔接；
@@ -114,4 +115,10 @@ PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 - 最终审阅：规范维度与规格维度均无剩余阻断问题；没有声称取得独立 GitHub approval 或完成多人实操/分支保护/CI 配置验收。
 - 采用 GitHub squash merge：PR 历史包含已由主干单提交整合替代的旧 GUI 提交，不使用 rebase 重放旧 GUI；仅合并已审阅的文档净差异。
 - 合并结果和完整 SHA 在 [PR #2](https://github.com/jiahao07A/video-organizer-pro/pull/2) 与 [Issue #1](https://github.com/jiahao07A/video-organizer-pro/issues/1) 的关闭总结中追加。本文件状态表示文档实现与本轮验证完成；远程合并以 GitHub 记录为准。
-- 回滚：对 PR #2 的 squash commit 使用新的 revert 分支/PR；不回滚独立 GUI 提交。遗留限制：真实多人协作、分支保护和 CI 必需检查尚未配置/实操验收，不作为本轮已完成内容。
+### 2026-10-07 终审修正记录
+
+- 根据规范一致性终审，移除对未纳入仓库的 `CONTEXT.md` 文件链接，改为注明“若已纳入当前仓库”及项目提供的领域上下文，避免合并后产生 GitHub 断链。
+- 补建远程规范 triage 标签 `needs-info` 与 `ready-for-human`，使远程标签集合与 `docs/agents/triage-labels.md` 的五标签定义一致。
+- 修正 `git-github-workflow.md` 的章节编号顺序；补齐 Bug 模板首次发现时间、Feature/Task 模板的文档/测试/迁移说明字段；修正本地 issue tracker 文案笔误。
+- 规范终审指出的评论格式重复属于非阻断建议，保留两份文档各自的本地记录与 GitHub 协作职责说明，不在本次合并前扩大文档重构范围。
+- 修正后重新检查限定文件、链接、模板字段、章节编号、空白和围栏；产品代码仍相对 `origin/main` 无差异。

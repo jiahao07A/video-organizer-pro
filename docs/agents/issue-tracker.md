@@ -8,7 +8,7 @@ GitHub Issue 是共享的任务身份和协作记录；详细执行记录继续�
 
 - 每个功能使用一个目录：`.scratch/<feature-slug>/`
 - 功能规格文件为：`.scratch/<feature-slug>/spec.md`
-- 实现议题每个一个文件，路径为 `.scratch/<feature-slug>/issues/<NN>-<slug>.md`，编号从 `01` 开始
+- 每个实现议题一个文件，路径为 `.scratch/<feature-slug>/issues/<NN>-<slug>.md`，编号从 `01` 开始
 - GitHub Issue 使用 [`triage-labels.md`](./triage-labels.md) 中的五个规范 triage 标签之一
 - 本地 Markdown 议题在文件顶部附近使用 `Status:` 行记录执行状态
 - 评论和对话历史追加在文件底部的 `## Comments` 标题下
