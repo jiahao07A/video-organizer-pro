@@ -6,7 +6,7 @@ Feature-slug: `git-github-workflow-standard`
 
 GitHub Issue: #1 (https://github.com/jiahao07A/video-organizer-pro/issues/1)
 Branch: `docs/git-github-workflow-standard`
-PR: 待创建
+PR: #2 (https://github.com/jiahao07A/video-organizer-pro/pull/2)
 
 ## 目标
 
@@ -63,18 +63,24 @@ PR: 待创建
 以下路径已批准作为本规范进入远程协作的下一步；执行这些操作前仍需由维护者确认远程仓库权限和 Issue 编号：
 
 - [x] 创建 GitHub Issue，补充 Issue 编号并链接本地 spec；
-- [ ] 推送 `docs/git-github-workflow-standard` 分支；
-- [ ] 创建 Draft PR，填写中文优先的 PR 正文并链接 Issue；
+- [x] 推送 `docs/git-github-workflow-standard` 分支；
+- [x] 创建 Draft PR，填写中文优先的 PR 正文并链接 Issue；
 - [ ] 由维护者完成人工审阅，确认是否转为可合并 PR；
 - [ ] 合并后补充 PR 编号、合并 commit、最终验证结果和遗留风险。
 
 ## Comments
 
+### 2026-10-07 推送分支并创建 Draft PR
+
+- 已将 `docs/git-github-workflow-standard` 推送到 `origin`。
+- 已创建 Draft PR [#2](https://github.com/jiahao07A/video-organizer-pro/pull/2)，目标分支为 `main`，源分支为 `docs/git-github-workflow-standard`。
+- PR 使用中文优先正文并通过 `Fixes #1` 关联 GitHub Issue #1。
+- 当前等待维护者人工审阅；未执行合并。
+
 ### 2026-10-07 创建 GitHub Issue
 
 - 已创建 GitHub Issue [#1](https://github.com/jiahao07A/video-organizer-pro/issues/1)：`[Docs] 建立 Git、GitHub 与 Subagent 工作规范`。
 - Issue 使用 `needs-triage` 标签，正文已写明目标、范围、验收标准、风险、回滚和本地 spec 路径。
-- 当前下一步为推送 `docs/git-github-workflow-standard` 分支并创建 Draft PR。
 
 ### 2026-10-06 增加简体中文优先规则
 
