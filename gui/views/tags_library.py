@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QMessageBox, QMenu,
     QFileDialog, QProgressDialog, QListView, QScrollArea, QFrame,
     QSplitter, QDialog, QListWidget, QListWidgetItem, QComboBox,
-    QToolButton, QSizePolicy, QInputDialog,
+    QToolButton, QSizePolicy, QInputDialog, QTabWidget,
 )
 from PySide6.QtGui import QColor, QAction, QIcon, QDragEnterEvent, QDropEvent, QPalette
 from PySide6.QtCore import Qt, QSize, Slot
@@ -12,6 +12,15 @@ import json
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from core.tag_import_service import TagImportService
 from gui.models.tag_model import TagListModel, TagFilterProxyModel
+from gui.models.tag_work_views import (
+    PendingSuggestionRow,
+    StandardWordRow,
+    build_pending_suggestion_rows,
+    build_standard_word_rows,
+    filter_pending_rows,
+    filter_standard_word_rows,
+    selected_suggestions,
+)
 from gui.widgets.delegates import TagChipDelegate
 from gui.widgets.import_wizard import TagImportWizard
 from gui.views.tags_library_editors import TagGroupEditor, PromptConfigCenter
@@ -127,19 +136,20 @@ class TagHeatmapWidget(QFrame):
         self.content_layout.addStretch()
 
 
-class PendingTagsPanel(QFrame):
-    """左侧固定待审面板：列表 + 批准到组 / 挂别名 / 丢弃 / AI 建议（须确认）。
+class PendingReviewView(QWidget):
+    """待审审核工作视图（默认视图）：搜索/筛选 + 多选 + 批量 AI 建议在同一视图应用。
 
-    待审词 ≠ 已入库标准词；视觉与右侧标准词组栏区分。
+    待审词 ≠ 已入库标准词。批准须选目标标签组；挂别名 / 丢弃 / 采纳 AI 建议
+    均须人工确认后写库，禁止静默写入。
     """
 
     def __init__(self, owner: "TagsView", colors: dict = None, parent=None):
         super().__init__(parent)
         self.owner = owner
         self.colors = colors or tags_library_palette("dark")
-        self.setMinimumWidth(280)
-        self.setMaximumWidth(380)
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._pending_rows = []  # 当前展示的待审行（已筛选）
+        self._suggestion_rows: list[PendingSuggestionRow] = []
         self._build_ui()
         self._apply_style()
 
@@ -149,7 +159,7 @@ class PendingTagsPanel(QFrame):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
-        self.title_label = QLabel("待审词")
+        self.title_label = QLabel("待审审核")
         self.count_label = QLabel("0")
         header.addWidget(self.title_label)
         header.addStretch()
@@ -158,21 +168,59 @@ class PendingTagsPanel(QFrame):
 
         self.hint_label = QLabel(
             "尚未入库的待审词。批准须选目标标签组；"
-            "挂别名 / 丢弃 / AI 建议均须确认后写库。"
+            "挂别名 / 丢弃 / 采纳 AI 建议均须确认后写库。"
         )
         self.hint_label.setWordWrap(True)
         layout.addWidget(self.hint_label)
 
+        # 搜索 + 建议组筛选
+        filter_row = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索待审词 / 建议组…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.group_filter = QComboBox()
+        self.group_filter.setToolTip("按 AI 建议组筛选待审词")
+        filter_row.addWidget(self.search_edit, 1)
+        filter_row.addWidget(self.group_filter)
+        layout.addLayout(filter_row)
+
+        # 待审词列表（多选）
         self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QListWidget.SingleSelection)
+        self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list_widget.setToolTip("可 Ctrl / Shift 多选待审词；批量建议在同一视图勾选后应用")
         layout.addWidget(self.list_widget, 1)
 
+        # 批量 AI 建议行（默认隐藏；生成后在本视图内勾选应用）
+        self.ai_header = QLabel("AI 建议（默认不勾选，勾选后点「应用所选」才写库）")
+        self.ai_header.setWordWrap(True)
+        self.ai_header.setVisible(False)
+        layout.addWidget(self.ai_header)
+
+        self.ai_list = QListWidget()
+        self.ai_list.setVisible(False)
+        self.ai_list.setMaximumHeight(200)
+        layout.addWidget(self.ai_list)
+
+        ai_btn_row = QHBoxLayout()
+        self.btn_ai_sel_all = QPushButton("全选建议")
+        self.btn_ai_clear = QPushButton("清空勾选")
+        self.btn_ai_apply = QPushButton("应用所选建议")
+        self.btn_ai_apply.setObjectName("primary_button")
+        for b in (self.btn_ai_sel_all, self.btn_ai_clear, self.btn_ai_apply):
+            b.setVisible(False)
+        ai_btn_row.addWidget(self.btn_ai_sel_all)
+        ai_btn_row.addWidget(self.btn_ai_clear)
+        ai_btn_row.addStretch()
+        ai_btn_row.addWidget(self.btn_ai_apply)
+        layout.addLayout(ai_btn_row)
+
+        # 批准目标组 + 单条动作
         self.group_combo = QComboBox()
         self.group_combo.setToolTip("批准为标准词时的目标标签组（必选）")
         layout.addWidget(self.group_combo)
 
         btn_row1 = QHBoxLayout()
-        self.btn_approve = QPushButton("批准到组")
+        self.btn_approve = QPushButton("批准选中到组")
         self.btn_approve.setObjectName("primary_button")
         self.btn_alias = QPushButton("挂别名")
         btn_row1.addWidget(self.btn_approve)
@@ -180,45 +228,45 @@ class PendingTagsPanel(QFrame):
         layout.addLayout(btn_row1)
 
         btn_row2 = QHBoxLayout()
-        self.btn_discard = QPushButton("丢弃")
-        self.btn_ai = QPushButton("AI 建议")
-        self.btn_ai.setToolTip("待审词 AI 建议：给出处理方向，人工确认后才写库")
+        self.btn_discard = QPushButton("丢弃选中")
+        self.btn_ai = QPushButton("AI 建议（选中单条）")
+        self.btn_ai.setToolTip("对待审词给 AI 建议：给出处理方向，人工确认后才写库")
         btn_row2.addWidget(self.btn_discard)
         btn_row2.addWidget(self.btn_ai)
         layout.addLayout(btn_row2)
 
-        self.btn_batch_ai = QPushButton("批量 AI 分拣…")
-        self.btn_batch_ai.setToolTip("批量待审 AI 分拣：出清单 → 多选 → 应用选中")
+        self.btn_batch_ai = QPushButton("批量生成 AI 建议")
+        self.btn_batch_ai.setToolTip("对当前待审词批量请求 AI 建议，结果在本视图内勾选应用")
         layout.addWidget(self.btn_batch_ai)
 
+        self.search_edit.textChanged.connect(self._apply_filter)
+        self.group_filter.currentIndexChanged.connect(self._apply_filter)
         self.btn_approve.clicked.connect(self._on_approve)
         self.btn_alias.clicked.connect(self._on_alias)
         self.btn_discard.clicked.connect(self._on_discard)
         self.btn_ai.clicked.connect(self._on_ai_suggest)
         self.btn_batch_ai.clicked.connect(self._on_batch_ai)
+        self.btn_ai_sel_all.clicked.connect(self._select_all_suggestions)
+        self.btn_ai_clear.clicked.connect(self._clear_suggestions)
+        self.btn_ai_apply.clicked.connect(self._on_apply_suggestions)
 
     def _apply_style(self):
         c = self.colors
-        # 待审面板：琥珀色边框，与右侧标准词组栏区分
         accent = "#d48806" if c.get("title") == "#b45309" else "#faad14"
-        self.setStyleSheet(f"""
-            PendingTagsPanel {{
-                background-color: {c["panel_bg"]};
-                border-radius: 8px;
-                border: 2px solid {accent};
-            }}
-        """)
         self.title_label.setStyleSheet(
-            f"font-weight: bold; color: {accent}; border: none; font-size: 14px;"
+            f"font-weight: bold; color: {accent}; font-size: 14px;"
         )
         self.count_label.setStyleSheet(
-            f"color: {accent}; border: none; font-weight: bold; font-size: 13px;"
+            f"color: {accent}; font-weight: bold; font-size: 13px;"
         )
-        self.hint_label.setStyleSheet(
-            f"color: {c['muted']}; border: none; font-size: 11px;"
+        self.hint_label.setStyleSheet(f"color: {c['muted']}; font-size: 11px;")
+        self.ai_header.setStyleSheet(f"color: {accent}; font-size: 11px;")
+        self.search_edit.setStyleSheet(
+            f"background-color: {c['input_bg']}; color: {c['input_text']}; "
+            f"border: 1px solid {c['panel_border']}; border-radius: 4px; "
+            f"height: 24px; padding: 2px 6px;"
         )
-        self.list_widget.setStyleSheet(
-            f"""
+        list_qss = f"""
             QListWidget {{
                 background-color: {c['list_bg']};
                 color: {c['input_text']};
@@ -233,6 +281,16 @@ class PendingTagsPanel(QFrame):
                 background-color: {c['accent']};
                 color: #ffffff;
             }}
+        """
+        self.list_widget.setStyleSheet(list_qss)
+        self.ai_list.setStyleSheet(list_qss)
+        self.setStyleSheet(
+            f"""
+            PendingReviewView {{
+                background-color: {c["panel_bg"]};
+                border-radius: 8px;
+                border: 2px solid {accent};
+            }}
             """
         )
 
@@ -246,9 +304,13 @@ class PendingTagsPanel(QFrame):
     def _tag_config(self):
         return self.owner.tag_config
 
+    def _current_rows(self):
+        """所有选中的待审行（多选）。"""
+        return [it.data(Qt.UserRole) for it in self.list_widget.selectedItems()]
+
     def _current_row(self):
-        item = self.list_widget.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        rows = self._current_rows()
+        return rows[0] if rows else None
 
     def refresh_group_combo(self):
         current = self.group_combo.currentData()
@@ -264,10 +326,38 @@ class PendingTagsPanel(QFrame):
             if idx >= 0:
                 self.group_combo.setCurrentIndex(idx)
 
+    def refresh_group_filter(self):
+        """建议组筛选：全部 / 无建议组 / 各合法组。"""
+        current = self.group_filter.currentData()
+        if self.group_filter.count() == 0:
+            self.group_filter.addItem("全部建议组", "")
+            self.group_filter.addItem("无建议组", "__none__")
+            for g in self._tag_config().get("tag_groups", []) or []:
+                gid = (g.get("id") or "").strip()
+                if not gid or gid.lower() == "pool":
+                    continue
+                self.group_filter.addItem(f"建议组 {g.get('name') or gid}", gid)
+            return
+        # 组集合变化时重建，保留原选择
+        self.group_filter.blockSignals(True)
+        self.group_filter.clear()
+        self.group_filter.addItem("全部建议组", "")
+        self.group_filter.addItem("无建议组", "__none__")
+        for g in self._tag_config().get("tag_groups", []) or []:
+            gid = (g.get("id") or "").strip()
+            if not gid or gid.lower() == "pool":
+                continue
+            self.group_filter.addItem(f"建议组 {g.get('name') or gid}", gid)
+        if current:
+            idx = self.group_filter.findData(current)
+            if idx >= 0:
+                self.group_filter.setCurrentIndex(idx)
+        self.group_filter.blockSignals(False)
+
     def reload(self):
-        """刷新待审列表与组下拉。"""
+        """刷新待审列表、筛选器与组下拉。"""
         self.refresh_group_combo()
-        self.list_widget.clear()
+        self.refresh_group_filter()
         rows = []
         db = getattr(self._service(), "db", None)
         if db and hasattr(db, "list_pending_tags"):
@@ -276,50 +366,67 @@ class PendingTagsPanel(QFrame):
             except Exception as e:
                 print(f"list_pending_tags: {e}")
                 rows = []
+        self._all_pending_rows = list(rows)
+        self._apply_filter()
+        self._clear_suggestions()
+
+    def _apply_filter(self):
+        """按搜索词与建议组筛选后重建列表（保持已选？— 简化：重建）。"""
+        rows = filter_pending_rows(
+            getattr(self, "_all_pending_rows", []),
+            query=self.search_edit.text(),
+            group_id=self.group_filter.currentData() or "",
+        )
+        self._pending_rows = rows
+        self.list_widget.clear()
         for row in rows:
             raw = row.get("raw_text") or ""
             gid = row.get("group_id") or ""
-            label = f"{raw}"
-            if gid:
-                label = f"{raw}  · 建议组 {gid}"
+            label = f"{raw}" + (f"  · 建议组 {gid}" if gid else "")
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, row)
             item.setToolTip(f"待审词 #{row.get('id')}：{raw}\n（待审 ≠ 标准词）")
             self.list_widget.addItem(item)
-        self.count_label.setText(str(len(rows)))
-        if self.list_widget.count() and not self.list_widget.currentItem():
-            self.list_widget.setCurrentRow(0)
+        total = len(getattr(self, "_all_pending_rows", []))
+        shown = len(rows)
+        self.count_label.setText(
+            str(shown) if shown == total else f"{shown}/{total}"
+        )
 
     def _on_approve(self):
-        row = self._current_row()
-        if not row:
-            QMessageBox.information(self, "提示", "请先选择一条待审词。")
+        rows = self._current_rows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先选择待审词。")
             return
         gid = self.group_combo.currentData()
         if not gid or str(gid).lower() == "pool":
             QMessageBox.warning(self, "目标组无效", "批准为标准词必须选择目标标签组（中转池已废除）。")
             return
-        try:
-            ok = self._service().resolve_pending_tag(
-                row["id"], "approve_standard", group_id=gid
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "批准失败", f"写入标签库时出错：{e}")
-            return
-        if ok:
-            self.reload()
+        ok_n = 0
+        for row in rows:
+            try:
+                if self._service().resolve_pending_tag(
+                    row["id"], "approve_standard", group_id=gid
+                ):
+                    ok_n += 1
+            except Exception as e:
+                QMessageBox.critical(self, "批准失败", f"写入标签库时出错：{e}")
+                break
+        self.reload()
+        if ok_n:
             self.owner.on_pending_resolved()
         else:
             QMessageBox.warning(
                 self, "失败",
-                "无法批准该待审词（须有效目标组，或同名词冲突未解决）。",
+                "无法批准选中待审词（须有效目标组，或同名词冲突未解决）。",
             )
 
     def _on_alias(self):
-        row = self._current_row()
-        if not row:
-            QMessageBox.information(self, "提示", "请先选择一条待审词。")
+        rows = self._current_rows()
+        if len(rows) != 1:
+            QMessageBox.information(self, "提示", "挂别名一次只能处理一条待审词。")
             return
+        row = rows[0]
         std, ok = QInputDialog.getText(
             self, "挂为别名", f"将「{row.get('raw_text')}」挂到哪个标准词？"
         )
@@ -334,19 +441,20 @@ class PendingTagsPanel(QFrame):
             QMessageBox.warning(self, "失败", "挂别名失败。")
 
     def _on_discard(self):
-        row = self._current_row()
-        if not row:
+        rows = self._current_rows()
+        if not rows:
             return
         reply = QMessageBox.question(
             self,
             "确认丢弃",
-            f"确定丢弃待审词「{row.get('raw_text')}」？",
+            f"确定丢弃选中的 {len(rows)} 条待审词？",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        if self._service().resolve_pending_tag(row["id"], "discard"):
-            self.reload()
+        for row in rows:
+            self._service().resolve_pending_tag(row["id"], "discard")
+        self.reload()
 
     def _on_ai_suggest(self):
         """待审词 AI 建议：后台调模型，完成后弹确认框。"""
@@ -405,20 +513,69 @@ class PendingTagsPanel(QFrame):
             fn=work,
             on_ok=on_ok,
             on_fail=on_fail,
-            busy_widgets=[self.btn_ai, self.btn_batch_ai] if hasattr(self, "btn_batch_ai") else [self.btn_ai],
+            busy_widgets=[self.btn_ai, self.btn_batch_ai],
         )
 
-    def _on_batch_ai(self):
-        """批量待审 AI 分拣：后台生成清单 → 多选 → 应用选中。"""
-        from PySide6.QtWidgets import (
-            QDialog,
-            QVBoxLayout,
-            QHBoxLayout,
-            QListWidget,
-            QListWidgetItem,
-            QPushButton,
-            QLabel,
+    # --- 批量 AI 建议（在本视图内勾选应用） ---
+    def _clear_suggestions(self):
+        self._suggestion_rows = []
+        self.ai_list.clear()
+        self.ai_list.setVisible(False)
+        self.ai_header.setVisible(False)
+        self.btn_ai_sel_all.setVisible(False)
+        self.btn_ai_clear.setVisible(False)
+        self.btn_ai_apply.setVisible(False)
+
+    def _show_suggestion_rows(self, rows):
+        self._suggestion_rows = list(rows)
+        self.ai_list.clear()
+        for r in self._suggestion_rows:
+            item = QListWidgetItem(r.display)
+            item.setData(Qt.UserRole, r)
+            item.setCheckState(Qt.Unchecked)
+            self.ai_list.addItem(item)
+        visible = bool(self._suggestion_rows)
+        self.ai_list.setVisible(visible)
+        self.ai_header.setVisible(visible)
+        self.btn_ai_sel_all.setVisible(visible)
+        self.btn_ai_clear.setVisible(visible)
+        self.btn_ai_apply.setVisible(visible)
+
+    def _sync_suggestion_checks(self):
+        for i in range(self.ai_list.count()):
+            it = self.ai_list.item(i)
+            r = it.data(Qt.UserRole)
+            r.checked = it.checkState() == Qt.Checked
+
+    def _select_all_suggestions(self):
+        for i in range(self.ai_list.count()):
+            self.ai_list.item(i).setCheckState(Qt.Checked)
+
+    def _on_apply_suggestions(self):
+        self._sync_suggestion_checks()
+        chosen = selected_suggestions(self._suggestion_rows)
+        if not chosen:
+            QMessageBox.information(self, "提示", "未勾选任何建议，未写库。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认应用",
+            f"将应用 {len(chosen)} 条明确勾选的建议到标签库。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
         )
+        if reply != QMessageBox.Yes:
+            return
+        result = self._service().apply_pending_suggestions_selected(chosen, confirm=True)
+        msg = result.get("message") or f"已应用 {result.get('applied', 0)} 条"
+        if result.get("failed"):
+            QMessageBox.warning(self, "部分失败", f"{msg}\n请检查日志后重试失败项。")
+        else:
+            QMessageBox.information(self, "完成", msg)
+        self.reload()
+        self.owner.on_pending_resolved()
+
+    def _on_batch_ai(self):
+        """批量待审 AI：后台生成建议 → 在本视图内勾选 → 应用所选。"""
         from gui.workers.tag_ai_worker import run_tag_ai_job
 
         svc = self._service()
@@ -428,101 +585,14 @@ class PendingTagsPanel(QFrame):
 
         def on_ok(suggestions):
             if not suggestions:
-                QMessageBox.information(self, "批量分拣", "当前没有待审词。")
+                QMessageBox.information(self, "批量建议", "当前没有待审词。")
                 return
-
-            dlg = QDialog(self)
-            dlg.setWindowTitle("批量待审 AI 分拣")
-            dlg.resize(560, 440)
-            layout = QVBoxLayout(dlg)
-            layout.addWidget(
-                QLabel("默认不预选。勾选后点「应用选中」才写库；未选不写。")
-            )
-            lst = QListWidget()
-            layout.addWidget(lst)
-            for sug in suggestions:
-                action = getattr(sug, "action", "") or ""
-                raw = getattr(sug, "raw_text", "") or ""
-                reason = getattr(sug, "reason", "") or ""
-                source = getattr(sug, "source", "rule") or "rule"
-                src = "模型" if source == "model" else "规则"
-                if action == "link_alias":
-                    act = f"挂别名→{getattr(sug, 'recommended_standard', '')}"
-                elif action == "approve_standard":
-                    act = f"批准→{getattr(sug, 'recommended_group_id', None) or getattr(sug, 'group_id', '')}"
-                else:
-                    act = "丢弃"
-                item = QListWidgetItem(f"[{src}] {raw}  ·  {act}  ·  {reason}")
-                item.setData(Qt.UserRole, sug)
-                item.setCheckState(Qt.Unchecked)
-                lst.addItem(item)
-
-            btn_row = QHBoxLayout()
-            btn_sel_all = QPushButton("全选")
-            btn_clear = QPushButton("清空勾选")
-            btn_apply = QPushButton("应用选中")
-            btn_apply.setObjectName("primary_button")
-            btn_close = QPushButton("关闭")
-            btn_row.addWidget(btn_sel_all)
-            btn_row.addWidget(btn_clear)
-            btn_row.addStretch()
-            btn_row.addWidget(btn_apply)
-            btn_row.addWidget(btn_close)
-            layout.addLayout(btn_row)
-
-            def sel_all():
-                for i in range(lst.count()):
-                    lst.item(i).setCheckState(Qt.Checked)
-
-            def clear_sel():
-                for i in range(lst.count()):
-                    lst.item(i).setCheckState(Qt.Unchecked)
-
-            def on_apply():
-                chosen = []
-                for i in range(lst.count()):
-                    it = lst.item(i)
-                    if it.checkState() == Qt.Checked:
-                        chosen.append(it.data(Qt.UserRole))
-                if not chosen:
-                    QMessageBox.information(dlg, "提示", "未勾选任何建议。")
-                    return
-                reply = QMessageBox.question(
-                    dlg,
-                    "确认应用",
-                    f"将应用 {len(chosen)} 条建议到标签库。是否继续？",
-                    QMessageBox.Yes | QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
-                    return
-                result = self._service().apply_pending_suggestions_selected(
-                    chosen, confirm=True
-                )
-                msg = result.get("message") or f"已应用 {result.get('applied', 0)} 条"
-                if result.get("failed"):
-                    QMessageBox.warning(
-                        dlg,
-                        "部分失败",
-                        f"{msg}\n请检查日志后重试失败项。",
-                    )
-                else:
-                    QMessageBox.information(dlg, "完成", msg)
-                self.reload()
-                self.owner.on_pending_resolved()
-                dlg.accept()
-
-            btn_sel_all.clicked.connect(sel_all)
-            btn_clear.clicked.connect(clear_sel)
-            btn_apply.clicked.connect(on_apply)
-            btn_close.clicked.connect(dlg.reject)
-            dlg.exec()
+            rows = build_pending_suggestion_rows(suggestions)
+            self._show_suggestion_rows(rows)
 
         def on_fail(msg: str):
             QMessageBox.warning(self, "批量 AI 失败", msg or "调用失败")
 
-        busy = [self.btn_ai]
-        if hasattr(self, "btn_batch_ai"):
-            busy.append(self.btn_batch_ai)
         run_tag_ai_job(
             self,
             title="批量待审 AI",
@@ -530,12 +600,12 @@ class PendingTagsPanel(QFrame):
             fn=work,
             on_ok=on_ok,
             on_fail=on_fail,
-            busy_widgets=busy,
+            busy_widgets=[self.btn_ai, self.btn_batch_ai],
         )
 
 
 class TagsView(QWidget):
-    """标签库：左待审面板 + 右标签组栏（无中转池）。"""
+    """标签库：默认「待审审核」工作视图 + 「标准词管理」工作视图（无中转池）。"""
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
         self.service = service
@@ -580,9 +650,25 @@ class TagsView(QWidget):
             )
         if hasattr(self, "pending_panel") and self.pending_panel is not None:
             self.pending_panel.set_colors(c)
-        if hasattr(self, "body_splitter"):
-            self.body_splitter.setStyleSheet(
-                f"QSplitter::handle {{ background-color: {c['splitter']}; }}"
+        if hasattr(self, "work_tabs") and self.work_tabs is not None:
+            self.work_tabs.setStyleSheet(
+                f"""
+                QTabWidget::pane {{ border: 1px solid {c['panel_border']}; }}
+                QTabBar::tab {{
+                    background: {c['list_bg']}; color: {c['input_text']};
+                    padding: 6px 14px; border: 1px solid {c['panel_border']};
+                    border-bottom: none;
+                }}
+                QTabBar::tab:selected {{ background: {c['panel_bg']}; color: {c['title']}; }}
+                """
+            )
+        if hasattr(self, "standard_hint"):
+            self.standard_hint.setStyleSheet(f"color: {c['muted']}; font-size: 11px;")
+        if hasattr(self, "standard_search"):
+            self.standard_search.setStyleSheet(
+                f"background-color: {c['input_bg']}; color: {c['input_text']}; "
+                f"border: 1px solid {c['panel_border']}; border-radius: 4px; "
+                f"height: 24px; padding: 2px 6px;"
             )
         if hasattr(self, "splitter"):
             self.splitter.setStyleSheet(
@@ -629,17 +715,54 @@ class TagsView(QWidget):
         header_layout.addWidget(save_btn)
         self.main_layout.addLayout(header_layout)
 
-        # 主布局：左待审 + 右标签组栏
-        self.body_splitter = QSplitter(Qt.Horizontal)
-        self.body_splitter.setHandleWidth(4)
-        self.body_splitter.setStyleSheet(
-            f"QSplitter::handle {{ background-color: {c['splitter']}; }}"
+        # 工作视图切换：默认「待审审核」；「标准词管理」为清晰可达的第二个工作视图
+        self.work_tabs = QTabWidget()
+        self.work_tabs.setDocumentMode(True)
+        self.work_tabs.setStyleSheet(
+            f"""
+            QTabWidget::pane {{ border: 1px solid {c['panel_border']}; }}
+            QTabBar::tab {{
+                background: {c['list_bg']}; color: {c['input_text']};
+                padding: 6px 14px; border: 1px solid {c['panel_border']};
+                border-bottom: none;
+            }}
+            QTabBar::tab:selected {{ background: {c['panel_bg']}; color: {c['title']}; }}
+            """
         )
 
-        self.pending_panel = PendingTagsPanel(self, self.ui_colors)
-        self.body_splitter.addWidget(self.pending_panel)
+        # Tab 1（默认）：待审审核（搜索/筛选 + 多选 + 批量 AI 建议同一视图应用）
+        self.pending_panel = PendingReviewView(self, self.ui_colors)
+        self.work_tabs.addTab(self.pending_panel, "待审审核")
 
-        # 右侧：仅标签组栏（无中转池、无热力图常驻）
+        # Tab 2：标准词管理（全局搜索 + 按标签组筛选 + 标准词/别名/使用次数）
+        self.standard_tab = QWidget()
+        std_layout = QVBoxLayout(self.standard_tab)
+        std_layout.setContentsMargins(10, 10, 10, 10)
+        std_layout.setSpacing(8)
+
+        std_filter_row = QHBoxLayout()
+        self.standard_search = QLineEdit()
+        self.standard_search.setPlaceholderText("搜索标准词 / 别名…")
+        self.standard_search.setClearButtonEnabled(True)
+        self.standard_search.setStyleSheet(
+            f"background-color: {c['input_bg']}; color: {c['input_text']}; "
+            f"border: 1px solid {c['panel_border']}; border-radius: 4px; "
+            f"height: 24px; padding: 2px 6px;"
+        )
+        self.standard_group_filter = QComboBox()
+        self.standard_group_filter.setToolTip("按标签组筛选标准词")
+        std_filter_row.addWidget(self.standard_search, 1)
+        std_filter_row.addWidget(self.standard_group_filter)
+        std_layout.addLayout(std_filter_row)
+
+        self.standard_hint = QLabel(
+            "标准词必须属于某一标签组。显示标准词 / 别名 / 使用次数；"
+            "拖拽或右键可移动改组，右键可编辑别名、调用 AI 助手。"
+        )
+        self.standard_hint.setWordWrap(True)
+        self.standard_hint.setStyleSheet(f"color: {c['muted']}; font-size: 11px;")
+        std_layout.addWidget(self.standard_hint)
+
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QFrame.NoFrame)
@@ -656,16 +779,18 @@ class TagsView(QWidget):
 
         main_h_layout.addWidget(self.splitter)
         scroll_area.setWidget(container)
-        self.body_splitter.addWidget(scroll_area)
+        std_layout.addWidget(scroll_area, 1)
 
-        self.body_splitter.setStretchFactor(0, 0)
-        self.body_splitter.setStretchFactor(1, 1)
-        self.body_splitter.setSizes([300, 900])
-        self.main_layout.addWidget(self.body_splitter, 1)
+        self.work_tabs.addTab(self.standard_tab, "标准词管理")
+        self.standard_search.textChanged.connect(self._apply_standard_filter)
+        self.standard_group_filter.currentIndexChanged.connect(self._apply_standard_filter)
+
+        self.main_layout.addWidget(self.work_tabs, 1)
 
     def create_column(self, dim_id, dim_name, color):
         c = self.ui_colors
         col_widget = QFrame()
+        col_widget.setProperty("dim_id", dim_id)
         col_widget.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
         col_widget.setMinimumWidth(260)
         col_widget.setStyleSheet(f"""
@@ -804,6 +929,69 @@ class TagsView(QWidget):
             column = self.create_column(group["id"], group["name"], color)
             self.splitter.addWidget(column)
 
+        # 标准词管理视图的按组筛选随组集合更新
+        if hasattr(self, "standard_group_filter"):
+            self._refresh_standard_group_filter()
+            self._apply_standard_filter()
+
+    # --- 标准词管理视图 ---
+    def _refresh_standard_group_filter(self):
+        """重建「标准词管理」的按标签组筛选（全部 + 各合法组）。"""
+        current = self.standard_group_filter.currentData()
+        self.standard_group_filter.blockSignals(True)
+        self.standard_group_filter.clear()
+        self.standard_group_filter.addItem("全部标签组", "")
+        for g in self.tag_config.get("tag_groups", []) or []:
+            gid = (g.get("id") or "").strip()
+            if not gid or gid.lower() == "pool":
+                continue
+            self.standard_group_filter.addItem(f"{g.get('name') or gid}", gid)
+        if current:
+            idx = self.standard_group_filter.findData(current)
+            if idx >= 0:
+                self.standard_group_filter.setCurrentIndex(idx)
+        self.standard_group_filter.blockSignals(False)
+
+    def _apply_standard_filter(self):
+        """全局搜索 + 按组筛选：驱动列可见性与各列代理过滤。"""
+        query = self.standard_search.text() if hasattr(self, "standard_search") else ""
+        gid = self.standard_group_filter.currentData() if hasattr(self, "standard_group_filter") else ""
+        for dim_id, proxy in (self.column_proxies or {}).items():
+            proxy.set_filter_text(query)
+        # 按组筛选：仅显示匹配组列，其它列隐藏（不改模型/配置）
+        for i in range(self.splitter.count()):
+            col = self.splitter.widget(i)
+            col_dim = col.property("dim_id")
+            if not col_dim:
+                continue
+            if gid:
+                col.setVisible(col_dim.lower() == str(gid).lower())
+            else:
+                col.setVisible(True)
+
+    def _standard_rows(self):
+        """基于配置 + 库详情 + 别名合成标准词行（只读，供统计/测试）。"""
+        db = getattr(self.service, "db", None)
+        details = []
+        synonyms = {}
+        if db is not None:
+            try:
+                details = db.get_tags_detail() or []
+            except Exception:
+                details = []
+            if hasattr(db, "get_synonyms"):
+                try:
+                    synonyms = db.get_synonyms() or {}
+                except Exception:
+                    synonyms = {}
+        return build_standard_word_rows(self.tag_config, details, synonyms)
+
+    def _refresh_standard_aliases(self):
+        """把别名写回模型，供「标准词管理」视图展示与搜索。"""
+        rows = self._standard_rows()
+        alias_map = {r.name: r.aliases for r in rows}
+        self.model.set_aliases(alias_map)
+
     def load_data(self):
         """从配置 + 数据库加载标签；配置中的组标签优先，DB 中已标 dimension 的也归入对应组。"""
         from core.tag_normalize import DEFAULT_CLOSED_GROUP_IDS, DEFAULT_SUGGESTION_GROUP_ID
@@ -883,6 +1071,11 @@ class TagsView(QWidget):
             processed_names.add(name)
 
         self.model.set_tags(formatted_data)
+        # 标准词管理视图：补别名，刷新按组筛选
+        self._refresh_standard_aliases()
+        if hasattr(self, "standard_group_filter"):
+            self._refresh_standard_group_filter()
+            self._apply_standard_filter()
 
         if hasattr(self, "pending_panel") and self.pending_panel is not None:
             self.pending_panel.reload()
@@ -914,7 +1107,9 @@ class TagsView(QWidget):
                     tag.usage_count = detail["usage_count"]
                     idx = self.model.index(i)
                     self.model.dataChanged.emit(idx, idx, [TagListModel.USAGE_ROLE, Qt.DisplayRole])
-        
+
+        # 标准词管理视图的别名可能随处理变化
+        self._refresh_standard_aliases()
         # 使用统计仅在对话框打开时刷新（主界面不常驻）
         heat = getattr(self, "_usage_stats_widget", None)
         if heat is not None:
@@ -924,7 +1119,7 @@ class TagsView(QWidget):
                 self._usage_stats_widget = None
 
     def on_pending_resolved(self, refresh_groups: bool = True):
-        """待审处理成功后：刷新右侧组栏（批准进组）并同步模型。"""
+        """待审处理成功后：刷新标准词视图（批准进组）并同步模型。"""
         if refresh_groups:
             self.load_data()
             # 组栏已随 model 过滤更新；保存配置使标准词落盘
@@ -956,14 +1151,12 @@ class TagsView(QWidget):
         dlg.exec()
 
     def open_pending_tags_dialog(self):
-        """兼容旧入口：聚焦左侧待审面板并刷新。"""
+        """兼容旧入口：切到待审审核视图并刷新。"""
         if self.pending_panel is not None:
+            if hasattr(self, "work_tabs"):
+                self.work_tabs.setCurrentWidget(self.pending_panel)
             self.pending_panel.reload()
             self.pending_panel.setFocus()
-            if self.body_splitter is not None:
-                sizes = self.body_splitter.sizes()
-                if sizes and sizes[0] < 200:
-                    self.body_splitter.setSizes([300, max(sizes[1], 600)])
 
     def open_standard_tag_ai_assist(self, tag):
         """标准词 AI 助手：后台取建议 → 对话框确认后写库。"""

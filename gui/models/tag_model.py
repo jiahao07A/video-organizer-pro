@@ -19,19 +19,21 @@ class TagFilterProxyModel(QSortFilterProxyModel):
         
         # 维度过滤
         dim = model.data(idx, model.DIMENSION_ROLE)
-        if dim != self.dimension_id:
+        if self.dimension_id and dim != self.dimension_id:
             return False
             
-        # 文本过滤
+        # 文本过滤（标准词 + 别名）
         if self.filter_text:
-            name = model.data(idx, model.NAME_ROLE).lower()
-            if self.filter_text not in name:
+            name = model.data(idx, model.NAME_ROLE) or ""
+            aliases = model.data(idx, model.ALIASES_ROLE) or []
+            haystack = " ".join([str(name), *[str(a) for a in aliases]]).lower()
+            if self.filter_text not in haystack:
                 return False
                 
         return True
 
 class TagItem:
-    def __init__(self, id: int, name: str, dimension: str, usage_count: int = 0, color: Optional[str] = None, parent_id: Optional[int] = None, is_person: bool = False):
+    def __init__(self, id: int, name: str, dimension: str, usage_count: int = 0, color: Optional[str] = None, parent_id: Optional[int] = None, is_person: bool = False, aliases: Optional[List[str]] = None):
         self.id = id
         self.name = name
         self.dimension = dimension  # 分类 ID: "pool", "C1", "C2", etc.
@@ -39,6 +41,7 @@ class TagItem:
         self.color = color
         self.parent_id = parent_id
         self.is_person = is_person
+        self.aliases = list(aliases or [])
         self.selected = False
 
 class TagListModel(QAbstractListModel):
@@ -54,6 +57,7 @@ class TagListModel(QAbstractListModel):
     PARENT_ID_ROLE = Qt.UserRole + 7
     FULL_PATH_ROLE = Qt.UserRole + 8 # 返回 "父 > 子" 格式的完整路径
     IS_PERSON_ROLE = Qt.UserRole + 9
+    ALIASES_ROLE = Qt.UserRole + 10  # 别名列表（标准词管理视图展示用）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -91,9 +95,14 @@ class TagListModel(QAbstractListModel):
             return self.get_full_path(tag)
         elif role == self.IS_PERSON_ROLE:
             return tag.is_person
+        elif role == self.ALIASES_ROLE:
+            return list(tag.aliases)
         elif role == Qt.ToolTipRole:
             path_str = self.get_full_path(tag)
-            return f"完整路径: {path_str}\n使用次数: {tag.usage_count}"
+            tip = f"完整路径: {path_str}\n使用次数: {tag.usage_count}"
+            if tag.aliases:
+                tip += f"\n别名: {'、'.join(tag.aliases)}"
+            return tip
         
         return None
 
@@ -193,10 +202,24 @@ class TagListModel(QAbstractListModel):
                 usage_count=item.get("usage_count", 0),
                 color=item.get("color"),
                 parent_id=item.get("parent_id"),
-                is_person=bool(item.get("is_person", 0))
+                is_person=bool(item.get("is_person", 0)),
+                aliases=item.get("aliases") or [],
             )
             self._tags.append(tag)
         self.endResetModel()
+
+    def set_aliases(self, alias_map: Dict[str, List[str]]):
+        """按标准词名批量写入别名（标准词管理视图展示别名）。"""
+        alias_map = alias_map or {}
+        changed = False
+        for row, tag in enumerate(self._tags):
+            new_aliases = list(alias_map.get(tag.name, []) or [])
+            if new_aliases != tag.aliases:
+                tag.aliases = new_aliases
+                idx = self.index(row)
+                self.dataChanged.emit(idx, idx, [self.ALIASES_ROLE, Qt.ToolTipRole])
+                changed = True
+        return changed
 
     def add_tag(self, tag_data: Dict[str, Any]):
         row = len(self._tags)
@@ -208,7 +231,8 @@ class TagListModel(QAbstractListModel):
             usage_count=tag_data.get("usage_count", 0),
             color=tag_data.get("color"),
             parent_id=tag_data.get("parent_id"),
-            is_person=bool(tag_data.get("is_person", 0))
+            is_person=bool(tag_data.get("is_person", 0)),
+            aliases=tag_data.get("aliases") or [],
         )
         self._tags.append(tag)
         self.endInsertRows()

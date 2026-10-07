@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+from collections import OrderedDict
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSize, QThreadPool, QSortFilterProxyModel
 from PySide6.QtGui import QPixmap
 from ..workers.thumbnail_loader import ThumbnailLoader
@@ -14,6 +15,15 @@ COL_CATEGORY = 4
 COL_TAGS = 5
 COL_STATUS = 6
 
+# 表头只决定 SQL 排序；代理模型不能仅对已加载的一页重新排序。
+CATALOG_SORT_COLUMNS = {
+    COL_LIST_NO: "timestamp",
+    COL_LIBRARY_ID: "id",
+    COL_FILENAME: "filename",
+    COL_CATEGORY: "category",
+    COL_STATUS: "status",
+}
+
 # 旧 8 列方案中的「选择」列索引（仅用于偏好迁移，勿作数据列）
 LEGACY_COL_CHECK = 0
 LEGACY_COLUMN_COUNT = 8
@@ -26,10 +36,17 @@ class VideoTableModel(QAbstractTableModel):
         super().__init__()
         self.videos = videos or []
         self.headers = ["#", "入库编号", "缩略图", "文件名", "分类", "标签", "状态"]
-        self.thumbnail_cache = {}
+        self.thumbnail_cache = OrderedDict()
+        self.thumbnail_cache_limit = 256
         self.thumbnail_pool = QThreadPool()
         self.thumbnail_pool.setMaxThreadCount(4)
         self.loading_paths = set()
+        self._thumb_rows = {}
+        self._query_generation = 0
+        self._page_total = 0
+        self._page_offset = 0
+        self._page_limit = 100
+        self._page_loading = False
         # 代理模型可见行 -> 列表序号（由视图在刷新时可选设置；默认用源行+1）
         self._list_no_by_source_row = {}
         # 分析任务行临时态 path -> 文案（不写库）
@@ -117,16 +134,16 @@ class VideoTableModel(QAbstractTableModel):
 
         pixmap = QPixmap.fromImage(image)
 
-        if len(self.thumbnail_cache) > 200:
-            self.thumbnail_cache.pop(next(iter(self.thumbnail_cache)))
-
+        self.thumbnail_cache.pop(path, None)
         self.thumbnail_cache[path] = pixmap
+        while len(self.thumbnail_cache) > self.thumbnail_cache_limit:
+            self.thumbnail_cache.popitem(last=False)
 
-        for row, video in enumerate(self.videos):
-            if video.get("thumbnail_path") == path or video.get("thumbnail") == path:
-                tl = self.index(row, COL_THUMB)
-                br = self.index(row, COL_THUMB)
-                self.dataChanged.emit(tl, br, [Qt.DecorationRole])
+        for row in self._thumb_rows.get(path, ()):
+            if 0 <= row < len(self.videos):
+                idx = self.index(row, COL_THUMB)
+                self.dataChanged.emit(idx, idx, [Qt.DecorationRole])
+        self._thumb_rows.pop(path, None)
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self.videos)):
@@ -182,10 +199,13 @@ class VideoTableModel(QAbstractTableModel):
                     return None
 
                 if thumb_path in self.thumbnail_cache:
-                    return self.thumbnail_cache[thumb_path]
+                    pixmap = self.thumbnail_cache.pop(thumb_path)
+                    self.thumbnail_cache[thumb_path] = pixmap
+                    return pixmap
 
                 if thumb_path not in self.loading_paths and os.path.exists(thumb_path):
                     self.loading_paths.add(thumb_path)
+                    self._thumb_rows.setdefault(thumb_path, set()).add(row)
                     loader = ThumbnailLoader(thumb_path, QSize(320, 180))
                     loader.signals.loaded.connect(self.on_thumbnail_loaded)
                     self.thumbnail_pool.start(loader)
@@ -207,11 +227,40 @@ class VideoTableModel(QAbstractTableModel):
             return self.headers[section]
         return None
 
+    def append_data(self, extra_videos):
+        """Append the next catalog page without resetting selection or delegates."""
+        extra = list(extra_videos or [])
+        if not extra:
+            return
+        start = len(self.videos)
+        end = start + len(extra) - 1
+        self.beginInsertRows(QModelIndex(), start, end)
+        self.videos.extend(extra)
+        for row, video in enumerate(self.videos[start:], start=start):
+            thumb = video.get("thumbnail_path") or video.get("thumbnail")
+            if thumb:
+                self._thumb_rows.setdefault(thumb, set()).add(row)
+        self.endInsertRows()
+
     def update_data(self, new_videos):
         self.beginResetModel()
-        self.videos = new_videos
-        self.thumbnail_cache.clear()
-        self.loading_paths.clear()
+        self.videos = list(new_videos or [])
+        # Retain decoded thumbnails that are still present in the new query.
+        valid_paths = {
+            v.get("thumbnail_path") or v.get("thumbnail")
+            for v in self.videos
+            if v.get("thumbnail_path") or v.get("thumbnail")
+        }
+        self.thumbnail_cache = OrderedDict(
+            (p, pix) for p, pix in self.thumbnail_cache.items() if p in valid_paths
+        )
+        self.loading_paths.intersection_update(valid_paths)
+        self._thumb_rows = {}
+        for row, video in enumerate(self.videos):
+            thumb = video.get("thumbnail_path") or video.get("thumbnail")
+            if thumb:
+                self._thumb_rows.setdefault(thumb, set()).add(row)
+        self._query_generation += 1
         self._list_no_by_source_row = {}
         self.endResetModel()
 

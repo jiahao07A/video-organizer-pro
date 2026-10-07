@@ -9,13 +9,14 @@ from PySide6.QtWidgets import (
     QDialog, QFileDialog, QTreeView, QListView as QtListView, QCheckBox,
     QToolButton, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QEvent, QObject
+from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QEvent, QObject, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from ..widgets.filter_panel import FilterPanel
 from ..widgets.detail_panel import DetailPanel
 from ..widgets.delegates import CardDelegate, MaterialTagsColumnDelegate, StatusDelegate, ThumbnailDelegate
 from ..models.video_table import (
     VideoTableModel,
+    CATALOG_SORT_COLUMNS,
     COL_FILENAME,
     COL_LIBRARY_ID,
     COL_LIST_NO,
@@ -32,6 +33,7 @@ from ..workers.io_worker import run_io_job
 from ..widgets.rename_dialog import BatchRenameDialog
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from gui.styles import normalize_theme
+from ..workers.catalog_worker import run_catalog_query
 
 
 class _ClearSelectionOnEmptyClickFilter(QObject):
@@ -62,6 +64,20 @@ class WorkstationView(QWidget):
         self.service = service
         self.settings = service.settings
         self.worker = None
+        self._query_generation = 0
+        self._detail_generation = 0
+        self._page_offset = 0
+        self._page_total = 0
+        self._page_limit = 100
+        self._page_loading = False
+        self._order_by = "timestamp"
+        self._descending = True
+        self._filter_params = {}
+        self._query_debounce = QTimer(self)
+        self._query_debounce.setSingleShot(True)
+        self._query_debounce.setInterval(180)
+        self._query_debounce.timeout.connect(self._load_query_page)
+        self._query_pending = False
         self.setup_ui()
         self._refresh_scope_path_ui()
 
@@ -161,7 +177,8 @@ class WorkstationView(QWidget):
         self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
         self.table_view.setModel(self.proxy_model)
-        self.table_view.setSortingEnabled(True)
+        # SQL catalog owns ordering for the loaded window.
+        self.table_view.setSortingEnabled(False)
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table_view.setAlternatingRowColors(True)
@@ -192,7 +209,11 @@ class WorkstationView(QWidget):
         self.proxy_model.modelReset.connect(self._refresh_list_numbers)
         self.proxy_model.rowsInserted.connect(lambda *_: self._refresh_list_numbers())
         self.proxy_model.rowsRemoved.connect(lambda *_: self._refresh_list_numbers())
-        header.sortIndicatorChanged.connect(lambda *_: self._refresh_list_numbers())
+        header.setSortIndicator(-1, Qt.DescendingOrder)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sortIndicatorChanged.connect(self._on_catalog_sort_changed)
+        self.table_view.verticalScrollBar().valueChanged.connect(self._maybe_fetch_more)
 
         table_layout.addWidget(self.table_view)
 
@@ -209,6 +230,9 @@ class WorkstationView(QWidget):
         self.card_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.card_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.card_view.customContextMenuRequested.connect(self.show_context_menu)
+        self.card_view.verticalScrollBar().valueChanged.connect(
+            lambda value: self._maybe_fetch_more(value, self.card_view)
+        )
 
         self.view_stack.addWidget(table_container)
         self.view_stack.addWidget(self.card_view)
@@ -324,23 +348,29 @@ class WorkstationView(QWidget):
         return paths
 
     def _get_visible_paths(self) -> list:
-        """当前筛选/排序后的可见列表路径。"""
-        paths = []
-        for visual in range(self.proxy_model.rowCount()):
-            src = self.proxy_model.mapToSource(self.proxy_model.index(visual, 0)).row()
-            if not (0 <= src < len(self.model.videos)):
-                continue
-            p = self.model.videos[src].get("path")
-            if p:
-                paths.append(p)
-        return paths
+        """Resolve all rows matching the current query, not only loaded rows."""
+        return self.service.resolve_visible_video_paths(
+            self._current_filter_params(),
+            scope_paths=self._work_scope_query_paths(),
+            order_by=self._order_by,
+            descending=self._descending,
+        )
+
+    def _current_filter_params(self) -> dict:
+        params = dict(self._filter_params or {})
+        params["text"] = self.search_input.text()
+        return params
 
     def _scope_paths(self) -> list:
-        """工作范围内已入库视频路径。"""
-        return [v.get("path") for v in self.service.get_videos_in_work_scope() if v.get("path")]
+        """工作范围内已入库视频路径，供操作目标集求交。"""
+        return self.service.get_work_scope_video_paths()
+
+    def _work_scope_query_paths(self) -> list:
+        """原始工作范围路径，供 SQL 前缀查询；不展开成全部视频路径。"""
+        return self.service.get_work_scope_paths()
 
     def _resolve_batch_targets(self) -> list:
-        """批量操作目标：有选中用选中，无选中用可见；始终 ⊆ 工作范围。"""
+        """批量操作目标：有选中用选中，无选中用完整可见结果。"""
         selected = self._get_selected_paths()
         visible = self._get_visible_paths()
         return self.service.resolve_operation_target_paths(
@@ -521,12 +551,96 @@ class WorkstationView(QWidget):
             self.view_switch_btn.setText("切换视图")
 
     def filter_text_changed(self, text):
-        self.proxy_model.set_filter_params({"text": text})
-        self._refresh_list_numbers()
+        self._filter_params = dict(self._filter_params)
+        self._filter_params["text"] = text
+        self.proxy_model.set_filter_params({})
+        self._schedule_query_reload()
 
     def apply_advanced_filter(self, params):
-        self.proxy_model.set_filter_params(params)
-        self._refresh_list_numbers()
+        self._filter_params = dict(params or {})
+        self._filter_params["text"] = self.search_input.text()
+        self.proxy_model.set_filter_params({})
+        self._schedule_query_reload()
+
+    def _on_catalog_sort_changed(self, column, order):
+        # 缩略图和标签列没有定义 SQL 排序，保留当前有效排序指示。
+        if column not in CATALOG_SORT_COLUMNS and column != -1:
+            header = self.table_view.horizontalHeader()
+            header.blockSignals(True)
+            previous = next((c for c, key in CATALOG_SORT_COLUMNS.items() if key == self._order_by), -1)
+            header.setSortIndicator(previous, Qt.DescendingOrder if self._descending else Qt.AscendingOrder)
+            header.blockSignals(False)
+            return
+        self._order_by = CATALOG_SORT_COLUMNS.get(column, "timestamp")
+        self._descending = order == Qt.DescendingOrder
+        self._schedule_query_reload()
+
+    def _schedule_query_reload(self):
+        self._query_pending = True
+        self._query_debounce.start()
+
+    def _load_query_page(self, *, reset=True):
+        if not self._query_pending and reset:
+            return
+        self._query_pending = False
+        scope = self._work_scope_query_paths()
+        if reset:
+            self._query_generation += 1
+            generation = self._query_generation
+            offset = 0
+            self._page_offset = 0
+            self._page_total = 0
+        else:
+            generation = self._query_generation
+            offset = self._page_offset
+        params = self._current_filter_params()
+        self._page_loading = True
+        if reset:
+            self.status_label.setText("正在查询工作范围…")
+
+        def on_ok(page):
+            if generation != self._query_generation:
+                return
+            self._page_loading = False
+            if reset:
+                self.model.update_data(page.rows)
+            else:
+                self.model.append_data(page.rows)
+            self._page_offset = page.offset + len(page.rows)
+            self._page_total = page.total_count
+            self._refresh_list_numbers()
+            self._refresh_scope_path_ui()
+            self.status_label.setText(f"工作范围内共 {page.total_count} 个已入库视频，已加载 {self._page_offset} 个")
+            self.status_message.emit(self.status_label.text())
+
+        def on_fail(message):
+            if generation != self._query_generation:
+                return
+            self._page_loading = False
+            self.status_label.setText(f"查询失败：{message}")
+            self.status_message.emit(self.status_label.text())
+
+        run_catalog_query(
+            self,
+            fn=lambda: self.service.query_video_page(
+                params,
+                scope_paths=scope,
+                offset=offset,
+                limit=self._page_limit,
+                order_by=self._order_by,
+                descending=self._descending,
+            ),
+            on_ok=on_ok,
+            on_fail=on_fail,
+        )
+
+    def _maybe_fetch_more(self, value, view=None):
+        view = view or self.table_view
+        bar = view.verticalScrollBar()
+        if self._query_pending or self._page_loading or self._page_offset >= self._page_total:
+            return
+        if value >= max(0, bar.maximum() - 12):
+            self._load_query_page(reset=False)
 
     def _collect_dialog_paths(self, dialog: QFileDialog) -> list:
         """从非原生文件对话框收集多选路径（文件 + 文件夹）。"""
@@ -582,44 +696,58 @@ class WorkstationView(QWidget):
         self.path_input.setToolTip("\n".join(paths))
 
     def load_data(self):
-        """从服务层加载「工作范围内」的已入库视频；空范围显示空列表与提示。"""
+        """后台加载工作范围内的首批列表页。"""
         scope = self.service.get_work_scope_paths()
-        videos = self.service.get_videos_in_work_scope()
-        self.model.update_data(videos)
-        if hasattr(self, "_refresh_list_numbers"):
-            self._refresh_list_numbers()
         self._refresh_scope_path_ui()
         if not scope:
+            # 空范围也要使进行中的旧查询失效，防止结果迟到后恢复旧行。
+            self._query_generation += 1
+            self._detail_generation += 1
+            self._page_loading = False
+            self._page_offset = 0
+            self._page_total = 0
+            self._query_pending = False
+            self._query_debounce.stop()
+            self.model.update_data([])
             self.status_label.setText("请先设定工作范围：点击「浏览」选择文件或文件夹")
             self.status_message.emit(self.status_label.text())
-        else:
-            self.status_label.setText(f"工作范围内共 {len(videos)} 个已入库视频")
-            self.status_message.emit(self.status_label.text())
+            return
+        self._query_pending = True
+        self._load_query_page(reset=True)
+
 
     def on_selection_changed(self, selected, deselected):
+        self._detail_generation += 1
+        generation = self._detail_generation
         if self.view_stack.currentWidget() == self.card_view:
             indexes = self.card_view.selectionModel().selectedIndexes()
         else:
             indexes = self.table_view.selectionModel().selectedRows()
-
+        self.detail_panel.save_btn.setEnabled(False)
         if not indexes:
             return
-
-        rows = sorted(list(set(idx.row() for idx in indexes)))
-
+        rows = sorted(set(idx.row() for idx in indexes))
         if len(rows) > 1:
-            selected_videos = []
-            for row in rows:
-                proxy_idx = self.proxy_model.index(row, 0)
-                source_idx = self.proxy_model.mapToSource(proxy_idx)
-                selected_videos.append(self.model.videos[source_idx.row()])
+            selected_videos = [
+                self.model.videos[self.proxy_model.mapToSource(self.proxy_model.index(row, 0)).row()]
+                for row in rows
+            ]
             self.detail_panel.load_video_data(selected_videos)
-        elif len(rows) == 1:
-            proxy_idx = self.proxy_model.index(rows[0], 0)
-            source_idx = self.proxy_model.mapToSource(proxy_idx)
-            video_data = self.model.videos[source_idx.row()]
-            self.video_selected.emit(video_data)
-            self.detail_panel.load_video_data(video_data)
+            return
+        source_idx = self.proxy_model.mapToSource(self.proxy_model.index(rows[0], 0))
+        path = self.model.videos[source_idx.row()]["path"]
+
+        def on_ok(detail):
+            if generation == self._detail_generation and detail:
+                self.video_selected.emit(detail)
+                self.detail_panel.load_video_data(detail)
+
+        run_catalog_query(
+            self,
+            fn=lambda: self.service.get_video_detail(path),
+            on_ok=on_ok,
+            worker_key="_detail_worker",
+        )
 
     def show_context_menu(self, pos):
         sender = self.sender()
