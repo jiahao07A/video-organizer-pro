@@ -1,7 +1,7 @@
 # 统一 AI 请求并修复请求旁路与客户端生命周期
 
 Status: claimed
-GitHub Issue: 待网络恢复后创建
+GitHub Issue: #4
 Branch: refactor/ai-request-reliability
 
 ## 背景
@@ -73,6 +73,7 @@ Branch: refactor/ai-request-reliability
 - 已读取 `CONTEXT.md`、相关 ADR、Subagent 工作规范、Issue 追踪规范和现有 AI/分析测试。
 - 初始基线未能运行：当时 Python 环境缺少 `pytest` 模块；已安装测试依赖后完成请求/分析相关验证。
 - GitHub Issue 创建尝试因当前网络无法连接 GitHub API 失败，待网络恢复后补建并回填编号。
+- 已新增 GitHub Issue #4，作为本任务共享追踪身份。
 - 已新增 `core/ai_gateway.py`，并将视频分析、标签库 AI、标签导入和音频转录接入统一网关。
 - 已补充 `response_format` 兼容回退、空响应解析、供应商连接缓存失效和空响应重试规则。
 - 验证：`py -m compileall -q core gui tests` 通过；AI/分析/核心服务相关测试累计 92 个通过。
