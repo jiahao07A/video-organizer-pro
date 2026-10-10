@@ -23,7 +23,7 @@ from xml.sax.saxutils import escape
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Set, Union, Any, Callable
-from openai import OpenAI
+from core.ai_gateway import AiRequestGateway
 from core.video_catalog import VideoCatalog, VideoQuery
 
 # 资源路径处理函数
@@ -1086,28 +1086,66 @@ class VideoProcessor:
         return {"frames": base64_frames, "thumbnail": thumbnail_path, "phash": phash}
 
 class AudioTranscriber:
-    """音频转录逻辑 (Whisper)"""
+    """音频转录前处理；实际 API 请求统一交给 AiRequestGateway。"""
+
     @staticmethod
-    def transcribe(video_path: str, api_key: str, base_url: str) -> str:
+    def transcribe(
+        video_path: str,
+        api_key: str = "",
+        base_url: str = "",
+        *,
+        gateway: Optional[AiRequestGateway] = None,
+        retry_config=None,
+        cancel_event=None,
+        sleeper=None,
+    ) -> str:
+        """提取临时音频并通过统一网关转录。
+
+        保留旧的 api_key/base_url 参数以兼容外部调用；活动代码传入 gateway，
+        不再在此处自行创建 OpenAI 客户端。
+        """
+        audio_path = video_path + ".mp3"
         try:
-            client = OpenAI(api_key=api_key, base_url=base_url)
-            audio_path = video_path + ".mp3"
-            # 检查 ffmpeg 是否可用
             subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", "-f", "mp3", audio_path], 
-                           capture_output=True, check=True)
-            
-            with open(audio_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1", 
-                    file=audio_file,
-                    response_format="text"
-                )
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-            return str(transcript)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", video_path, "-vn", "-ar", "16000",
+                    "-ac", "1", "-ab", "64k", "-f", "mp3", audio_path,
+                ],
+                capture_output=True,
+                check=True,
+            )
+
+            use_gateway = gateway
+            if use_gateway is None:
+                # 兼容旧的静态调用者，但仍通过同一网关实现请求、重试和解析。
+                legacy_settings = {
+                    "api": {"key": api_key or "", "base_url": base_url or ""},
+                    "model_providers": [],
+                    "current_provider_id": "",
+                }
+                use_gateway = AiRequestGateway(legacy_settings)
+            transcript = use_gateway.transcribe_audio(
+                audio_path,
+                task_key="content_description",
+                model="whisper-1",
+                retry_config=retry_config,
+                cancel_event=cancel_event,
+                sleeper=sleeper,
+            )
+            if transcript is None:
+                failure = use_gateway.get_last_failure()
+                return f"转录失败: {(failure.message if failure else 'AI 未返回转录结果')}"
+            return transcript
         except Exception as e:
             return f"转录失败 (请确保已安装 ffmpeg): {e}"
+        finally:
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except OSError:
+                logger.debug("清理临时音频失败: %s", audio_path, exc_info=True)
+
 
 class MetadataInjector:
     """元数据注入逻辑 (XMP/FFmpeg)"""
@@ -1128,71 +1166,54 @@ class MetadataInjector:
             return False
 
 class AIHandler:
-    """封装 AI 分析逻辑，支持缓存、动态标签发现和自定义 Prompt"""
-    
+    """AI 业务门面；具体请求传输统一由 AiRequestGateway 完成。"""
+
     def __init__(self, settings: Dict, db: Optional[DatabaseManager] = None, tag_config: Optional[Dict] = None):
         self.settings = settings
         self.db = db
         self.tag_config = tag_config
-        
-        api_key = SettingsManager.get_setting(settings, "api.key", "")
-        base_url = SettingsManager.get_setting(settings, "api.base_url", "")
-        
-        self.client = OpenAI(
-            api_key=api_key or "EMPTY",
-            base_url=base_url or None,
-            # 调用层重试由 _get_api_response 统一负责，避免与 max_retries 叠加烧费用
-            max_retries=0,
-            timeout=45.0
-        )
-        self._clients_by_provider: Dict[str, Any] = {}
-        
-        # 模型路由 - 动态获取，不再缓存到成员变量
-        self.tag_lib_lock = threading.Lock()
-        # 每线程独立的上次 API 失败信息（避免并行 worker 串台）
+        self._last_api_failure = None
         self._tls = threading.local()
-        
-        # 初始化标签库
+        self._retry_sleeper: Optional[Callable[[float], None]] = None
+        self._job_retry_config = None
+        self._job_metrics = None
+        self.analysis_cancel_event = None
+
+        self.gateway = AiRequestGateway(
+            self.settings,
+            metrics_recorder=self._record_api_metrics,
+        )
+        # 保留 client 属性作为兼容门面和测试注入接缝；生产请求仍由 gateway 统一处理。
+        self.client = self.gateway.default_client()
+        self._clients_by_provider = self.gateway.client_cache
+
+        self.tag_lib_lock = threading.Lock()
         self.init_tag_libraries()
 
     def reload_client(self):
-        """设置变更后重建默认 OpenAI 客户端（当前供应商写穿字段）。"""
-        api_key = SettingsManager.get_setting(self.settings, "api.key", "")
-        base_url = SettingsManager.get_setting(self.settings, "api.base_url", "")
-        self.client = OpenAI(
-            api_key=api_key or "EMPTY",
-            base_url=base_url or None,
-            max_retries=0,
-            timeout=45.0,
-        )
-        # 按供应商缓存的客户端在配置变更后失效
-        self._clients_by_provider = {}
+        """设置变更后清空所有连接缓存并重建当前供应商客户端。"""
+        self.gateway.settings = self.settings
+        self.client = self.gateway.reload()
         logger.info("AI 客户端已按最新配置重建")
 
     def resolve_task_route(self, task_key: str) -> Dict:
         """任务模型路由解析（ADR-0006）。"""
-        from core.model_providers import resolve_task_route
-
-        return resolve_task_route(self.settings, task_key)
+        return self.gateway.resolve_route(task_key)
 
     def client_for_task(self, task_key: str):
-        """按任务路由返回 OpenAI 客户端（同 provider 复用缓存）。"""
-        route = self.resolve_task_route(task_key)
-        pid = str(route.get("provider_id") or "") or "_default"
-        cache = getattr(self, "_clients_by_provider", None)
-        if cache is None:
-            self._clients_by_provider = {}
-            cache = self._clients_by_provider
-        client = cache.get(pid)
-        if client is None:
-            client = OpenAI(
-                api_key=(route.get("api_key") or "EMPTY"),
-                base_url=(route.get("base_url") or None),
-                max_retries=0,
-                timeout=45.0,
-            )
-            cache[pid] = client
-        return client, route
+        """按任务路由返回 OpenAI 客户端；连接配置变化会自动使用新缓存键。"""
+        self.gateway.settings = self.settings
+        return self.gateway.client_for_task(task_key)
+
+    def transcribe_audio(self, video_path: str) -> str:
+        """抽取并转录音频；调用层由统一网关处理。"""
+        return AudioTranscriber.transcribe(
+            video_path,
+            gateway=self.gateway,
+            retry_config=getattr(self, "_job_retry_config", None),
+            cancel_event=getattr(self, "analysis_cancel_event", None),
+            sleeper=getattr(self, "_retry_sleeper", None),
+        )
 
     def init_tag_libraries(self):
         """同步设置或 tag_config.json 中的标签到数据库"""
@@ -1238,131 +1259,26 @@ class AIHandler:
         task_key: Optional[str] = None,
         client=None,
     ) -> Optional[Dict]:
-        """调用 AI；对瞬时错误做调用层重试（ADR-0005）。
-
-        task_key 非空时按任务模型路由选客户端与（若 model 未覆盖）模型名。
-        失败时写入 self._last_api_failure: ApiCallFailure，供单条层决定是否 B 重试。
-        """
-        from core.analysis_job_policy import (
-            ApiCallFailure,
-            RetryConfig,
-            is_retriable,
-            should_retry_call,
-            sleep_backoff,
+        """兼容门面：所有聊天请求委托给 AiRequestGateway。"""
+        self.gateway.settings = self.settings
+        # 无 task_key 的显式 client 仍保留给测试/兼容调用；生产入口必须传 task_key。
+        use_client = client if client is not None else (None if task_key else self.client)
+        result = self.gateway.request_chat(
+            model=model,
+            system_prompt=system_prompt,
+            content_parts=content_parts,
+            json_mode=json_mode,
+            task_key=task_key,
+            client=use_client,
+            retry_config=getattr(self, "_job_retry_config", None),
+            cancel_event=getattr(self, "analysis_cancel_event", None),
+            sleeper=getattr(self, "_retry_sleeper", None),
         )
-
-        use_client = client
-        use_model = model
-        if task_key:
-            use_client, route = self.client_for_task(task_key)
-            use_model = (route.get("model") or model or "gemini-2.0-flash")
-        if use_client is None:
-            use_client = self.client
-
-        cfg = getattr(self, "_job_retry_config", None) or RetryConfig.from_settings(self.settings)
-        sleeper = getattr(self, "_retry_sleeper", None)
-        cancel_ev = getattr(self, "analysis_cancel_event", None)
-        attempt = 0
-        last_err: Optional[BaseException] = None
-        self._last_api_failure = None
-        # 同步清理线程局部，避免读到过期失败
+        failure = self.gateway.get_last_failure()
+        self._last_api_failure = failure
         if getattr(self, "_tls", None) is not None:
-            self._tls.last_api_failure = None
-
-        while True:
-            if cancel_ev is not None and cancel_ev.is_set():
-                logger.info("AI 调用因用户取消而中止")
-                fail = ApiCallFailure(
-                    message="用户取消", retriable=False, cancelled=True
-                )
-                self._last_api_failure = fail
-                if getattr(self, "_tls", None) is not None:
-                    self._tls.last_api_failure = fail
-                return None
-            attempt += 1
-            logger.info(f"正在调用 AI 模型: {use_model} (JSON 模式: {json_mode}, 尝试 {attempt})")
-            try:
-                kwargs = {
-                    "model": use_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": content_parts}
-                    ],
-                    "temperature": 0.2,
-                }
-                if json_mode:
-                    kwargs["response_format"] = {"type": "json_object"}
-
-                response = use_client.chat.completions.create(**kwargs)
-                res_content = response.choices[0].message.content
-
-                if res_content is None or (isinstance(res_content, str) and not res_content.strip()):
-                    raise ValueError("empty body")
-
-                if json_mode:
-                    data = json.loads(res_content)
-                    logger.debug("AI 响应解析成功")
-                    self._last_api_failure = None
-                    if getattr(self, "_tls", None) is not None:
-                        self._tls.last_api_failure = None
-                    self._record_api_metrics(
-                        attempt=attempt,
-                        model=str(use_model or ""),
-                        task_key=task_key or "",
-                        ok=True,
-                    )
-                    return data
-                self._last_api_failure = None
-                if getattr(self, "_tls", None) is not None:
-                    self._tls.last_api_failure = None
-                self._record_api_metrics(
-                    attempt=attempt,
-                    model=str(use_model or ""),
-                    task_key=task_key or "",
-                    ok=True,
-                )
-                return res_content
-            except Exception as e:
-                last_err = e
-                logger.error(f"AI API 调用出错: {e}")
-                msg = str(e) or e.__class__.__name__
-                if len(msg) > 200:
-                    msg = msg[:200] + "…"
-                retriable = is_retriable(e)
-                self._record_api_metrics(
-                    attempt=attempt,
-                    model=str(use_model or ""),
-                    task_key=task_key or "",
-                    ok=False,
-                    error=msg,
-                    retriable=retriable,
-                )
-                if not retriable:
-                    fail = ApiCallFailure(
-                        message=msg, retriable=False, cancelled=False
-                    )
-                    self._last_api_failure = fail
-                    if getattr(self, "_tls", None) is not None:
-                        self._tls.last_api_failure = fail
-                    return None
-                if not should_retry_call(attempt, call_extra_attempts=cfg.call_extra_attempts):
-                    fail = ApiCallFailure(
-                        message=msg, retriable=True, cancelled=False
-                    )
-                    self._last_api_failure = fail
-                    if getattr(self, "_tls", None) is not None:
-                        self._tls.last_api_failure = fail
-                    return None
-                sleep_backoff(attempt, config=cfg, sleeper=sleeper)
-
-        if last_err:
-            logger.error(f"AI API 重试耗尽: {last_err}")
-            msg = str(last_err) or last_err.__class__.__name__
-            fail = ApiCallFailure(message=msg, retriable=True)
-            self._last_api_failure = fail
-            if getattr(self, "_tls", None) is not None:
-                self._tls.last_api_failure = fail
-        return None
+            self._tls.last_api_failure = failure
+        return result
 
     def _record_api_metrics(
         self,
@@ -1391,6 +1307,11 @@ class AIHandler:
 
     def get_last_api_failure(self):
         """线程安全读取上次 API 失败。"""
+        gateway = getattr(self, "gateway", None)
+        if gateway is not None:
+            failure = gateway.get_last_failure()
+            if failure is not None:
+                return failure
         tls = getattr(self, "_tls", None)
         if tls is not None and getattr(tls, "last_api_failure", None) is not None:
             return tls.last_api_failure
@@ -4381,13 +4302,7 @@ class VideoOrganizerService:
                 if SettingsManager.get_setting(
                     self.settings, "processing.enable_audio_transcription"
                 ):
-                    api_key = SettingsManager.get_setting(self.settings, "api.key", "")
-                    base_url = SettingsManager.get_setting(
-                        self.settings, "api.base_url", ""
-                    )
-                    transcription = AudioTranscriber.transcribe(
-                        video_path, api_key, base_url
-                    )
+                    transcription = self.ai.transcribe_audio(video_path)
 
                 metadata_injected = False
                 if SettingsManager.get_setting(

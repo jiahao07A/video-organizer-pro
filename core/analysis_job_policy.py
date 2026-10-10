@@ -170,6 +170,9 @@ def is_retriable(error: Any) -> bool:
         "rate limit",
         "empty body",
         "empty response",
+        "empty choices",
+        "empty message",
+        "empty transcription",
         "expecting value",  # json.JSONDecodeError 空 body
         "json decode",
         "jsondecodeerror",
