@@ -21,6 +21,7 @@ def test_is_retriable_timeout_and_http():
     assert is_retriable(TimeoutError("timeout"))
     assert is_retriable("Connection reset by peer")
     assert is_retriable("HTTP 429 rate limit")
+    assert is_retriable("empty choices")
     assert is_retriable({"status_code": 503, "message": "bad gateway"})
     assert is_retriable(json.JSONDecodeError("Expecting value", "", 0))
     assert is_retriable("Expecting value: line 1 column 1")
