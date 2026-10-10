@@ -2,6 +2,7 @@
 
 Status: claimed
 GitHub Issue: #4
+PR: #5
 Branch: refactor/ai-request-reliability
 
 ## 背景
