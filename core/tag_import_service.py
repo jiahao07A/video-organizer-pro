@@ -96,16 +96,11 @@ class TagImportService:
 4. 禁止输出 pool。
 """
 
-        from core.video_organizer_service import SettingsManager
-
-        model_map = SettingsManager.get_setting(self.ai.settings, "api.model_personalization", {})
-        model = model_map.get("tag_generation", "gemini-2.0-flash")
-
         result = self.ai._get_api_response(
-            model=model,
+            model="",
             system_prompt=system_prompt,
             content_parts=[{"type": "text", "text": user_prompt}],
-            json_mode=True,
+            task_key="tag_generation",
         )
 
         if not result:
