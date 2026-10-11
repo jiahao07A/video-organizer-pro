@@ -19,6 +19,7 @@ import logging
 import sys
 import numpy as np
 import subprocess
+import tempfile
 from xml.sax.saxutils import escape
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1104,47 +1105,43 @@ class AudioTranscriber:
         保留旧的 api_key/base_url 参数以兼容外部调用；活动代码传入 gateway，
         不再在此处自行创建 OpenAI 客户端。
         """
-        audio_path = video_path + ".mp3"
         try:
             subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", video_path, "-vn", "-ar", "16000",
-                    "-ac", "1", "-ab", "64k", "-f", "mp3", audio_path,
-                ],
-                capture_output=True,
-                check=True,
-            )
+            # 本次独占临时目录，避免覆盖或清理源素材旁的既有同名音频。
+            with tempfile.TemporaryDirectory(prefix="video-organizer-audio-") as temp_dir:
+                audio_path = os.path.join(temp_dir, "audio.mp3")
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", video_path, "-vn", "-ar", "16000",
+                        "-ac", "1", "-ab", "64k", "-f", "mp3", audio_path,
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
 
-            use_gateway = gateway
-            if use_gateway is None:
-                # 兼容旧的静态调用者，但仍通过同一网关实现请求、重试和解析。
-                legacy_settings = {
-                    "api": {"key": api_key or "", "base_url": base_url or ""},
-                    "model_providers": [],
-                    "current_provider_id": "",
-                }
-                use_gateway = AiRequestGateway(legacy_settings)
-            transcript = use_gateway.transcribe_audio(
-                audio_path,
-                task_key="content_description",
-                model="whisper-1",
-                retry_config=retry_config,
-                cancel_event=cancel_event,
-                sleeper=sleeper,
-            )
-            if transcript is None:
-                failure = use_gateway.get_last_failure()
-                return f"转录失败: {(failure.message if failure else 'AI 未返回转录结果')}"
-            return transcript
+                use_gateway = gateway
+                if use_gateway is None:
+                    # 兼容旧的静态调用者，但仍通过同一网关实现请求、重试和解析。
+                    legacy_settings = {
+                        "api": {"key": api_key or "", "base_url": base_url or ""},
+                        "model_providers": [],
+                        "current_provider_id": "",
+                    }
+                    use_gateway = AiRequestGateway(legacy_settings)
+                transcript = use_gateway.transcribe_audio(
+                    audio_path,
+                    task_key="content_description",
+                    model="whisper-1",
+                    retry_config=retry_config,
+                    cancel_event=cancel_event,
+                    sleeper=sleeper,
+                )
+                if transcript is None:
+                    failure = use_gateway.get_last_failure()
+                    return f"转录失败: {(failure.message if failure else 'AI 未返回转录结果')}"
+                return transcript
         except Exception as e:
             return f"转录失败 (请确保已安装 ffmpeg): {e}"
-        finally:
-            try:
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
-            except OSError:
-                logger.debug("清理临时音频失败: %s", audio_path, exc_info=True)
 
 
 class MetadataInjector:
