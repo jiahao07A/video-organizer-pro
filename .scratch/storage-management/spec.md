@@ -153,12 +153,12 @@ PR: 待创建（仅文档，不关闭实现父议题）
 
 本地每项独立记录在 `issues/` 下，并与 GitHub 子议题双向关联。用户已确认以下拆分与依赖：
 
-1. 可靠备份与受控恢复：无前置。
-2. 一次性升级迁移：依赖 01。
-3. 统一便携数据目录：依赖 02。
-4. 设置与标签存储一致性：依赖 03。
-5. 素材按需读写与显式导出：依赖 03。
-6. 完整性能与恢复验收：依赖 04、05。
+1. [可靠备份与受控恢复](issues/01-consistent-backup-restore.md)：GitHub [#8](https://github.com/jiahao07A/video-organizer-pro/issues/8)，无前置。
+2. [一次性升级迁移](issues/02-gated-one-time-upgrade.md)：GitHub [#9](https://github.com/jiahao07A/video-organizer-pro/issues/9)，依赖 01 / #8。
+3. [统一便携数据目录](issues/03-portable-data-directory.md)：GitHub [#10](https://github.com/jiahao07A/video-organizer-pro/issues/10)，依赖 02 / #9。
+4. [设置与标签存储一致性](issues/04-settings-tag-authority.md)：GitHub [#12](https://github.com/jiahao07A/video-organizer-pro/issues/12)，依赖 03 / #10。
+5. [素材按需读写与显式导出](issues/05-targeted-writes-explicit-exports.md)：GitHub [#11](https://github.com/jiahao07A/video-organizer-pro/issues/11)，依赖 03 / #10。
+6. [完整性能与恢复验收](issues/06-process-performance-recovery.md)：GitHub [#13](https://github.com/jiahao07A/video-organizer-pro/issues/13)，依赖 04、05 / #12、#11。
 
 实现入口是 01。每项从最新已集成的前置成果创建独立分支并经 PR 合入；04 与 05 仅在 03 完成后可以分别开展。文档 PR 合并不表示这些任务已经完成，也不自动关闭父议题。
 
@@ -193,3 +193,7 @@ PR: 待创建（仅文档，不关闭实现父议题）
 ### 2026-10-11 状态更新
 
 工作区最初干净；读取项目流程、上下文与全部既有 ADR，检查相关代码与本地规格。已建立父议题 #7，并从已同步主干建立独立文档分支。实际性能和故障路径均待实现阶段验证。
+
+### 2026-10-11 任务发布与依赖验证
+
+已建立六个 GitHub 子议题及一议题一文件的本地记录，均使用 ready-for-agent 标签。GitHub 原生父子关系与阻塞关系已创建并回读核对：#8 无前置，#9 被 #8 阻塞，#10 被 #9 阻塞，#12 与 #11 被 #10 阻塞，#13 被 #12、#11 阻塞。当前实现入口是 01 / #8；文档待 PR 审阅，本次没有启动实现或执行生产数据操作。
