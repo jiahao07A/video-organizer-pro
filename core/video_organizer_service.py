@@ -25,6 +25,11 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Set, Union, Any, Callable
 from core.ai_gateway import AiRequestGateway
+from core.storage_backup import (
+    STORAGE_IO_LOCK,
+    StorageBackupError,
+    StorageBackupManager,
+)
 from core.video_catalog import VideoCatalog, VideoQuery
 
 # 资源路径处理函数
@@ -164,7 +169,7 @@ class DatabaseManager:
     
     def __init__(self, db_path: str = DB_FILE):
         self.db_path = db_path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self._init_db()
 
     def _get_connection(self):
@@ -944,24 +949,25 @@ class SettingsManager:
             except Exception as e:
                 logger.warning(f"保存前同步模型供应商失败: {e}")
 
-        # 原子写入，避免半截 JSON
-        parent = os.path.dirname(settings_path) or "."
-        os.makedirs(parent, exist_ok=True)
-        tmp_path = settings_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, settings_path)
+        # 原子写入，避免半截 JSON；与管理数据快照共享进程内边界。
+        with STORAGE_IO_LOCK:
+            parent = os.path.dirname(settings_path) or "."
+            os.makedirs(parent, exist_ok=True)
+            tmp_path = settings_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, settings_path)
 
-        if db:
-            try:
-                # 整包持久化（含 api.key 等嵌套字段）
-                db.save_setting("settings_blob", payload)
-                # 兼容旧扁平键
-                for k, v in payload.items():
-                    if not isinstance(v, dict):
-                        db.save_setting(k, v)
-            except Exception as e:
-                logger.warning(f"写入数据库 settings 失败: {e}")
+            if db:
+                try:
+                    # 整包持久化（含 api.key 等嵌套字段）
+                    db.save_setting("settings_blob", payload)
+                    # 兼容旧扁平键
+                    for k, v in payload.items():
+                        if not isinstance(v, dict):
+                            db.save_setting(k, v)
+                except Exception as e:
+                    logger.warning(f"写入数据库 settings 失败: {e}")
 
 class VideoProcessor:
     """处理视频文件：抽帧、压缩、场景检测、哈希计算"""
@@ -2043,7 +2049,21 @@ class VideoOrganizerService:
         results_json: Optional[str] = None,
         results_csv: Optional[str] = None,
     ):
-        self.db = DatabaseManager(db_path) if db_path else DatabaseManager()
+        effective_db_path = db_path if db_path is not None else DB_FILE
+        recovery_manager = StorageBackupManager(
+            database_path=effective_db_path,
+            settings_path=get_settings_file_path(),
+            tag_config_path=TAG_CONFIG_FILE,
+            backup_dir=BACKUP_DIR,
+        )
+        try:
+            recovery_manager.recover_pending_restore()
+        except StorageBackupError:
+            logger.exception("检测到未完成的管理数据恢复，无法安全启动。")
+            raise
+
+        self._database_path = effective_db_path
+        self.db = DatabaseManager(effective_db_path)
         self.catalog = VideoCatalog(self.db)
         self.settings = settings or SettingsManager.load_settings(self.db)
         self.tag_config = self.load_tag_config()
@@ -2852,58 +2872,52 @@ class VideoOrganizerService:
         }
 
     # --- 备份与恢复 (V6.0) ---
+    def _storage_backup_manager(self) -> StorageBackupManager:
+        """按当前活动路径创建管理数据快照服务。"""
+        return StorageBackupManager(
+            database_path=self.db.db_path,
+            settings_path=get_settings_file_path(),
+            tag_config_path=TAG_CONFIG_FILE,
+            backup_dir=BACKUP_DIR,
+            database_lock=self.db.lock,
+        )
+
     def backup_configuration(self) -> str:
-        """一键备份数据库和标签配置到 backups/ 目录"""
-        if not os.path.exists(BACKUP_DIR):
-            os.makedirs(BACKUP_DIR)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(BACKUP_DIR, f"backup_{timestamp}")
-        os.makedirs(backup_path)
-        
+        """创建数据库与配套配置的一致性快照，不包含原始视频。"""
         try:
-            # 备份数据库 (使用 WAL 模式下可能需要处理 shm/wal 文件，但简单复制 .db 在关闭连接时通常够了)
-            # 为了安全，我们这里直接复制文件
-            shutil.copy2(DB_FILE, os.path.join(backup_path, DB_FILE))
-            if os.path.exists(TAG_CONFIG_FILE):
-                shutil.copy2(TAG_CONFIG_FILE, os.path.join(backup_path, TAG_CONFIG_FILE))
-            if os.path.exists(SETTINGS_FILE):
-                shutil.copy2(SETTINGS_FILE, os.path.join(backup_path, os.path.basename(SETTINGS_FILE)))
-            
+            backup_path = self._storage_backup_manager().create_backup()
             self.log(f"配置已备份至: {backup_path}")
             return backup_path
-        except Exception as e:
-            self.log(f"备份失败: {e}")
+        except StorageBackupError as exc:
+            logger.exception("管理数据快照失败")
+            self.log(f"备份失败: {exc}", force_ui=True)
             return ""
 
     def restore_configuration(self, backup_folder_name: str) -> bool:
-        """从备份目录恢复配置"""
-        backup_path = os.path.join(BACKUP_DIR, backup_folder_name)
-        if not os.path.exists(backup_path):
-            self.log(f"备份目录不存在: {backup_path}")
-            return False
-        
+        """校验并恢复管理数据；失败时自动回滚当前数据。"""
         try:
-            # 恢复前先做个临时备份
-            self.backup_configuration()
-            
-            # 恢复文件
-            for filename in [DB_FILE, TAG_CONFIG_FILE, os.path.basename(SETTINGS_FILE)]:
-                src = os.path.join(backup_path, filename)
-                if os.path.exists(src):
-                    shutil.copy2(src, filename)
-            
-            self.log("配置恢复成功，请重启应用以应用更改。")
+            rollback_path = self._storage_backup_manager().restore(backup_folder_name)
+            self.invalidate_video_memory_cache()
+            self.log(
+                "配置恢复成功。当前数据已自动保护至："
+                f"{rollback_path}；请重启应用以加载恢复的配置。",
+                force_ui=True,
+            )
             return True
-        except Exception as e:
-            self.log(f"恢复失败: {e}")
+        except StorageBackupError as exc:
+            logger.exception("管理数据恢复失败")
+            self.log(f"恢复失败: {exc}", force_ui=True)
             return False
 
     def list_backups(self) -> List[str]:
-        """列出所有可用的备份"""
-        if not os.path.exists(BACKUP_DIR):
+        """只列出校验通过的完整管理数据快照。"""
+        try:
+            return [
+                os.path.basename(path)
+                for path in self._storage_backup_manager().list_valid_backups()
+            ]
+        except StorageBackupError:
             return []
-        return [d for d in os.listdir(BACKUP_DIR) if os.path.isdir(os.path.join(BACKUP_DIR, d))]
 
     def switch_preset(self, preset_id: str) -> bool:
         """切换当前的活动预设"""
@@ -3119,8 +3133,13 @@ class VideoOrganizerService:
             pass
         self.tag_config = config
         try:
-            with open(TAG_CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
+            with STORAGE_IO_LOCK:
+                parent = os.path.dirname(TAG_CONFIG_FILE) or "."
+                os.makedirs(parent, exist_ok=True)
+                tmp_path = TAG_CONFIG_FILE + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, TAG_CONFIG_FILE)
             # 更新 AI Handler 中的配置
             if hasattr(self, "ai"):
                 self.ai.tag_config = config

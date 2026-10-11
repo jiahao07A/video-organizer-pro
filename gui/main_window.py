@@ -121,7 +121,7 @@ class MainWindow(QMainWindow):
         self.theme_btn.clicked.connect(self.toggle_theme)
         footer_layout.addWidget(self.theme_btn)
         
-        self.backup_btn = QPushButton("💾 备份配置")
+        self.backup_btn = QPushButton("💾 备份管理数据")
         self.backup_btn.clicked.connect(self.run_backup)
         footer_layout.addWidget(self.backup_btn)
         
@@ -289,6 +289,6 @@ class MainWindow(QMainWindow):
     def run_backup(self):
         path = self.service.backup_configuration()
         if path:
-            QMessageBox.information(self, "备份成功", f"配置已成功备份至：\n{path}")
+            QMessageBox.information(self, "备份成功", f"管理数据已成功备份至：\n{path}")
         else:
-            QMessageBox.warning(self, "备份失败", "配置备份过程中出现错误。")
+            QMessageBox.warning(self, "备份失败", "管理数据备份过程中出现错误。")
