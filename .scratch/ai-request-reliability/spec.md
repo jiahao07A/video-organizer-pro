@@ -1,9 +1,10 @@
 # 统一 AI 请求并修复请求旁路与客户端生命周期
 
-Status: claimed
-GitHub Issue: #4
-PR: #5
+Status: resolved
+GitHub Issue: #4（已关闭）
+PR: #5（已合并）
 Branch: refactor/ai-request-reliability
+Merge commit: 88c21758ad0bb401deb3dd9718b0364a591c829d
 
 ## 背景
 
@@ -109,3 +110,18 @@ Branch: refactor/ai-request-reliability
 - 主审独立复核正式测试、修复差异与原复现；两个复审均为只读，没有实施业务修改或操作 GitHub。代码验证固定在 `75066f5d2c83b8804af815bff88fafa23b69ea33`，后续只归档维护文档和评审证据。
 - 用户已授权审核无阻塞后直接合并；当前账户与 PR 作者相同，GitHub 不允许自我批准，最终以 COMMENT 记录两项独立复审和维护者授权，不声称有 GitHub APPROVED 审阅，也不绕过分支保护或必需检查。
 - 验收已完成，准备按 Rebase and merge 合并；合并 commit 与最终状态待 GitHub 返回后追加。
+
+### 合并与关闭（2026-10-11）
+
+- PR #5 已按 Rebase and merge 合入 main，合并结果 commit：`88c21758ad0bb401deb3dd9718b0364a591c829d`。最终待合并 HEAD 固定为 `46d9b4e771c02ecae37a58d961399238bf34bc01`，3 条原评审线程全部解决，未直接推送 main 或使用管理员绕过。
+- 合并后的 main 源码树与已复审 HEAD 完全一致；本地主干已更新，再次运行全部可运行测试，230 passed, 2 skipped。
+- Issue #4 已记录关闭总结、合并 commit、验收与遗留风险并关闭：https://github.com/jiahao07A/video-organizer-pro/issues/4#issuecomment-6104894725 。
+- 完整 GUI 六模块缺少 PySide6、真实 AI/ffmpeg 链路未验证的限制保持；两项独立复审无实质阻塞。
+- 本条关闭记录在已合并分支上追加，仅作为本地台账保留，不直接向 main 提交或推送；此前修复、正式测试和评审归档均已通过 PR 进入 main。
+
+### 关闭记录同步（2026-10-11）
+
+- 用户要求同步本地与远端。本次在 `docs/4-ai-request-closeout` 分支归档 `spec.md`、`pr-fix-plan.md` 和 `pr-review.md` 三份已有关闭记录，通过独立文档 PR 同步到 main，不直接推送主干。
+- 范围只包含状态、PR #5 合并 commit、Issue #4 关闭结果和既有验收记录；不修改业务代码、正式测试、依赖、配置或数据，也不重新打开已关闭议题。
+- 验收为三个 Markdown 文件的差异检查通过、记录与 GitHub 已确认事实一致，以及同步后本地 main 与 origin/main 提交一致、工作区干净。此前 230 passed, 2 skipped 为 PR #5 的验证记录，本次纯文档同步不重复声称新跑业务测试。
+- 回滚仅需在独立分支撤销本次文档提交并通过 PR 处理；本节作为关闭结果的归档说明，不再新增需要下一轮提交的合并后本地记录，文档 PR 的结果以 GitHub 记录为准。

@@ -4,7 +4,10 @@ GitHub Issue: #4
 PR: #5
 Branch: refactor/ai-request-reliability
 起始提交：bf9be1680a22c1006f5eba37748b02d77b169f18
-Status: claimed
+Status: resolved
+Merge commit: 88c21758ad0bb401deb3dd9718b0364a591c829d
+
+合并结果：PR #5 已通过 GitHub 按 Rebase and merge 合入 main，Issue #4 已关闭。主干源码树与已复审 HEAD 完全一致；合并后重新运行全部可运行测试，230 passed, 2 skipped。完整 GUI/真实服务限制仍保留。以下为执行前已确定的原始方案，保留历史不改写。
 
 ## 背景与目标
 

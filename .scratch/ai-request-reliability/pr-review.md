@@ -88,3 +88,13 @@ GitHub 评审及 3 条行内意见已成功发布：https://github.com/jiahao07A
 用户已授权“审核无问题后直接合并”，本次继续修复后已无实质阻塞。当前 GitHub 身份与 PR 作者相同，不能提交自我批准；以 COMMENT 留下独立复审与维护者授权证据，合并仍须通过 GitHub PR、遵守必需检查和分支保护，不使用管理者绕过。GUI/真实服务未验证的限制保持明确记录。合并结果待追加。
 
 总结：Standards 0 项阻塞（1 项非阻塞维护性建议），Spec 0 项问题；两轴均无阻塞风险。
+
+## 合并与关闭结果
+
+- Status: resolved
+- PR #5 已于 2026-10-11 通过 GitHub 按 Rebase and merge 合入 main；合并结果 commit 为 `88c21758ad0bb401deb3dd9718b0364a591c829d`。
+- 合并前固定最终 HEAD `46d9b4e771c02ecae37a58d961399238bf34bc01`，确认 PR 非草稿、可合并、无必需检查阻塞、3 条原评审线程均已解决；未使用管理员绕过或直接推送 main。
+- 合并后确认 main 的树与已复审 HEAD 一致，本地主干已更新；再次运行全部当前可运行测试，230 passed, 2 skipped。
+- Issue #4 已追加关闭总结并以 completed 关闭：https://github.com/jiahao07A/video-organizer-pro/issues/4#issuecomment-6104894725 。
+- 遗留限制仍为缺少 PySide6 的 6 个 GUI 模块与真实服务/ffmpeg 链路未验证，没有未解决的本 PR 实质阻塞。
+- 本地合并状态记录在已合并分支上追加，不直接提交或推送 main；代码和正式回归均已纳入 PR，关闭记录作为本地后续台账保留。
