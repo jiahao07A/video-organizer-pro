@@ -11,6 +11,7 @@ import json
 import logging
 from typing import List, Dict, Optional, Any, Tuple
 from core.video_organizer_service import AIHandler, TAG_CONFIG_FILE
+from core.storage_backup import STORAGE_IO_LOCK, write_json_atomic
 
 logger = logging.getLogger("VideoOrganizer.TagImport")
 
@@ -181,8 +182,8 @@ class TagImportService:
 
         config["tag_groups"] = target_groups
         try:
-            with open(TAG_CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
+            with STORAGE_IO_LOCK:
+                write_json_atomic(TAG_CONFIG_FILE, config)
             logger.info("已成功保存分类后的标签到配置")
             return True, ""
         except Exception as e:

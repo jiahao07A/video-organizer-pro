@@ -35,6 +35,51 @@ class StorageBackupError(RuntimeError):
     """管理数据快照无法创建、校验或恢复。"""
 
 
+def write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    """将 JSON 写入同目录临时文件后原子替换目标。"""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent,
+            prefix=f".{os.path.basename(path)}-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _copy_sqlite_database(source_path: str, target_path: str, operation: str) -> None:
+    """通过 SQLite backup API 复制数据库，统一快照和恢复的连接生命周期。"""
+    if not os.path.isfile(source_path):
+        raise StorageBackupError(f"数据库不存在: {source_path}")
+    os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+    source = None
+    target = None
+    try:
+        source = sqlite3.connect(source_path, timeout=30)
+        target = sqlite3.connect(target_path, timeout=30)
+        source.backup(target, pages=-1)
+        target.commit()
+    except Exception as exc:
+        raise StorageBackupError(f"SQLite {operation}失败: {exc}") from exc
+    finally:
+        if target is not None:
+            target.close()
+        if source is not None:
+            source.close()
+
+
 class StorageBackupManager:
     """创建和恢复数据库与配套配置的可校验快照。
 
@@ -52,6 +97,8 @@ class StorageBackupManager:
         backup_dir: str,
         database_lock: Optional[threading.RLock] = None,
         io_lock: Optional[threading.RLock] = None,
+        settings_payload: Optional[Dict[str, Any]] = None,
+        tag_config_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.database_path = os.path.abspath(str(database_path))
         self.settings_path = os.path.abspath(str(settings_path))
@@ -59,6 +106,8 @@ class StorageBackupManager:
         self.backup_dir = os.path.abspath(str(backup_dir))
         self.database_lock = database_lock
         self.io_lock = io_lock or STORAGE_IO_LOCK
+        self.settings_payload = settings_payload
+        self.tag_config_payload = tag_config_payload
 
     def create_backup(self) -> str:
         """创建完整快照并返回快照目录；失败时不留下可见半成品。"""
@@ -80,15 +129,17 @@ class StorageBackupManager:
                     "size": os.path.getsize(database_target),
                     "sha256": self._sha256(database_target),
                 },
-                "settings": self._capture_file(
+                "settings": self._capture_json_file(
                     self.settings_path,
                     os.path.join(stage, SETTINGS_NAME),
-                    required=False,
+                    fallback_payload=self.settings_payload,
+                    label="settings",
                 ),
-                "tag_config": self._capture_file(
+                "tag_config": self._capture_json_file(
                     self.tag_config_path,
                     os.path.join(stage, TAG_CONFIG_NAME),
-                    required=False,
+                    fallback_payload=self.tag_config_payload,
+                    label="tag_config",
                 ),
             }
             manifest = {
@@ -98,7 +149,7 @@ class StorageBackupManager:
                 "created_at": datetime.now().astimezone().isoformat(),
                 "files": files,
             }
-            self._write_json_atomic(os.path.join(stage, MANIFEST_NAME), manifest)
+            write_json_atomic(os.path.join(stage, MANIFEST_NAME), manifest)
             self._validate_backup_directory(stage)
 
             final_name = "backup_{}_{}".format(
@@ -139,10 +190,11 @@ class StorageBackupManager:
                     "rollback_backup": rollback_path,
                 }
                 journal_path = self._journal_path()
-                self._write_json_atomic(journal_path, journal)
+                write_json_atomic(journal_path, journal)
                 try:
                     self._apply_snapshot_locked(backup_path, manifest)
                     self._validate_live_database()
+                    self._validate_live_configuration()
                     os.remove(journal_path)
                     return rollback_path
                 except Exception as exc:
@@ -150,6 +202,7 @@ class StorageBackupManager:
                         rollback_manifest = self._validate_backup_directory(rollback_path)
                         self._apply_snapshot_locked(rollback_path, rollback_manifest)
                         self._validate_live_database()
+                        self._validate_live_configuration()
                         os.remove(journal_path)
                     except Exception as rollback_exc:
                         raise StorageBackupError(
@@ -179,6 +232,7 @@ class StorageBackupManager:
                 with self._database_guard():
                     self._apply_snapshot_locked(rollback_path, rollback_manifest)
                     self._validate_live_database()
+                    self._validate_live_configuration()
                 os.remove(journal_path)
                 logger.warning("已根据恢复日志回滚上次未完成的管理数据恢复。")
                 return True
@@ -205,42 +259,54 @@ class StorageBackupManager:
             paths.append(path)
         return paths
 
-    def _capture_file(self, source: str, target: str, *, required: bool) -> Dict[str, Any]:
-        present = os.path.isfile(source)
-        entry: Dict[str, Any] = {
+    def _capture_json_file(
+        self,
+        source: str,
+        target: str,
+        *,
+        fallback_payload: Optional[Dict[str, Any]],
+        label: str,
+    ) -> Dict[str, Any]:
+        """捕获必需 JSON 配置；缺失时使用已验证的内存回退。"""
+        if os.path.isfile(source):
+            self._read_json_object(source, label)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(source, target)
+            # 再读取暂存副本，确保清单对应的实际快照仍是有效 JSON 对象。
+            self._read_json_object(target, label)
+        else:
+            if fallback_payload is None:
+                raise StorageBackupError(f"必需的管理数据不存在且没有内存回退: {source}")
+            self._validate_json_object(fallback_payload, label)
+            write_json_atomic(target, fallback_payload)
+            self._read_json_object(target, label)
+
+        return {
             "name": os.path.basename(target),
-            "present": present,
-            "required": required,
+            "present": True,
+            "required": True,
+            "size": os.path.getsize(target),
+            "sha256": self._sha256(target),
         }
-        if not present:
-            if required:
-                raise StorageBackupError(f"必需的管理数据不存在: {source}")
-            return entry
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copy2(source, target)
-        entry["size"] = os.path.getsize(target)
-        entry["sha256"] = self._sha256(target)
-        return entry
+
+    @staticmethod
+    def _validate_json_object(payload: Any, label: str) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise StorageBackupError(f"{label} 配置必须是 JSON 对象")
+        return payload
+
+    @classmethod
+    def _read_json_object(cls, path: str, label: str) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            raise StorageBackupError(f"{label} 配置不是有效 JSON: {exc}") from exc
+        return cls._validate_json_object(payload, label)
 
     @staticmethod
     def _snapshot_database(source_path: str, target_path: str) -> None:
-        if not os.path.isfile(source_path):
-            raise StorageBackupError(f"数据库不存在: {source_path}")
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        source = None
-        target = None
-        try:
-            source = sqlite3.connect(source_path, timeout=30)
-            target = sqlite3.connect(target_path, timeout=30)
-            source.backup(target, pages=-1)
-            target.commit()
-        except Exception as exc:
-            raise StorageBackupError(f"SQLite 一致性快照失败: {exc}") from exc
-        finally:
-            if target is not None:
-                target.close()
-            if source is not None:
-                source.close()
+        _copy_sqlite_database(source_path, target_path, "一致性快照")
 
     def _validate_backup_directory(self, backup_path: str) -> Dict[str, Any]:
         if not backup_path or not os.path.isdir(backup_path):
@@ -262,18 +328,33 @@ class StorageBackupManager:
             raise StorageBackupError("备份尚未完成")
 
         files = manifest.get("files")
-        if not isinstance(files, dict) or "database" not in files:
-            raise StorageBackupError("备份缺少数据库清单")
+        required_files = {
+            "database": DATABASE_NAME,
+            "settings": SETTINGS_NAME,
+            "tag_config": TAG_CONFIG_NAME,
+        }
+        if not isinstance(files, dict):
+            raise StorageBackupError("备份文件清单无效")
+        for key in required_files:
+            if key not in files:
+                raise StorageBackupError(f"备份缺少必需文件清单: {key}")
+
         for key, entry in files.items():
             if not isinstance(entry, dict):
                 raise StorageBackupError(f"备份文件清单无效: {key}")
-            present = bool(entry.get("present"))
+            present = entry.get("present")
+            required = entry.get("required")
             name = entry.get("name")
+            if not isinstance(present, bool) or not isinstance(required, bool):
+                raise StorageBackupError(f"备份文件清单标志无效: {key}")
             if not isinstance(name, str) or not name or os.path.basename(name) != name:
                 raise StorageBackupError(f"备份文件名无效: {key}")
+            expected_name = required_files.get(key)
+            if expected_name is not None and name != expected_name:
+                raise StorageBackupError(f"备份文件名不匹配: {key}")
             path = os.path.join(backup_path, name)
             if not present:
-                if entry.get("required"):
+                if required:
                     raise StorageBackupError(f"备份缺少必需文件: {key}")
                 continue
             if not os.path.isfile(path):
@@ -282,10 +363,14 @@ class StorageBackupManager:
             expected_hash = entry.get("sha256")
             if expected_size != os.path.getsize(path) or expected_hash != self._sha256(path):
                 raise StorageBackupError(f"备份文件校验失败: {name}")
+            if key in ("settings", "tag_config"):
+                self._read_json_object(path, key)
 
-        database_entry = files["database"]
-        if database_entry.get("name") != DATABASE_NAME or not database_entry.get("present"):
-            raise StorageBackupError("备份数据库文件清单无效")
+        for key in required_files:
+            entry = files[key]
+            if entry.get("required") is not True or entry.get("present") is not True:
+                raise StorageBackupError(f"备份必需文件清单无效: {key}")
+
         self._validate_sqlite(os.path.join(backup_path, DATABASE_NAME))
         return manifest
 
@@ -325,20 +410,11 @@ class StorageBackupManager:
 
     @staticmethod
     def _restore_database_snapshot(source_path: str, target_path: str) -> None:
-        source = None
-        target = None
-        try:
-            source = sqlite3.connect(source_path, timeout=30)
-            target = sqlite3.connect(target_path, timeout=30)
-            source.backup(target, pages=-1)
-            target.commit()
-        except Exception as exc:
-            raise StorageBackupError(f"SQLite 数据库恢复失败: {exc}") from exc
-        finally:
-            if target is not None:
-                target.close()
-            if source is not None:
-                source.close()
+        _copy_sqlite_database(source_path, target_path, "数据库恢复")
+
+    def _validate_live_configuration(self) -> None:
+        self._read_json_object(self.settings_path, "settings")
+        self._read_json_object(self.tag_config_path, "tag_config")
 
     def _validate_live_database(self) -> None:
         self._validate_sqlite(self.database_path)
@@ -379,29 +455,6 @@ class StorageBackupManager:
     def _journal_path(self) -> str:
         os.makedirs(self.backup_dir, exist_ok=True)
         return os.path.join(self.backup_dir, RESTORE_JOURNAL_NAME)
-
-    @staticmethod
-    def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
-        parent = os.path.dirname(path) or "."
-        os.makedirs(parent, exist_ok=True)
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=parent,
-                prefix=f".{os.path.basename(path)}-",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temp_path = handle.name
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, path)
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
 
     @staticmethod
     def _sha256(path: str) -> str:

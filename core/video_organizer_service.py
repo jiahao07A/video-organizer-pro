@@ -29,6 +29,7 @@ from core.storage_backup import (
     STORAGE_IO_LOCK,
     StorageBackupError,
     StorageBackupManager,
+    write_json_atomic,
 )
 from core.video_catalog import VideoCatalog, VideoQuery
 
@@ -951,12 +952,7 @@ class SettingsManager:
 
         # 原子写入，避免半截 JSON；与管理数据快照共享进程内边界。
         with STORAGE_IO_LOCK:
-            parent = os.path.dirname(settings_path) or "."
-            os.makedirs(parent, exist_ok=True)
-            tmp_path = settings_path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, settings_path)
+            write_json_atomic(settings_path, payload)
 
             if db:
                 try:
@@ -2880,6 +2876,8 @@ class VideoOrganizerService:
             tag_config_path=TAG_CONFIG_FILE,
             backup_dir=BACKUP_DIR,
             database_lock=self.db.lock,
+            settings_payload=self.settings,
+            tag_config_payload=self.tag_config,
         )
 
     def backup_configuration(self) -> str:
@@ -3134,12 +3132,7 @@ class VideoOrganizerService:
         self.tag_config = config
         try:
             with STORAGE_IO_LOCK:
-                parent = os.path.dirname(TAG_CONFIG_FILE) or "."
-                os.makedirs(parent, exist_ok=True)
-                tmp_path = TAG_CONFIG_FILE + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(config, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, TAG_CONFIG_FILE)
+                write_json_atomic(TAG_CONFIG_FILE, config)
             # 更新 AI Handler 中的配置
             if hasattr(self, "ai"):
                 self.ai.tag_config = config
