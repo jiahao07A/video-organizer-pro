@@ -72,6 +72,8 @@ def test_backup_captures_database_and_configuration_atomically(
     assert manifest["format"] == "video-organizer-backup"
     assert manifest["status"] == "complete"
     assert manifest["files"]["database"]["present"] is True
+    assert manifest["files"]["settings"]["required"] is True
+    assert manifest["files"]["tag_config"]["required"] is True
     assert (backup / "database.sqlite").exists()
     assert (backup / "settings.json").read_text(encoding="utf-8") == '{"marker": "before"}'
     assert (backup / "tag_config.json").read_text(encoding="utf-8") == '{"marker": "before"}'
@@ -84,6 +86,51 @@ def test_backup_captures_database_and_configuration_atomically(
     assert service.db.get_video_by_path(video_path)["summary"] == "备份前"
     assert settings_path.read_text(encoding="utf-8") == '{"marker": "before"}'
     assert tag_config_path.read_text(encoding="utf-8") == '{"marker": "before"}'
+
+
+def test_missing_configuration_uses_current_memory_fallback(
+    service: VideoOrganizerService,
+):
+    settings_path = Path(service_module.get_settings_file_path())
+    tag_config_path = Path(service_module.TAG_CONFIG_FILE)
+    settings_path.unlink()
+    tag_config_path.unlink()
+
+    backup_path = Path(service.backup_configuration())
+    assert backup_path
+    backup = Path(backup_path)
+    manifest = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["files"]["settings"]["required"] is True
+    assert manifest["files"]["tag_config"]["required"] is True
+    assert json.loads((backup / "settings.json").read_text(encoding="utf-8")) == service.settings
+    assert json.loads((backup / "tag_config.json").read_text(encoding="utf-8")) == service.tag_config
+
+
+@pytest.mark.parametrize(
+    ("config_name", "content"),
+    [
+        ("settings", '{"broken":'),
+        ("tag_config", '{"broken":'),
+        ("settings", "[]"),
+        ("tag_config", "[]"),
+    ],
+)
+def test_corrupt_configuration_rejects_backup(
+    service: VideoOrganizerService,
+    config_name: str,
+    content: str,
+):
+    path = (
+        Path(service_module.get_settings_file_path())
+        if config_name == "settings"
+        else Path(service_module.TAG_CONFIG_FILE)
+    )
+    path.write_text(content, encoding="utf-8")
+
+    assert service.backup_configuration() == ""
+    backup_dir = Path(service_module.BACKUP_DIR)
+    assert not list(backup_dir.glob("backup_*"))
+    assert not list(backup_dir.glob(".backup-staging-*"))
 
 
 def test_invalid_backup_is_rejected_without_changing_current_data(
