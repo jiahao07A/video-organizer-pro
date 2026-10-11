@@ -1,6 +1,6 @@
 # 01：可靠备份与受控恢复
 
-Status: ready-for-agent
+Status: claimed
 
 GitHub Issue: [#8](https://github.com/jiahao07A/video-organizer-pro/issues/8)
 
@@ -41,3 +41,13 @@ Spec: [父规格](../spec.md)
 ### 2026-10-11 任务发布
 
 用户确认该任务及无前置依赖。本次只发布规格，尚未实施。实现须独立分支和 PR，任务验收后追加证据与状态，不以文档合并关闭实现任务。
+
+### 2026-10-11 实现交付与复核
+
+实现分支：`feat/8-consistent-backup-restore`；实现提交：`cda067d`；拉取请求：[#15](https://github.com/jiahao07A/video-organizer-pro/pull/15)。
+
+已完成管理数据快照、WAL 一致性数据库捕获、清单/哈希校验、恢复前回滚快照、恢复日志和失败回滚。审查修正进一步保证：`settings.json` 与 `tag_config.json` 是必需配置；存在时先解析并校验 JSON 对象，损坏时拒绝快照；缺失时使用服务当前生效配置作为回退快照。设置保存、标签配置保存、标签导入和恢复日志统一使用 `STORAGE_IO_LOCK` 与 `write_json_atomic`；SQLite 快照和恢复共用底层辅助函数。
+
+验证记录：专项测试 31 passed；完整测试 `python -m pytest -q` 为 308 passed；`python -m compileall -q core gui tests`、`git diff --check` 和相关文件诊断均通过。原始视频与真实管理数据未进入测试或提交。
+
+当前等待 PR #15 审阅与合并；在 PR 合并前不将本地议题标记为 `resolved`。GUI 人工走查和冲突任务暂停语义仍按 PR 范围说明保留为审阅项。
