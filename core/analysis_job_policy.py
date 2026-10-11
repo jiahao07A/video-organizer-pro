@@ -94,6 +94,9 @@ def is_retriable(error: Any) -> bool:
     """
     if error is None:
         return False
+    # 文件不可用是确定性失败，不能因文件名包含 timeout 等字样而重试。
+    if isinstance(error, (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)):
+        return False
 
     # 显式标记
     if isinstance(error, dict):
@@ -103,10 +106,10 @@ def is_retriable(error: Any) -> bool:
         if code is not None:
             try:
                 c = int(code)
-                if c in (401, 403):
-                    return False
                 if c in (429, 502, 503, 504):
                     return True
+                if 400 <= c < 500:
+                    return False
             except (TypeError, ValueError):
                 pass
         msg = str(error.get("message") or error.get("error") or "")
@@ -119,10 +122,10 @@ def is_retriable(error: Any) -> bool:
         if code is not None:
             try:
                 c = int(code)
-                if c in (401, 403):
-                    return False
                 if c in (429, 502, 503, 504):
                     return True
+                if 400 <= c < 500:
+                    return False
             except (TypeError, ValueError):
                 pass
 
@@ -149,10 +152,8 @@ def is_retriable(error: Any) -> bool:
     )
     for m in non_retriable_markers:
         if m in low:
-            # 区分 HTTP 404 not found on API vs file — 若同时含 timeout 仍可重试
+            # HTTP/API 的 not found 不等同于本地文件丢失；明确状态码已在上面处理。
             if m in ("not found",) and ("http" in low or "api" in low or "404" in low):
-                continue
-            if "timeout" in low or "429" in low:
                 continue
             return False
 

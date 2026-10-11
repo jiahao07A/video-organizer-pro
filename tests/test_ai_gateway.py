@@ -3,6 +3,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import threading
 
+import pytest
+
 from core.ai_gateway import AiRequestGateway
 from core.analysis_job_policy import RetryConfig
 from core.tag_import_service import TagImportService
@@ -222,3 +224,57 @@ def test_cancelled_request_does_not_submit_call():
     failure = gateway.get_last_failure()
     assert failure.cancelled is True
     assert failure.retriable is False
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+@pytest.mark.parametrize("request_kind", ["chat", "audio"])
+def test_http_error_status_overrides_transient_text(tmp_path, status_code, request_kind):
+    class HttpError(Exception):
+        def __init__(self):
+            super().__init__("upstream timeout: invalid JSON, rate limit")
+            self.status_code = status_code
+
+    error = HttpError()
+    client = FakeChatClient([error, error, error])
+    audio_calls = []
+
+    def transcribe(**kwargs):
+        audio_calls.append(kwargs)
+        raise error
+
+    client.audio = SimpleNamespace(transcriptions=SimpleNamespace(create=transcribe))
+    metrics = []
+    gateway = AiRequestGateway({}, metrics_recorder=lambda **entry: metrics.append(entry))
+    options = {
+        "client": client,
+        "retry_config": RetryConfig(call_extra_attempts=2),
+        "sleeper": lambda _: None,
+    }
+    if request_kind == "chat":
+        result = gateway.request_chat(model="m", system_prompt="sys", content_parts=[], **options)
+        calls = client.calls
+    else:
+        audio = tmp_path / "voice.mp3"
+        audio.write_bytes(b"fake audio")
+        result = gateway.transcribe_audio(str(audio), **options)
+        calls = audio_calls
+
+    assert result is None
+    assert len(calls) == 1
+    assert len(metrics) == 1
+    assert gateway.get_last_failure().retriable is False
+
+
+def test_missing_audio_with_timeout_in_filename_is_not_retried(tmp_path):
+    metrics = []
+    gateway = AiRequestGateway({}, metrics_recorder=lambda **entry: metrics.append(entry))
+    result = gateway.transcribe_audio(
+        str(tmp_path / "timeout.mp3"),
+        client=SimpleNamespace(),
+        retry_config=RetryConfig(call_extra_attempts=2),
+        sleeper=lambda _: None,
+    )
+
+    assert result is None
+    assert len(metrics) == 1
+    assert gateway.get_last_failure().retriable is False
