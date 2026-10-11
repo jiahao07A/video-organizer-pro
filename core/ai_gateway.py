@@ -370,7 +370,7 @@ class AiRequestGateway:
                     )
                     continue
 
-                retriable = is_retriable(error) or is_retriable(message)
+                retriable = is_retriable(error)
                 logger.error("AI API 调用出错: %s", message)
                 self._record_metrics(
                     attempt=attempt,
@@ -439,7 +439,7 @@ class AiRequestGateway:
                 return text
             except Exception as error:
                 message = _error_message(error)
-                retriable = is_retriable(error) or is_retriable(message)
+                retriable = is_retriable(error)
                 self._record_metrics(
                     attempt=attempt,
                     model=model,

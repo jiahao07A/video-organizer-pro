@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """分析任务策略纯逻辑（ticket 01）。"""
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from core.analysis_job_policy import (
     DEFAULT_CALL_EXTRA_ATTEMPTS,
@@ -46,6 +49,36 @@ def test_should_retry_call_bounds():
 
 def test_should_retry_item_bounds():
     assert should_retry_item(1, item_max_attempts=2) is True
+
+
+@pytest.mark.parametrize("shape", ["exception", "response", "dict"])
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422, 429, 502, 503, 504])
+def test_explicit_http_status_takes_precedence_over_error_text(shape, status_code):
+    message = "upstream timeout: invalid JSON, rate limit"
+
+    class HttpError(Exception):
+        pass
+
+    if shape == "dict":
+        error = {"status_code": status_code, "message": message}
+    else:
+        error = HttpError(message)
+        if shape == "response":
+            error.response = SimpleNamespace(status_code=status_code)
+        else:
+            error.status_code = status_code
+
+    assert is_retriable(error) is (status_code in {429, 502, 503, 504})
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError])
+def test_file_error_types_override_transient_text(error_type):
+    assert not is_retriable(error_type("timeout.mp3"))
+
+
+@pytest.mark.parametrize("message", ["401 Unauthorized: timeout", "用户取消: timeout", "文件不存在: timeout.mp3"])
+def test_permanent_error_text_cannot_be_overridden_by_timeout(message):
+    assert not is_retriable(message)
     assert should_retry_item(2, item_max_attempts=2) is False
     assert should_retry_item(1, item_max_attempts=1) is False
 
