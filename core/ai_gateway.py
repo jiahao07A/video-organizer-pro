@@ -296,11 +296,13 @@ class AiRequestGateway:
         use_client = client
         use_model = model
         if task_key:
-            route = self.resolve_route(task_key)
+            # 模型与连接来自同一份路由快照，避免设置切换时混用两次解析结果。
+            if use_client is None:
+                use_client, route = self.client_for_task(task_key)
+            else:
+                route = self.resolve_route(task_key)
             # 任务路由中的模型是唯一真相；显式 client 只用于测试或特殊适配器。
             use_model = str(route.get("model") or model or "gemini-2.0-flash")
-            if use_client is None:
-                use_client, _ = self.client_for_task(task_key)
         if use_client is None:
             use_client = self.default_client()
 
@@ -403,10 +405,8 @@ class AiRequestGateway:
     ) -> Optional[str]:
         """请求音频转录，使用与聊天请求相同的连接和调用层策略。"""
         use_client = client
-        if task_key:
-            self.resolve_route(task_key)
-            if use_client is None:
-                use_client, _ = self.client_for_task(task_key)
+        if task_key and use_client is None:
+            use_client, _ = self.client_for_task(task_key)
         if use_client is None:
             use_client = self.default_client()
 
