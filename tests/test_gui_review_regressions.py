@@ -173,6 +173,21 @@ def test_autosave_timer_emits_success_and_clears_pending_status(service, qt_app,
     assert view.save_status_label.text() == "界面偏好已保存"
 
 
+def test_switching_to_settings_does_not_force_window_beyond_current_height(service, qt_app, views):
+    window = MainWindow(service)
+    views.append(window)
+    window.show()
+    qt_app.processEvents()
+    initial_height = window.height()
+
+    window.nav_list.setCurrentRow(3)
+    qt_app.processEvents()
+
+    settings = window.settings_page
+    assert window.height() <= initial_height
+    assert settings.save_btn.geometry().bottom() <= settings.height()
+
+
 def test_autosaved_prefs_apply_to_main_window_without_reloading_ai(service, qt_app, views, monkeypatch):
     window = MainWindow(service)
     views.append(window)
