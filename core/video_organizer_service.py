@@ -32,6 +32,7 @@ from core.storage_backup import (
     write_json_atomic,
 )
 from core.video_catalog import VideoCatalog, VideoQuery
+from core.physical_migration import build_physical_migration_plan
 
 # 资源路径处理函数
 def get_resource_path(relative_path):
@@ -4897,9 +4898,11 @@ class VideoOrganizerService:
         self,
         target_root: str,
         selected_paths: Optional[List[str]] = None,
-    ) -> List[Dict[str, str]]:
-        """
-        物理整理模拟预览：返回 [{old_path, new_path, category, filename}, ...]，不改磁盘。
+    ) -> List[Dict[str, Any]]:
+        """生成物理整理模拟预览，不创建目录、不移动文件。
+
+        旧的 ``old_path``/``new_path``/``category``/``filename`` 字段继续保留；
+        预览额外提供完整路径、冲突和风险字段，供 GUI 展示与测试使用。
         """
         videos = (
             self.db.get_all_videos()
@@ -4907,38 +4910,31 @@ class VideoOrganizerService:
             else self.db.get_videos_by_paths(selected_paths)
         )
 
-        plan: List[Dict[str, str]] = []
-        used_dest: set = set()
-        for item in videos:
-            old_path = item.get("path")
-            if not old_path or not os.path.exists(old_path):
-                continue
-            category = item.get("category") or "Other"
-            dest_dir = os.path.join(target_root, str(category))
-            filename = os.path.basename(old_path)
-            new_path = os.path.join(dest_dir, filename)
-            if os.path.normpath(old_path) == os.path.normpath(new_path):
-                continue
-            # 预览层冲突消解（与执行层策略一致的可解释命名）
-            if os.path.exists(new_path) or new_path in used_dest:
-                base, ext = os.path.splitext(filename)
-                n = 1
-                while True:
-                    candidate = os.path.join(dest_dir, f"{base}_{n}{ext}")
-                    if not os.path.exists(candidate) and candidate not in used_dest:
-                        new_path = candidate
-                        break
-                    n += 1
-                    if n > 9999:
-                        break
-            used_dest.add(new_path)
-            plan.append({
-                "old_path": old_path,
-                "new_path": new_path,
-                "category": str(category),
-                "filename": filename,
-            })
-        return plan
+        def hash_matches(item: Dict[str, Any], source_path: str) -> Optional[bool]:
+            expected = str(item.get("file_hash") or "").strip()
+            if not expected:
+                return None
+            try:
+                return self.processor.get_file_hash(source_path) == expected
+            except (OSError, IOError):
+                return None
+            except Exception:
+                logger.debug("无法比较物理整理源文件哈希: %s", source_path, exc_info=True)
+                return None
+
+        raw_plan = build_physical_migration_plan(
+            videos,
+            target_root,
+            hash_matches=hash_matches,
+        )
+        # 保持执行入口的既有安全语义：源文件已经位于目标位置时不生成步骤，
+        # 防止执行函数把同一路径复制后删除源文件。
+        return [
+            step
+            for step in raw_plan
+            if os.path.normcase(os.path.normpath(step["old_path"]))
+            != os.path.normcase(os.path.normpath(step["new_path"]))
+        ]
 
     def execute_physical_migration(self, target_root: str, selected_paths: Optional[List[str]] = None):
         """V4.0: 执行物理迁移，按分类自动归档文件"""
