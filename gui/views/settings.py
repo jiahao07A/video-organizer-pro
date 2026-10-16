@@ -599,7 +599,14 @@ class SettingsView(QWidget):
 
     def create_ai_tab(self):
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer_layout = QVBoxLayout(tab)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
 
         ensure_providers(self.settings)
 
@@ -702,6 +709,9 @@ class SettingsView(QWidget):
 
         layout.addWidget(route_group)
         layout.addStretch()
+
+        scroll.setWidget(container)
+        outer_layout.addWidget(scroll)
 
         self._provider_ui_ready = True
         self._refresh_provider_list(select_id=self.settings.get("current_provider_id"))
