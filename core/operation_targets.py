@@ -9,9 +9,74 @@
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 from core.analysis_targets import path_status_key
+
+
+@dataclass(frozen=True)
+class OperationTargetSnapshot:
+    """一次批量操作使用的目标快照，供摘要、确认和执行共用。"""
+
+    selected_paths: Tuple[str, ...]
+    visible_paths: Tuple[str, ...]
+    target_paths: Tuple[str, ...]
+    scope_paths: Optional[Tuple[str, ...]]
+
+    @property
+    def source(self) -> str:
+        return "selected" if self.selected_paths else "visible"
+
+    @property
+    def selected_count(self) -> int:
+        return len(self.selected_paths)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self.visible_paths)
+
+    @property
+    def target_count(self) -> int:
+        return len(self.target_paths)
+
+
+def _unique_paths(paths: Optional[Sequence[str]]) -> Tuple[str, ...]:
+    """按规范化路径键去重，同时保留第一次出现的原始路径。"""
+    out: List[str] = []
+    seen = set()
+    for path in paths or []:
+        if not path:
+            continue
+        key = path_status_key(path)
+        if not key or key in seen:
+            continue
+        out.append(path)
+        seen.add(key)
+    return tuple(out)
+
+
+def resolve_operation_target_snapshot(
+    selected_paths: Optional[Sequence[str]],
+    visible_paths: Sequence[str],
+    *,
+    scope_paths: Optional[Sequence[str]] = None,
+) -> OperationTargetSnapshot:
+    """解析一次批量操作的选中、可见和实际目标路径快照。"""
+    selected = _unique_paths(selected_paths)
+    visible = _unique_paths(visible_paths)
+    scope = None if scope_paths is None else _unique_paths(scope_paths)
+    target = resolve_operation_target_paths(
+        selected,
+        visible,
+        scope_paths=scope,
+    )
+    return OperationTargetSnapshot(
+        selected_paths=selected,
+        visible_paths=visible,
+        target_paths=tuple(target),
+        scope_paths=scope,
+    )
 
 
 def resolve_operation_target_paths(

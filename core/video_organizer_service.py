@@ -2239,6 +2239,35 @@ class VideoOrganizerService:
             return resolve_pure(selected, vis, scope_paths=scope_list)
         return resolve_pure(selected, vis, scope_paths=None)
 
+    def resolve_operation_target_snapshot(
+        self,
+        selected_paths: Optional[List[str]] = None,
+        visible_paths: Optional[List[str]] = None,
+        *,
+        scope_paths: Optional[List[str]] = None,
+        checked_paths: Optional[List[str]] = None,
+    ):
+        """解析一次批量操作的稳定目标快照，供摘要、确认和执行共用。"""
+        from core.operation_targets import resolve_operation_target_snapshot as snapshot_pure
+
+        selected = selected_paths if selected_paths is not None else checked_paths
+
+        # 与 resolve_operation_target_paths 保持旧调用方兼容。
+        if visible_paths is None and scope_paths is None:
+            if not getattr(self, "_work_scope_paths", None):
+                return snapshot_pure(selected, [], scope_paths=[])
+            in_scope = self.get_videos_in_work_scope()
+            scope_list = [v.get("path") for v in in_scope if v.get("path")]
+            return snapshot_pure(selected, scope_list, scope_paths=scope_list)
+
+        vis = list(visible_paths or [])
+        if scope_paths is not None:
+            scope_list = list(scope_paths)
+            if not scope_list and not getattr(self, "_work_scope_paths", None):
+                return snapshot_pure(selected, vis, scope_paths=[])
+            return snapshot_pure(selected, vis, scope_paths=scope_list)
+        return snapshot_pure(selected, vis, scope_paths=None)
+
     def get_videos_for_operation(
         self,
         selected_paths: Optional[List[str]] = None,
