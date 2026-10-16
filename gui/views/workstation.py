@@ -32,6 +32,7 @@ from ..workers.rename_worker import RenameWorker
 from ..workers.io_worker import run_io_job
 from ..widgets.rename_dialog import BatchRenameDialog
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
+from core.organization_plan import OrganizationPlan, PHYSICAL_MIGRATION
 from gui.styles import normalize_theme
 from ..workers.catalog_worker import run_catalog_query
 
@@ -54,20 +55,32 @@ class _ClearSelectionOnEmptyClickFilter(QObject):
 
 
 class PhysicalMigrationPreviewDialog(QDialog):
-    """显示物理整理的完整路径和风险；不执行任何文件操作。"""
+    """显示物理整理方案，支持按素材排除；不执行任何文件操作。"""
 
-    _COLUMNS = ("状态", "源路径", "请求目标路径", "实际目标路径", "风险")
+    _COLUMNS = ("执行", "状态", "源路径", "请求目标路径", "实际目标路径", "风险")
 
-    def __init__(self, plan, target_root: str, parent=None):
+    def __init__(self, plan, target_root: str, parent=None, *, target_paths=()):
         super().__init__(parent)
         self.setWindowTitle("模拟预览 — 物理整理")
-        self.resize(1100, 620)
-        self._plan = list(plan or [])
+        self.resize(1150, 640)
+        self._raw_plan = list(plan or [])
+        self._plan = OrganizationPlan.from_migration_plan(
+            self._raw_plan,
+            target_paths=target_paths,
+            action_type=PHYSICAL_MIGRATION,
+            filter_summary="当前物理整理预览",
+        )
+        self._target_root = target_root
 
         layout = QVBoxLayout(self)
-        summary = QLabel(self._summary_text(target_root))
-        summary.setWordWrap(True)
-        layout.addWidget(summary)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.operation_checkbox = QCheckBox("执行物理整理（取消后本批次不执行此类操作）")
+        self.operation_checkbox.setChecked(True)
+        self.operation_checkbox.stateChanged.connect(self._update_summary)
+        layout.addWidget(self.operation_checkbox)
 
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText("搜索源路径、目标路径、分类或风险…")
@@ -77,72 +90,117 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self.table = QTableWidget(0, len(self._COLUMNS), self)
         self.table.setHorizontalHeaderLabels(list(self._COLUMNS))
         self.table.setSortingEnabled(True)
+        self.table.itemChanged.connect(self._update_summary)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 90)
-        self.table.setColumnWidth(1, 360)
+        self.table.setColumnWidth(0, 55)
+        self.table.setColumnWidth(1, 90)
         self.table.setColumnWidth(2, 360)
         self.table.setColumnWidth(3, 360)
+        self.table.setColumnWidth(4, 360)
         self._populate_rows()
         layout.addWidget(self.table, 1)
 
-        blocked = sum(1 for row in self._plan if row.get("status") == "blocked")
-        review = sum(1 for row in self._plan if row.get("status") == "review")
-        note = QLabel(
-            "执行前会再次检查当前文件状态。"
-            + (f" 当前有 {review} 条需要复核。" if review else "")
-            + (f" 当前有 {blocked} 条被阻止，不能执行。" if blocked else "")
-            + " 本轮不提供对原始素材的全部恢复承诺。"
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.note_label = QLabel()
+        self.note_label.setWordWrap(True)
+        layout.addWidget(self.note_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No, parent=self)
         buttons.button(QDialogButtonBox.Yes).setText("确认执行物理整理")
         buttons.button(QDialogButtonBox.No).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.Yes).setEnabled(blocked == 0)
+        self.confirm_button = buttons.button(QDialogButtonBox.Yes)
         layout.addWidget(buttons)
-
-    def _summary_text(self, target_root: str) -> str:
-        conflicts = sum(1 for row in self._plan if row.get("target_conflict"))
-        return (
-            f"预览 {len(self._plan)} 条整理步骤；目标根目录：{target_root}\\n"
-            f"冲突：{conflicts} 条。目标冲突仅显示为不覆盖的实际目标路径，"
-            "不会覆盖已有文件。"
-        )
+        self._update_summary()
 
     def _populate_rows(self):
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self._plan))
-        for row_index, step in enumerate(self._plan):
-            risks = "；".join(step.get("risk_flags") or []) or "无"
+        self.table.setRowCount(len(self._plan.items))
+        for row_index, step in enumerate(self._plan.items):
+            execute_item = QTableWidgetItem()
+            execute_item.setFlags(
+                execute_item.flags() | Qt.ItemIsUserCheckable
+            )
+            execute_item.setCheckState(Qt.Checked)
+            execute_item.setToolTip("取消勾选可排除该素材")
+            self.table.setItem(row_index, 0, execute_item)
+
+            risks = "；".join(step.risk_flags) or "无"
             values = (
                 {"ready": "可执行", "review": "需复核", "blocked": "已阻止"}.get(
-                    step.get("status"), str(step.get("status") or "未知")
+                    step.status, step.status or "未知"
                 ),
-                step.get("source_path") or step.get("old_path") or "",
-                step.get("requested_target_path") or "",
-                step.get("target_path") or step.get("new_path") or "",
+                step.source_path,
+                "",
+                step.target_path,
                 risks,
             )
-            for column, value in enumerate(values):
+            # 物理整理的完整请求目标路径由原始方案字段提供，便于确认实际改名。
+            raw = (self._raw_plan or [])[row_index] if row_index < len(self._raw_plan) else {}
+            values = (values[0], values[1], raw.get("requested_target_path", ""), values[3], values[4])
+            for column, value in enumerate(values, 1):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(value))
                 self.table.setItem(row_index, column, item)
         self.table.setSortingEnabled(True)
+
+    def _current_plan(self):
+        checked_paths = set(self._checked_paths())
+        excluded_paths = {
+            item.source_path
+            for item in self._plan.items
+            if item.source_path not in checked_paths
+        }
+        current = self._plan.exclude_paths(excluded_paths)
+        if not self.operation_checkbox.isChecked():
+            current = current.exclude_action_types([PHYSICAL_MIGRATION])
+        return current
+
+    def _update_summary(self, *_args):
+        current = self._current_plan()
+        active_count = len(current.active_items)
+        conflicts = sum(
+            1
+            for step in current.active_items
+            if "目标已存在" in "；".join(step.risk_flags)
+        )
+        blocked = sum(1 for step in current.active_items if step.status == "blocked")
+        self.summary_label.setText(
+            f"整理方案（尚未执行）：共 {len(self._plan.items)} 条，"
+            f"当前将执行 {active_count} 条，已排除 {len(self._plan.items) - active_count} 条；"
+            f"目标根目录：{self._target_root}；冲突 {conflicts} 条。"
+        )
+        self.note_label.setText(
+            "执行前会再次检查当前文件状态。"
+            + (f" 当前有 {blocked} 条被阻止，不能执行。" if blocked else "")
+            + " 本轮不提供对原始素材的全部恢复承诺。"
+        )
+        self.confirm_button.setEnabled(bool(active_count) and blocked == 0)
+
+    def _checked_paths(self):
+        if not self.operation_checkbox.isChecked():
+            return []
+        return [
+            self.table.item(row, 2).text()
+            for row in range(self.table.rowCount())
+            if self.table.item(row, 0).checkState() == Qt.Checked
+        ]
+
+    def execution_paths(self):
+        """返回本次确认后传给既有执行函数的源路径快照。"""
+        return list(self._current_plan().active_source_paths)
 
     def _filter_rows(self, text: str):
         query = text.strip().casefold()
         for row in range(self.table.rowCount()):
             content = " ".join(
                 self.table.item(row, column).text()
-                for column in range(self.table.columnCount())
+                for column in range(1, self.table.columnCount())
                 if self.table.item(row, column) is not None
             ).casefold()
             self.table.setRowHidden(row, bool(query and query not in content))
@@ -1432,12 +1490,17 @@ class WorkstationView(QWidget):
             QMessageBox.information(self, "无需整理", "没有需要移动的文件（可能已在目标位置或路径无效）。")
             return
 
-        preview_dialog = PhysicalMigrationPreviewDialog(plan, target_root, self)
+        preview_dialog = PhysicalMigrationPreviewDialog(
+            plan, target_root, self, target_paths=selected_paths
+        )
         if preview_dialog.exec() != QDialog.Accepted:
+            return
+        execution_paths = preview_dialog.execution_paths()
+        if not execution_paths:
             return
 
         def job():
-            return self.service.execute_physical_migration(target_root, selected_paths)
+            return self.service.execute_physical_migration(target_root, execution_paths)
 
         def on_ok(count):
             self._busy_io_end()
