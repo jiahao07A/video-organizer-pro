@@ -107,6 +107,14 @@ class MaterialLibraryView(QWidget):
         toolbar.addWidget(self.add_scope_btn)
         layout.addLayout(toolbar)
 
+        self.target_summary_label = QLabel("操作目标集：正在计算…")
+        self.target_summary_label.setObjectName("operation_target_summary")
+        self.target_summary_label.setStyleSheet("color: #888; padding: 2px 4px;")
+        self.target_summary_label.setToolTip(
+            "批量操作规则：有列表选中时使用列表选中；无选中时使用当前可见列表全部。"
+        )
+        layout.addWidget(self.target_summary_label)
+
         self.filter_panel = FilterPanel(self.settings, service=self.service)
         self.filter_panel.setVisible(False)
         self.filter_panel.filterChanged.connect(self.apply_advanced_filter)
@@ -236,12 +244,14 @@ class MaterialLibraryView(QWidget):
         self._filter_params = dict(self._filter_params)
         self._filter_params["text"] = text
         self.proxy_model.set_filter_params({})
+        self._refresh_operation_target_summary()
         self._schedule_query_reload()
 
     def apply_advanced_filter(self, params):
         self._filter_params = dict(params or {})
         self._filter_params["text"] = self.search_input.text()
         self.proxy_model.set_filter_params({})
+        self._refresh_operation_target_summary()
         self._schedule_query_reload()
 
     def _on_catalog_sort_changed(self, column, order):
@@ -255,6 +265,7 @@ class MaterialLibraryView(QWidget):
             return
         self._order_by = CATALOG_SORT_COLUMNS.get(column, "timestamp")
         self._descending = order == Qt.DescendingOrder
+        self._refresh_operation_target_summary()
         self._schedule_query_reload()
 
     def _schedule_query_reload(self):
@@ -298,6 +309,7 @@ class MaterialLibraryView(QWidget):
             self._page_offset = page.offset + len(page.rows)
             self._page_total = page.total_count
             self._refresh_list_numbers()
+            self._refresh_operation_target_summary()
             self.status_label.setText(f"素材库共 {page.total_count} 条，已加载 {self._page_offset} 条")
             self.status_message.emit(self.status_label.text())
 
@@ -399,28 +411,61 @@ class MaterialLibraryView(QWidget):
             order_by=self._order_by, descending=self._descending,
         )
 
-    def _resolve_batch_targets(self) -> list:
-        """素材库操作目标：有选中用选中，无选中用完整可见结果。"""
-        return self.service.resolve_operation_target_paths(
-            self._get_selected_paths() or None,
+    def _resolve_batch_snapshot(self):
+        """解析一次素材库操作目标集快照，供摘要、确认和执行共用。"""
+        return self.service.resolve_operation_target_snapshot(
+            self._get_selected_paths(),
             self._get_visible_paths(),
             scope_paths=None,
         )
 
+    def _filter_summary_text(self) -> str:
+        params = self._current_filter_params()
+        active = any(
+            bool(value) and value not in ([], (), "")
+            for value in params.values()
+        )
+        return "筛选已启用" if active else "未筛选"
+
+    def _format_operation_target_snapshot(self, snapshot) -> str:
+        source = (
+            f"列表选中 {snapshot.selected_count} 条"
+            if snapshot.source == "selected"
+            else "当前可见列表全部"
+        )
+        return (
+            f"操作目标集：{source} · 可见列表 {snapshot.visible_count} 条"
+            f" · 实际处理 {snapshot.target_count} 条 · {self._filter_summary_text()}"
+        )
+
+    def _refresh_operation_target_summary(self):
+        try:
+            snapshot = self._resolve_batch_snapshot()
+            self.target_summary_label.setText(
+                self._format_operation_target_snapshot(snapshot)
+            )
+        except Exception as exc:
+            self.target_summary_label.setText(f"操作目标集：暂时无法计算（{exc}）")
+
+    def _resolve_batch_targets(self) -> list:
+        """素材库操作目标：返回当前快照中的实际路径。"""
+        return list(self._resolve_batch_snapshot().target_paths)
+
     def uncatalog_selected(self):
         """素材库删除 = 取消入库（操作目标集）。"""
-        paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        paths = list(snapshot.target_paths)
         if not paths:
             QMessageBox.warning(
                 self, "提示",
                 "没有可取消入库的视频。\n请选中目标，或清空筛选使列表有可见项（无选中则作用于当前可见全部）。",
             )
             return
-        n = len(paths)
         reply = QMessageBox.question(
             self,
             "取消入库",
-            f"确定从素材库取消入库 {n} 条记录？\n"
+            f"{self._format_operation_target_snapshot(snapshot)}\n\n"
+            f"确定从素材库取消入库 {len(paths)} 条记录？\n"
             f"仅移除素材库入库记录，磁盘上的视频文件不会被删除。",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -431,6 +476,7 @@ class MaterialLibraryView(QWidget):
         self.work_scope_changed.emit()
 
     def on_selection_changed(self, selected, deselected):
+        self._refresh_operation_target_summary()
         self._detail_generation += 1
         generation = self._detail_generation
         if self.view_stack.currentWidget() == self.card_view:
@@ -463,7 +509,8 @@ class MaterialLibraryView(QWidget):
         )
 
     def accumulate_selected_to_scope(self):
-        paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        paths = list(snapshot.target_paths)
         if not paths:
             QMessageBox.warning(
                 self, "提示",

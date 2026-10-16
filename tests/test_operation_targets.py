@@ -3,7 +3,10 @@
 import os
 
 from core.analysis_targets import path_status_key
-from core.operation_targets import resolve_operation_target_paths
+from core.operation_targets import (
+    resolve_operation_target_paths,
+    resolve_operation_target_snapshot,
+)
 
 
 def test_nonempty_selected_uses_selected_order():
@@ -85,3 +88,28 @@ def test_skips_empty_path_strings():
     assert resolve_operation_target_paths(
         None, ["", "b.mp4"]
     ) == ["b.mp4"]
+
+
+def test_snapshot_keeps_selection_visible_and_scope_counts():
+    snapshot = resolve_operation_target_snapshot(
+        ["a.mp4", "outside.mp4", "a.mp4"],
+        ["a.mp4", "b.mp4", "outside.mp4"],
+        scope_paths=["a.mp4", "b.mp4"],
+    )
+    assert snapshot.source == "selected"
+    assert snapshot.selected_count == 2
+    assert snapshot.visible_count == 3
+    assert snapshot.target_paths == ("a.mp4",)
+    assert snapshot.target_count == 1
+    assert snapshot.scope_paths == ("a.mp4", "b.mp4")
+
+
+def test_snapshot_without_selection_uses_visible_paths():
+    snapshot = resolve_operation_target_snapshot(
+        [], ["b.mp4", "a.mp4", "b.mp4"], scope_paths=None
+    )
+    assert snapshot.source == "visible"
+    assert snapshot.selected_count == 0
+    assert snapshot.visible_count == 2
+    assert snapshot.target_paths == ("b.mp4", "a.mp4")
+    assert snapshot.scope_paths is None

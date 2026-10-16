@@ -155,6 +155,14 @@ class WorkstationView(QWidget):
 
         layout.addLayout(toolbar)
 
+        self.target_summary_label = QLabel("操作目标集：正在计算…")
+        self.target_summary_label.setObjectName("operation_target_summary")
+        self.target_summary_label.setStyleSheet("color: #888; padding: 2px 4px;")
+        self.target_summary_label.setToolTip(
+            "批量操作规则：有列表选中时使用列表选中；无选中时使用当前可见列表全部。工作台目标不得越出工作范围。"
+        )
+        layout.addWidget(self.target_summary_label)
+
         # 2. 筛选面板
         self.filter_panel = FilterPanel(self.settings, service=self.service)
         self.filter_panel.setVisible(False)
@@ -369,15 +377,48 @@ class WorkstationView(QWidget):
         """原始工作范围路径，供 SQL 前缀查询；不展开成全部视频路径。"""
         return self.service.get_work_scope_paths()
 
-    def _resolve_batch_targets(self) -> list:
-        """批量操作目标：有选中用选中，无选中用完整可见结果。"""
-        selected = self._get_selected_paths()
-        visible = self._get_visible_paths()
-        return self.service.resolve_operation_target_paths(
-            selected or None,
-            visible,
+    def _resolve_batch_snapshot(self):
+        """解析一次操作目标集快照，供摘要、确认和执行共用。"""
+        return self.service.resolve_operation_target_snapshot(
+            self._get_selected_paths(),
+            self._get_visible_paths(),
             scope_paths=self._scope_paths(),
         )
+
+    def _filter_summary_text(self) -> str:
+        params = self._current_filter_params()
+        active = any(
+            bool(value) and value not in ([], (), "")
+            for value in params.values()
+        )
+        return "筛选已启用" if active else "未筛选"
+
+    def _format_operation_target_snapshot(self, snapshot) -> str:
+        source = (
+            f"列表选中 {snapshot.selected_count} 条"
+            if snapshot.source == "selected"
+            else "当前可见列表全部"
+        )
+        scope = ""
+        if snapshot.scope_paths is not None:
+            scope = f" · 工作范围内可见 {len(snapshot.scope_paths)} 条"
+        return (
+            f"操作目标集：{source} · 可见列表 {snapshot.visible_count} 条"
+            f" · 实际处理 {snapshot.target_count} 条{scope} · {self._filter_summary_text()}"
+        )
+
+    def _refresh_operation_target_summary(self):
+        try:
+            snapshot = self._resolve_batch_snapshot()
+            self.target_summary_label.setText(
+                self._format_operation_target_snapshot(snapshot)
+            )
+        except Exception as exc:
+            self.target_summary_label.setText(f"操作目标集：暂时无法计算（{exc}）")
+
+    def _resolve_batch_targets(self) -> list:
+        """批量操作目标：返回当前快照中的实际路径。"""
+        return list(self._resolve_batch_snapshot().target_paths)
 
     def _build_column_menu(self):
         menu = QMenu(self)
@@ -554,12 +595,14 @@ class WorkstationView(QWidget):
         self._filter_params = dict(self._filter_params)
         self._filter_params["text"] = text
         self.proxy_model.set_filter_params({})
+        self._refresh_operation_target_summary()
         self._schedule_query_reload()
 
     def apply_advanced_filter(self, params):
         self._filter_params = dict(params or {})
         self._filter_params["text"] = self.search_input.text()
         self.proxy_model.set_filter_params({})
+        self._refresh_operation_target_summary()
         self._schedule_query_reload()
 
     def _on_catalog_sort_changed(self, column, order):
@@ -573,6 +616,7 @@ class WorkstationView(QWidget):
             return
         self._order_by = CATALOG_SORT_COLUMNS.get(column, "timestamp")
         self._descending = order == Qt.DescendingOrder
+        self._refresh_operation_target_summary()
         self._schedule_query_reload()
 
     def _schedule_query_reload(self):
@@ -610,6 +654,7 @@ class WorkstationView(QWidget):
             self._page_total = page.total_count
             self._refresh_list_numbers()
             self._refresh_scope_path_ui()
+            self._refresh_operation_target_summary()
             self.status_label.setText(f"工作范围内共 {page.total_count} 个已入库视频，已加载 {self._page_offset} 个")
             self.status_message.emit(self.status_label.text())
 
@@ -709,6 +754,7 @@ class WorkstationView(QWidget):
             self._query_pending = False
             self._query_debounce.stop()
             self.model.update_data([])
+            self._refresh_operation_target_summary()
             self.status_label.setText("请先设定工作范围：点击「浏览」选择文件或文件夹")
             self.status_message.emit(self.status_label.text())
             return
@@ -717,6 +763,7 @@ class WorkstationView(QWidget):
 
 
     def on_selection_changed(self, selected, deselected):
+        self._refresh_operation_target_summary()
         self._detail_generation += 1
         generation = self._detail_generation
         if self.view_stack.currentWidget() == self.card_view:
@@ -947,7 +994,8 @@ class WorkstationView(QWidget):
 
     def delete_selected(self):
         """工作台删除 = 移出工作范围（操作目标集）。"""
-        paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        paths = list(snapshot.target_paths)
         if not paths:
             QMessageBox.warning(
                 self, "提示",
@@ -957,6 +1005,7 @@ class WorkstationView(QWidget):
         n = len(paths)
         reply = QMessageBox.question(
             self, "移出工作范围",
+            f"{self._format_operation_target_snapshot(snapshot)}\n\n"
             f"确定将 {n} 条移出当前工作范围？\n"
             f"仅从工作范围移除，素材库入库记录与磁盘文件都会保留。",
             QMessageBox.Yes | QMessageBox.No,
@@ -1064,7 +1113,8 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "警告", "请先通过「浏览」设定工作范围。")
             return
 
-        paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        paths = list(snapshot.target_paths)
         if not paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可分析的视频。")
             return
@@ -1073,6 +1123,7 @@ class WorkstationView(QWidget):
         if force:
             reply = QMessageBox.question(
                 self, "确认强制重新分析",
+                f"{self._format_operation_target_snapshot(snapshot)}\n\n"
                 f"将对 {len(paths)} 个目标强制重新分析并整份覆盖分类/摘要/标签。是否继续？",
                 QMessageBox.Yes | QMessageBox.No,
             )
@@ -1102,16 +1153,17 @@ class WorkstationView(QWidget):
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
 
-        selected = self._get_selected_paths() or None
-        visible = self._get_visible_paths()
-        scope_paths = self._scope_paths()
-        selected_paths = self.service.resolve_operation_target_paths(
-            selected, visible, scope_paths=scope_paths
-        )
-        selected_videos = self.service.get_videos_for_operation(
-            selected, visible, scope_paths=scope_paths
-        )
+        snapshot = self._resolve_batch_snapshot()
+        selected_paths = list(snapshot.target_paths)
+        if not selected_paths:
+            QMessageBox.warning(self, "警告", "工作范围内没有可重命名的视频。")
+            return
 
+        selected_videos = self.service.get_videos_for_operation(
+            selected_paths,
+            selected_paths,
+            scope_paths=self._scope_paths(),
+        )
         if not selected_videos:
             QMessageBox.warning(self, "警告", "工作范围内没有可重命名的视频。")
             return
@@ -1125,6 +1177,7 @@ class WorkstationView(QWidget):
         if not dry_run:
             reply = QMessageBox.question(
                 self, "确认",
+                f"{self._format_operation_target_snapshot(snapshot)}\n\n"
                 f"确定要对 {len(selected_paths)} 个文件应用重命名吗？文件将被物理重命名。",
                 QMessageBox.Yes | QMessageBox.No,
             )
@@ -1170,7 +1223,8 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        selected_paths = list(snapshot.target_paths)
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
             return
@@ -1201,7 +1255,8 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        selected_paths = list(snapshot.target_paths)
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可导出的视频。")
             return
@@ -1238,7 +1293,8 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        selected_paths = list(snapshot.target_paths)
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可同步的视频。")
             return
@@ -1266,7 +1322,8 @@ class WorkstationView(QWidget):
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
             return
-        selected_paths = self._resolve_batch_targets()
+        snapshot = self._resolve_batch_snapshot()
+        selected_paths = list(snapshot.target_paths)
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可整理的视频。")
             return
