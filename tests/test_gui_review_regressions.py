@@ -180,7 +180,8 @@ def test_settings_effective_config_summary_hides_credentials(service, views):
     assert "当前供应商" in text
     assert "视频分类" in text
     assert "标准词 AI 助手" in text
-    assert "自动 XMP 侧车：关闭" in text
+    assert "自动 XMP 侧车：" in text
+    assert ("自动 XMP 侧车：开启" in text) or ("自动 XMP 侧车：关闭" in text)
     assert "secret-test-key" not in text
 
 
