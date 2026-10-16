@@ -1204,6 +1204,11 @@ class AIHandler:
         self.gateway.settings = self.settings
         return self.gateway.client_for_task(task_key)
 
+    def test_connection(self, task_key: str = "video_classification") -> Dict:
+        """测试指定任务路由的供应商连接，不暴露凭据。"""
+        self.gateway.settings = self.settings
+        return self.gateway.test_connection(task_key)
+
     def transcribe_audio(self, video_path: str) -> str:
         """抽取并转录音频；调用层由统一网关处理。"""
         return AudioTranscriber.transcribe(
@@ -2125,6 +2130,12 @@ class VideoOrganizerService:
         if hasattr(self, "tag_processor") and self.tag_processor is not None:
             self.tag_processor.settings = self.settings
 
+    def test_ai_connection(self, task_key: str = "video_classification") -> Dict:
+        """测试指定任务模型路由的连接，不保存设置或暴露凭据。"""
+        if not hasattr(self, "ai") or self.ai is None:
+            raise RuntimeError("AI 引擎尚未初始化")
+        return self.ai.test_connection(task_key)
+
     def reload_ai_client(self):
         """设置保存后：让 AI 客户端使用最新 api.key / base_url。"""
         try:
@@ -2138,6 +2149,8 @@ class VideoOrganizerService:
             if hasattr(self.ai, "reload_client"):
                 self.ai.reload_client()
         if hasattr(self, "tag_processor") and self.tag_processor is not None:
+            self.tag_processor.settings = self.settings
+
             self.tag_processor.settings = self.settings
 
     # --- 工作范围 (Work Scope) ---

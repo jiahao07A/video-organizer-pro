@@ -10,7 +10,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from core.video_organizer_service import SettingsManager, VideoOrganizerService
 from gui.main_window import MainWindow
@@ -159,6 +159,55 @@ def test_selection_loads_complete_detail_without_blank_transcription(service, tm
     _wait_for(qt_app, lambda: view.detail_panel.save_btn.isEnabled())
     assert view.detail_panel.current_video["path"] == path
     assert view.detail_panel.transcript_input.toPlainText() == "existing transcript"
+
+
+def test_settings_effective_config_summary_hides_credentials(service, views):
+    from core.model_providers import ensure_providers, update_provider
+
+    ensure_providers(service.settings)
+    provider_id = service.settings["current_provider_id"]
+    update_provider(
+        service.settings,
+        provider_id,
+        api_key="secret-test-key",
+        base_url="https://provider.example/v1",
+    )
+    view = SettingsView(service)
+    views.append(view)
+
+    text = view.effective_config_label.text()
+    assert "当前供应商" in text
+    assert "视频分类" in text
+    assert "标准词 AI 助手" in text
+    assert "自动 XMP 侧车：关闭" in text
+    assert "secret-test-key" not in text
+
+
+def test_reset_interface_layout_preserves_work_scope(service, views, monkeypatch):
+    service.settings["ui_preferences"].update(
+        {
+            "font_size": 22,
+            "sidebar_width": 340,
+            "table_columns_visible": {"0": False},
+            "table_column_widths": {"0": 999},
+            "last_work_scope": ["D:/素材"],
+        }
+    )
+    view = SettingsView(service)
+    views.append(view)
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+
+    view._reset_interface_layout()
+
+    prefs = service.settings["ui_preferences"]
+    assert prefs["font_size"] == 14
+    assert prefs["sidebar_width"] == 220
+    assert "table_columns_visible" not in prefs
+    assert "table_column_widths" not in prefs
+    assert prefs["last_work_scope"] == ["D:/素材"]
 
 
 def test_autosave_timer_emits_success_and_clears_pending_status(service, qt_app, views):

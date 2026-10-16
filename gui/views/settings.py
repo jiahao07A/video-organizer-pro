@@ -31,6 +31,7 @@ from gui.models.settings_catalog import (
     search_entries,
 )
 from gui.services.settings_controller import SettingsController
+from ..workers.io_worker import run_io_job
 
 
 class SettingsView(QWidget):
@@ -622,6 +623,29 @@ class SettingsView(QWidget):
         hint.setStyleSheet("color: #888; font-size: 12px;")
         layout.addWidget(hint)
 
+        # —— 当前生效配置摘要（只读，不显示 Key）——
+        effective_group = QGroupBox("当前生效配置")
+        effective_layout = QVBoxLayout(effective_group)
+        self.effective_config_label = QLabel()
+        self.effective_config_label.setWordWrap(True)
+        self.effective_config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.effective_config_label.setStyleSheet("color: #89d185; font-size: 12px;")
+        effective_layout.addWidget(self.effective_config_label)
+        test_row = QHBoxLayout()
+        self.connection_test_task_combo = QComboBox()
+        for key in TASK_ROUTE_KEYS:
+            self.connection_test_task_combo.addItem(TASK_ROUTE_LABELS.get(key, key), key)
+        self.connection_test_btn = QPushButton("测试连接")
+        self.connection_test_btn.clicked.connect(self._test_selected_connection)
+        self.connection_test_status_label = QLabel("")
+        self.connection_test_status_label.setStyleSheet("color: #888; font-size: 12px;")
+        test_row.addWidget(QLabel("测试任务:"))
+        test_row.addWidget(self.connection_test_task_combo, 1)
+        test_row.addWidget(self.connection_test_btn)
+        test_row.addWidget(self.connection_test_status_label, 2)
+        effective_layout.addLayout(test_row)
+        layout.addWidget(effective_group)
+
         # —— 供应商列表 ——
         list_group = QGroupBox("模型供应商（最多 5 个）")
         list_layout = QVBoxLayout(list_group)
@@ -705,6 +729,8 @@ class SettingsView(QWidget):
             row.addWidget(prov_combo, 1)
             row.addWidget(model_edit, 1)
             route_layout.addLayout(row)
+            prov_combo.currentIndexChanged.connect(self._on_route_widget_changed)
+            model_edit.textChanged.connect(self._on_route_widget_changed)
             self._route_widgets[key] = {"provider": prov_combo, "model": model_edit}
 
         layout.addWidget(route_group)
@@ -716,10 +742,85 @@ class SettingsView(QWidget):
         self._provider_ui_ready = True
         self._refresh_provider_list(select_id=self.settings.get("current_provider_id"))
         self._load_task_routes_ui()
+        self._refresh_effective_config_summary()
         self.register_setting_widget("api_key", self.api_key_input)
         self.register_setting_widget("api_url", self.api_url_input)
         self.register_setting_widget("provider_list", self.provider_list)
         return tab
+
+    def _refresh_effective_config_summary(self) -> None:
+        """显示当前实际生效的路由和副作用开关，不显示凭据。"""
+        if not hasattr(self, "effective_config_label"):
+            return
+        try:
+            current = resolve_current_provider(self.settings)
+            current_name = current.get("display_name") or current.get("id") or "未命名"
+            key_state = "已配置" if str(current.get("api_key") or "").strip() else "未配置"
+            url_state = "已配置" if str(current.get("base_url") or "").strip() else "未配置"
+            lines = [
+                f"当前供应商：{current_name}（API Key {key_state}，Base URL {url_state}）",
+                "任务模型路由：",
+            ]
+            for key in TASK_ROUTE_KEYS:
+                route = resolve_task_route(self.settings, key)
+                provider = route.get("display_name") or route.get("provider_id") or "未命名"
+                model = route.get("model") or "未设置"
+                lines.append(f"  · {TASK_ROUTE_LABELS.get(key, key)}：{provider} / {model}")
+            auto_xmp = bool(SettingsManager.get_setting(
+                self.settings, "processing.auto_sync_xmp_after_analysis", False
+            ))
+            audio = bool(SettingsManager.get_setting(
+                self.settings, "processing.enable_audio_transcription", False
+            ))
+            rerun = bool(SettingsManager.get_setting(
+                self.settings, "processing.analysis_retry.batch_rerun_enabled", True
+            ))
+            lines.extend([
+                f"自动 XMP 侧车：{'开启' if auto_xmp else '关闭'}",
+                f"音频转录：{'开启' if audio else '关闭'}",
+                f"分析失败项批次补跑：{'开启' if rerun else '关闭'}",
+            ])
+            self.effective_config_label.setText("\n".join(lines))
+        except Exception as exc:
+            self.effective_config_label.setText(f"当前生效配置暂时无法读取：{exc}")
+
+    def _test_selected_connection(self) -> None:
+        """在后台测试选中任务路由，结果只显示状态，不保存配置。"""
+        self._flush_provider_form_to_settings()
+        self._flush_task_routes_to_settings()
+        task_key = str(self.connection_test_task_combo.currentData() or TASK_ROUTE_KEYS[0])
+        self.connection_test_btn.setEnabled(False)
+        self.connection_test_status_label.setText("测试中…")
+
+        def on_ok(result):
+            self.connection_test_btn.setEnabled(True)
+            name = result.get("display_name") or result.get("provider_id") or "未命名"
+            model = result.get("model") or "未设置"
+            count = result.get("model_count")
+            suffix = f"，服务端返回 {count} 个模型" if count is not None else ""
+            self.connection_test_status_label.setStyleSheet("color: #89d185; font-size: 12px;")
+            self.connection_test_status_label.setText(f"成功：{name} / {model}{suffix}")
+            self._refresh_effective_config_summary()
+
+        def on_fail(message):
+            self.connection_test_btn.setEnabled(True)
+            self.connection_test_status_label.setStyleSheet("color: #f48771; font-size: 12px;")
+            self.connection_test_status_label.setText(f"失败：{message}")
+            self._refresh_effective_config_summary()
+
+        run_io_job(
+            self,
+            fn=lambda: self.service.test_ai_connection(task_key),
+            on_ok=on_ok,
+            on_fail=on_fail,
+            busy_message="正在测试 AI 连接…",
+        )
+
+    def _on_route_widget_changed(self, *_args) -> None:
+        if not getattr(self, "_provider_ui_ready", False):
+            return
+        self._flush_task_routes_to_settings()
+        self._refresh_effective_config_summary()
 
     def _load_task_routes_ui(self) -> None:
         if not getattr(self, "_route_widgets", None):
@@ -742,6 +843,7 @@ class SettingsView(QWidget):
             combo.blockSignals(False)
             if key == TASK_ROUTE_KEYS[0]:
                 self.register_setting_widget("task_routing", combo)
+        self._refresh_effective_config_summary()
 
     def _flush_task_routes_to_settings(self) -> None:
         if not getattr(self, "_route_widgets", None):
@@ -843,6 +945,7 @@ class SettingsView(QWidget):
         if target:
             self._load_provider_form(target)
         self._load_task_routes_ui()
+        self._refresh_effective_config_summary()
 
     def _on_provider_selection_changed(self, current, previous):
         if self._suppress_provider_signals:
@@ -1160,6 +1263,11 @@ class SettingsView(QWidget):
         layout.addRow("侧边栏宽度:", self.sidebar_spin)
         layout.addRow(self.detail_expanded_cb)
         layout.addRow(self.remember_scope_cb)
+
+        self.reset_layout_btn = QPushButton("恢复默认界面布局")
+        self.reset_layout_btn.setToolTip("恢复字体、缩略图、主题、默认视图、侧边栏和详情面板布局；不删除工作范围。")
+        self.reset_layout_btn.clicked.connect(self._reset_interface_layout)
+        layout.addRow(self.reset_layout_btn)
         
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
@@ -1242,6 +1350,66 @@ class SettingsView(QWidget):
         self.register_setting_widget("xmp_prefix_category", self.xmp_prefix_cat_cb)
         self.register_setting_widget("ale_columns", self.ale_columns_edit)
         return tab
+
+    def _reset_interface_layout(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "恢复默认界面布局",
+            "恢复字体、缩略图、主题、默认视图、侧边栏和详情面板布局？\n工作范围和标签数据不会被删除。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        import copy
+        from core.video_organizer_service import DEFAULT_SETTINGS
+
+        defaults = copy.deepcopy(DEFAULT_SETTINGS.get("ui_preferences") or {})
+        prefs = self.settings.setdefault("ui_preferences", {})
+        for key in (
+            "font_size",
+            "thumbnail_size",
+            "theme",
+            "default_view",
+            "sidebar_width",
+            "detail_panel_expanded",
+        ):
+            if key in defaults:
+                prefs[key] = defaults[key]
+        prefs.pop("table_columns_visible", None)
+        prefs.pop("table_column_widths", None)
+
+        widgets = (
+            self.font_spin,
+            self.thumb_w_spin,
+            self.thumb_h_spin,
+            self.theme_combo,
+            self.default_view_combo,
+            self.sidebar_spin,
+            self.detail_expanded_cb,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.font_spin.setValue(int(defaults.get("font_size", 14)))
+            thumb = defaults.get("thumbnail_size", [160, 90])
+            self.thumb_w_spin.setValue(int(thumb[0]))
+            self.thumb_h_spin.setValue(int(thumb[1]))
+            self.theme_combo.setCurrentIndex(0 if defaults.get("theme", "dark") == "dark" else 1)
+            self.default_view_combo.setCurrentIndex(0 if defaults.get("default_view", "list") != "card" else 1)
+            self.sidebar_spin.setValue(int(defaults.get("sidebar_width", 220)))
+            self.detail_expanded_cb.setChecked(bool(defaults.get("detail_panel_expanded", True)))
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+        try:
+            SettingsManager.save_settings(self.settings, self.service.db)
+            self._set_save_status("默认界面布局已恢复")
+            self.ui_preferences_applied.emit()
+        except Exception as exc:
+            self._set_save_status(f"恢复布局失败：{exc}", error=True)
+            QMessageBox.critical(self, "错误", f"恢复默认界面布局失败：{exc}")
 
     def apply_settings(self):
         """同步 UI 数据到 settings 字典并保存（敏感配置的明确保存区）"""
@@ -1354,6 +1522,7 @@ class SettingsView(QWidget):
             if self._provider_ui_ready:
                 self._refresh_provider_list(select_id=self._selected_provider_id())
                 self._load_task_routes_ui()
+            self._refresh_effective_config_summary()
             self._set_save_status("所有设置已保存并已应用")
             QMessageBox.information(self, "成功", "设置已保存并已应用到 AI 引擎，界面偏好将尽量立即生效。")
             self.settings_applied.emit()
