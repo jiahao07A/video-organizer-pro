@@ -383,6 +383,59 @@ def test_explicit_chat_client_resolves_route_once(monkeypatch):
     assert resolutions == ["video_classification"]
 
 
+def test_connection_probe_uses_selected_task_route_without_credentials(monkeypatch):
+    from core.model_providers import make_provider, set_task_route
+
+    settings = {
+        "model_providers": [
+            make_provider(
+                provider_id="p1",
+                display_name="测试供应商",
+                api_key="secret-key",
+                base_url="https://example.invalid/v1",
+            )
+        ],
+        "current_provider_id": "p1",
+    }
+    set_task_route(settings, "pending_tag_ai", provider_id="p1", model="cheap-model")
+    client = SimpleNamespace(
+        models=SimpleNamespace(list=lambda: SimpleNamespace(data=["a", "b"]))
+    )
+    monkeypatch.setattr("core.ai_gateway.OpenAI", lambda **_: client)
+    gateway = AiRequestGateway(settings)
+
+    result = gateway.test_connection("pending_tag_ai")
+
+    assert result == {
+        "task_key": "pending_tag_ai",
+        "provider_id": "p1",
+        "display_name": "测试供应商",
+        "model": "cheap-model",
+        "model_count": 2,
+    }
+    assert "secret-key" not in str(result)
+
+
+def test_connection_probe_classifies_auth_failure(monkeypatch):
+    from core.model_providers import make_provider
+
+    class AuthError(Exception):
+        status_code = 401
+
+    client = SimpleNamespace(
+        models=SimpleNamespace(list=lambda: (_ for _ in ()).throw(AuthError("unauthorized")))
+    )
+    settings = {
+        "model_providers": [make_provider(provider_id="p1", api_key="secret")],
+        "current_provider_id": "p1",
+    }
+    monkeypatch.setattr("core.ai_gateway.OpenAI", lambda **_: client)
+    gateway = AiRequestGateway(settings)
+
+    with pytest.raises(RuntimeError, match="鉴权失败"):
+        gateway.test_connection()
+
+
 def test_audio_connection_resolves_route_once(tmp_path, monkeypatch):
     from core.model_providers import resolve_task_route
 

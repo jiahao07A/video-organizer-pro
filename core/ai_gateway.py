@@ -228,6 +228,37 @@ class AiRequestGateway:
             self._clients[fingerprint] = client
         return client, route
 
+    def test_connection(self, task_key: str = "video_classification") -> Dict[str, Any]:
+        """调用供应商模型列表接口验证路由连接，不返回凭据。"""
+        client, route = self.client_for_task(task_key)
+        try:
+            models_api = getattr(client, "models", None)
+            list_models = getattr(models_api, "list", None)
+            if not callable(list_models):
+                raise RuntimeError("当前客户端不支持模型列表探测")
+            response = list_models()
+        except Exception as error:
+            code = _status_code(error)
+            if code in (401, 403):
+                raise RuntimeError("鉴权失败，请检查 API Key") from error
+            if code == 404:
+                raise RuntimeError("接口地址不存在，请检查 API Base URL") from error
+            text = _error_message(error)
+            lowered = text.lower()
+            if any(marker in lowered for marker in ("timeout", "timed out", "connection", "connect")):
+                raise RuntimeError("网络连接失败，请检查网络或 API Base URL") from error
+            raise RuntimeError(f"连接失败：{text}") from error
+
+        data = getattr(response, "data", None)
+        count = len(data) if isinstance(data, (list, tuple)) else None
+        return {
+            "task_key": task_key,
+            "provider_id": route.get("provider_id") or "",
+            "display_name": route.get("display_name") or "",
+            "model": route.get("model") or "",
+            "model_count": count,
+        }
+
     def reload(self) -> Any:
         """清空所有连接缓存，并返回最新当前供应商客户端。"""
         self._clients.clear()
