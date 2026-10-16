@@ -18,6 +18,7 @@ from gui.models.tag_work_views import (
     build_pending_suggestion_rows,
     build_standard_word_rows,
     filter_pending_rows,
+    sort_pending_rows,
     filter_standard_word_rows,
     selected_suggestions,
 )
@@ -180,15 +181,27 @@ class PendingReviewView(QWidget):
         self.search_edit.setClearButtonEnabled(True)
         self.group_filter = QComboBox()
         self.group_filter.setToolTip("按 AI 建议组筛选待审词")
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("按创建时间", "created_at")
+        self.sort_combo.addItem("按原词", "raw_text")
+        self.sort_combo.addItem("按来源组", "group_id")
+        self.sort_combo.addItem("按状态", "status")
+        self.sort_order_btn = QPushButton("降序")
+        self.sort_order_btn.setCheckable(True)
+        self.sort_order_btn.setChecked(True)
         filter_row.addWidget(self.search_edit, 1)
         filter_row.addWidget(self.group_filter)
+        filter_row.addWidget(self.sort_combo)
+        filter_row.addWidget(self.sort_order_btn)
         layout.addLayout(filter_row)
 
         # 待审词列表（多选）
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
         self.list_widget.setToolTip("可 Ctrl / Shift 多选待审词；批量建议在同一视图勾选后应用")
+        self.selection_count_label = QLabel("已选 0 条")
         layout.addWidget(self.list_widget, 1)
+        layout.addWidget(self.selection_count_label)
 
         # 批量 AI 建议行（默认隐藏；生成后在本视图内勾选应用）
         self.ai_header = QLabel("AI 建议（默认不勾选，勾选后点「应用所选」才写库）")
@@ -215,9 +228,14 @@ class PendingReviewView(QWidget):
         layout.addLayout(ai_btn_row)
 
         # 批准目标组 + 单条动作
+        layout.addWidget(QLabel("批准新标准词的目标组："))
         self.group_combo = QComboBox()
         self.group_combo.setToolTip("批准为标准词时的目标标签组（必选）")
         layout.addWidget(self.group_combo)
+        layout.addWidget(QLabel("挂别名到已有标准词："))
+        self.standard_combo = QComboBox()
+        self.standard_combo.setToolTip("挂别名时选择已有标准词；不允许直接写入未验证的标准词")
+        layout.addWidget(self.standard_combo)
 
         btn_row1 = QHBoxLayout()
         self.btn_approve = QPushButton("批准选中到组")
@@ -241,6 +259,9 @@ class PendingReviewView(QWidget):
 
         self.search_edit.textChanged.connect(self._apply_filter)
         self.group_filter.currentIndexChanged.connect(self._apply_filter)
+        self.sort_combo.currentIndexChanged.connect(self._apply_filter)
+        self.sort_order_btn.toggled.connect(self._on_sort_order_toggled)
+        self.list_widget.itemSelectionChanged.connect(self._refresh_selection_count)
         self.btn_approve.clicked.connect(self._on_approve)
         self.btn_alias.clicked.connect(self._on_alias)
         self.btn_discard.clicked.connect(self._on_discard)
@@ -354,10 +375,47 @@ class PendingReviewView(QWidget):
                 self.group_filter.setCurrentIndex(idx)
         self.group_filter.blockSignals(False)
 
-    def reload(self):
-        """刷新待审列表、筛选器与组下拉。"""
+    def refresh_standard_combo(self):
+        """刷新挂别名使用的标准词选择器。"""
+        current = self.standard_combo.currentData()
+        self.standard_combo.clear()
+        db = getattr(self._service(), "db", None)
+        names = []
+        if db is not None:
+            try:
+                names = [
+                    str(row.get("tag_name") or "").strip()
+                    for row in (db.get_tags_detail() or [])
+                    if str(row.get("tag_name") or "").strip()
+                    and str(row.get("dimension") or "").lower() != "pool"
+                ]
+            except Exception:
+                names = []
+        if not names:
+            for group in self._tag_config().get("tag_groups", []) or []:
+                for tag in group.get("tags") or []:
+                    name = tag.get("name") if isinstance(tag, dict) else tag
+                    if name:
+                        names.append(str(name).strip())
+        for name in sorted(set(names), key=str.casefold):
+            self.standard_combo.addItem(name, name)
+        if current:
+            idx = self.standard_combo.findData(current)
+            if idx >= 0:
+                self.standard_combo.setCurrentIndex(idx)
+
+    def _on_sort_order_toggled(self, descending: bool):
+        self.sort_order_btn.setText("降序" if descending else "升序")
+        self._apply_filter()
+
+    def _refresh_selection_count(self):
+        count = len(self.list_widget.selectedItems())
+        self.selection_count_label.setText(f"已选 {count} 条")
+
+        """刷新待审列表、筛选器、标准词选择器与组下拉。"""
         self.refresh_group_combo()
         self.refresh_group_filter()
+        self.refresh_standard_combo()
         rows = []
         db = getattr(self._service(), "db", None)
         if db and hasattr(db, "list_pending_tags"):
@@ -377,21 +435,33 @@ class PendingReviewView(QWidget):
             query=self.search_edit.text(),
             group_id=self.group_filter.currentData() or "",
         )
+        rows = sort_pending_rows(
+            rows,
+            sort_key=self.sort_combo.currentData() or "created_at",
+            descending=self.sort_order_btn.isChecked(),
+        )
         self._pending_rows = rows
         self.list_widget.clear()
         for row in rows:
             raw = row.get("raw_text") or ""
             gid = row.get("group_id") or ""
-            label = f"{raw}" + (f"  · 建议组 {gid}" if gid else "")
+            status = row.get("status") or "pending"
+            created = row.get("created_at") or ""
+            label = f"{raw}" + (f"  · 来源组 {gid}" if gid else "  · 来源组未指定")
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, row)
-            item.setToolTip(f"待审词 #{row.get('id')}：{raw}\n（待审 ≠ 标准词）")
+            item.setToolTip(
+                f"待审词 #{row.get('id')}：{raw}\n"
+                f"状态：{status}\n创建时间：{created or '未知'}\n"
+                f"来源文件：{row.get('source_path') or '未知'}\n（待审 ≠ 标准词）"
+            )
             self.list_widget.addItem(item)
         total = len(getattr(self, "_all_pending_rows", []))
         shown = len(rows)
         self.count_label.setText(
             str(shown) if shown == total else f"{shown}/{total}"
         )
+        self._refresh_selection_count()
 
     def _on_approve(self):
         rows = self._current_rows()
@@ -415,6 +485,7 @@ class PendingReviewView(QWidget):
         self.reload()
         if ok_n:
             self.owner.on_pending_resolved()
+            QMessageBox.information(self, "已写入", f"已批准 {ok_n}/{len(rows)} 条待审词到「{gid}」。")
         else:
             QMessageBox.warning(
                 self, "失败",
@@ -427,13 +498,20 @@ class PendingReviewView(QWidget):
             QMessageBox.information(self, "提示", "挂别名一次只能处理一条待审词。")
             return
         row = rows[0]
-        std, ok = QInputDialog.getText(
-            self, "挂为别名", f"将「{row.get('raw_text')}」挂到哪个标准词？"
+        std = self.standard_combo.currentData()
+        if not std:
+            QMessageBox.information(self, "提示", "当前没有可用标准词，请先维护标准词。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认挂别名",
+            f"将「{row.get('raw_text')}」挂为「{std}」的别名？\n确认后才会写入标签库。",
+            QMessageBox.Yes | QMessageBox.No,
         )
-        if not ok or not (std or "").strip():
+        if reply != QMessageBox.Yes:
             return
         if self._service().resolve_pending_tag(
-            row["id"], "link_alias", standard_tag=std.strip()
+            row["id"], "link_alias", standard_tag=str(std)
         ):
             self.reload()
             self.owner.on_pending_resolved(refresh_groups=False)
@@ -452,9 +530,13 @@ class PendingReviewView(QWidget):
         )
         if reply != QMessageBox.Yes:
             return
-        for row in rows:
-            self._service().resolve_pending_tag(row["id"], "discard")
+        applied = sum(
+            1
+            for row in rows
+            if self._service().resolve_pending_tag(row["id"], "discard")
+        )
         self.reload()
+        QMessageBox.information(self, "已处理", f"已丢弃 {applied}/{len(rows)} 条待审词。")
 
     def _on_ai_suggest(self):
         """待审词 AI 建议：后台调模型，完成后弹确认框。"""

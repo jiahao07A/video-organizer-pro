@@ -50,6 +50,28 @@ def filter_pending_rows(
     return out
 
 
+def sort_pending_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    sort_key: str = "created_at",
+    descending: bool = True,
+) -> List[Dict[str, Any]]:
+    """按待审词原文、来源组、状态或创建时间排序。"""
+    allowed = {"raw_text", "group_id", "status", "created_at"}
+    key_name = sort_key if sort_key in allowed else "created_at"
+
+    def value(row: Mapping[str, Any]):
+        raw = str(row.get(key_name) or "").strip().lower()
+        # 相同排序值用稳定的 id 次序作为确定性次键。
+        return raw, int(row.get("id") or 0)
+
+    return sorted(
+        [dict(row) for row in rows or [] if isinstance(row, Mapping)],
+        key=value,
+        reverse=bool(descending),
+    )
+
+
 @dataclass
 class PendingSuggestionRow:
     """一条批量 AI 建议在待审视图中的呈现行（默认不勾选）。"""
