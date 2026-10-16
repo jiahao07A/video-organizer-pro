@@ -90,7 +90,6 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self.table = QTableWidget(0, len(self._COLUMNS), self)
         self.table.setHorizontalHeaderLabels(list(self._COLUMNS))
         self.table.setSortingEnabled(True)
-        self.table.itemChanged.connect(self._update_summary)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -103,6 +102,7 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self.table.setColumnWidth(3, 360)
         self.table.setColumnWidth(4, 360)
         self._populate_rows()
+        self.table.itemChanged.connect(self._update_summary)
         layout.addWidget(self.table, 1)
 
         self.note_label = QLabel()
