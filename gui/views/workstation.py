@@ -195,6 +195,10 @@ class PhysicalMigrationPreviewDialog(QDialog):
         """返回本次确认后传给既有执行函数的源路径快照。"""
         return list(self._current_plan().active_source_paths)
 
+    def confirmed_plan(self):
+        """返回确认时的不可变方案快照，供结果摘要复用。"""
+        return self._current_plan()
+
     def _filter_rows(self, text: str):
         query = text.strip().casefold()
         for row in range(self.table.rowCount()):
@@ -1495,7 +1499,8 @@ class WorkstationView(QWidget):
         )
         if preview_dialog.exec() != QDialog.Accepted:
             return
-        execution_paths = preview_dialog.execution_paths()
+        confirmed_plan = preview_dialog.confirmed_plan()
+        execution_paths = list(confirmed_plan.active_source_paths)
         if not execution_paths:
             return
 
@@ -1505,7 +1510,14 @@ class WorkstationView(QWidget):
         def on_ok(count):
             self._busy_io_end()
             self.load_data()
-            QMessageBox.information(self, "完成", f"已成功整理 {count} 个文件。")
+            summary = confirmed_plan.summary()
+            QMessageBox.information(
+                self,
+                "整理结果",
+                f"整理已执行。\\n成功整理：{count}/{summary['active_items']} 条\\n"
+                f"方案排除：{summary['excluded_items']} 条\\n\\n"
+                "本切片未持久化逐项结果，也不承诺对原始素材全部恢复。",
+            )
 
         def on_fail(msg):
             self._busy_io_end()
