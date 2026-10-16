@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional, Tuple
@@ -12,6 +13,11 @@ from uuid import uuid4
 
 
 PHYSICAL_MIGRATION = "physical_migration"
+
+
+def _path_key(path: str) -> str:
+    """使用平台路径规则比较排除目标，避免 Windows 大小写/斜杠差异。"""
+    return os.path.normcase(os.path.normpath(str(path)))
 
 
 @dataclass(frozen=True)
@@ -94,11 +100,13 @@ class OrganizationPlan:
         *,
         reason: str = "用户排除素材",
     ) -> "OrganizationPlan":
-        excluded = {str(path) for path in paths if path}
+        excluded = {_path_key(path) for path in paths if path}
         return replace(
             self,
             items=tuple(
-                item.exclude(reason) if item.source_path in excluded else item
+                item.exclude(reason)
+                if _path_key(item.source_path) in excluded and not item.excluded
+                else item
                 for item in self.items
             ),
         )
@@ -113,7 +121,9 @@ class OrganizationPlan:
         return replace(
             self,
             items=tuple(
-                item.exclude(reason) if item.action_type in excluded else item
+                item.exclude(reason)
+                if item.action_type in excluded and not item.excluded
+                else item
                 for item in self.items
             ),
         )

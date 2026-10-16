@@ -38,6 +38,14 @@ def test_plan_excludes_one_material_without_mutating_original():
     assert updated.items[1].exclusion_reason == "用户排除素材"
 
 
+def test_plan_path_exclusion_is_normalized_and_preserves_first_reason():
+    plan = _plan().exclude_paths(["c:\\clips\\b.mp4"], reason="第一次排除")
+    updated = plan.exclude_paths(["C:/clips/b.mp4"], reason="第二次排除")
+
+    assert updated.items[1].excluded is True
+    assert updated.items[1].exclusion_reason == "第一次排除"
+
+
 def test_plan_excludes_operation_type_and_reports_counts():
     plan = _plan().exclude_action_types(["xmp"])
 
