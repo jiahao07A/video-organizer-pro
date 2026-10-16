@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QLabel, QSplitter, QStackedWidget, QTableView, QListView,
     QHeaderView, QAbstractItemView, QProgressBar, QMessageBox, QMenu,
     QDialog, QFileDialog, QTreeView, QListView as QtListView, QCheckBox,
-    QToolButton, QSizePolicy,
+    QToolButton, QSizePolicy, QTableWidget, QTableWidgetItem, QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QEvent, QObject, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -51,6 +51,101 @@ class _ClearSelectionOnEmptyClickFilter(QObject):
                 if not idx.isValid():
                     self._view.clearSelection()
         return False
+
+
+class PhysicalMigrationPreviewDialog(QDialog):
+    """显示物理整理的完整路径和风险；不执行任何文件操作。"""
+
+    _COLUMNS = ("状态", "源路径", "请求目标路径", "实际目标路径", "风险")
+
+    def __init__(self, plan, target_root: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("模拟预览 — 物理整理")
+        self.resize(1100, 620)
+        self._plan = list(plan or [])
+
+        layout = QVBoxLayout(self)
+        summary = QLabel(self._summary_text(target_root))
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("搜索源路径、目标路径、分类或风险…")
+        self.filter_edit.textChanged.connect(self._filter_rows)
+        layout.addWidget(self.filter_edit)
+
+        self.table = QTableWidget(0, len(self._COLUMNS), self)
+        self.table.setHorizontalHeaderLabels(list(self._COLUMNS))
+        self.table.setSortingEnabled(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 90)
+        self.table.setColumnWidth(1, 360)
+        self.table.setColumnWidth(2, 360)
+        self.table.setColumnWidth(3, 360)
+        self._populate_rows()
+        layout.addWidget(self.table, 1)
+
+        blocked = sum(1 for row in self._plan if row.get("status") == "blocked")
+        review = sum(1 for row in self._plan if row.get("status") == "review")
+        note = QLabel(
+            "执行前会再次检查当前文件状态。"
+            + (f" 当前有 {review} 条需要复核。" if review else "")
+            + (f" 当前有 {blocked} 条被阻止，不能执行。" if blocked else "")
+            + " 本轮不提供对原始素材的全部恢复承诺。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No, parent=self)
+        buttons.button(QDialogButtonBox.Yes).setText("确认执行物理整理")
+        buttons.button(QDialogButtonBox.No).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.Yes).setEnabled(blocked == 0)
+        layout.addWidget(buttons)
+
+    def _summary_text(self, target_root: str) -> str:
+        conflicts = sum(1 for row in self._plan if row.get("target_conflict"))
+        return (
+            f"预览 {len(self._plan)} 条整理步骤；目标根目录：{target_root}\\n"
+            f"冲突：{conflicts} 条。目标冲突仅显示为不覆盖的实际目标路径，"
+            "不会覆盖已有文件。"
+        )
+
+    def _populate_rows(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(self._plan))
+        for row_index, step in enumerate(self._plan):
+            risks = "；".join(step.get("risk_flags") or []) or "无"
+            values = (
+                {"ready": "可执行", "review": "需复核", "blocked": "已阻止"}.get(
+                    step.get("status"), str(step.get("status") or "未知")
+                ),
+                step.get("source_path") or step.get("old_path") or "",
+                step.get("requested_target_path") or "",
+                step.get("target_path") or step.get("new_path") or "",
+                risks,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                self.table.setItem(row_index, column, item)
+        self.table.setSortingEnabled(True)
+
+    def _filter_rows(self, text: str):
+        query = text.strip().casefold()
+        for row in range(self.table.rowCount()):
+            content = " ".join(
+                self.table.item(row, column).text()
+                for column in range(self.table.columnCount())
+                if self.table.item(row, column) is not None
+            ).casefold()
+            self.table.setRowHidden(row, bool(query and query not in content))
 
 
 class WorkstationView(QWidget):
@@ -1337,22 +1432,8 @@ class WorkstationView(QWidget):
             QMessageBox.information(self, "无需整理", "没有需要移动的文件（可能已在目标位置或路径无效）。")
             return
 
-        preview_lines = []
-        for i, step in enumerate(plan[:20]):
-            preview_lines.append(
-                f"{i + 1}. {step.get('filename')} → {step.get('category')}/"
-            )
-        if len(plan) > 20:
-            preview_lines.append(f"… 另有 {len(plan) - 20} 条")
-        preview = "\n".join(preview_lines)
-
-        reply = QMessageBox.question(
-            self, "模拟预览 — 确认整理",
-            f"将移动 {len(plan)} 个文件到：\n{target_root}\n\n"
-            f"{preview}\n\n确认后执行物理迁移（高风险）。是否继续？",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+        preview_dialog = PhysicalMigrationPreviewDialog(plan, target_root, self)
+        if preview_dialog.exec() != QDialog.Accepted:
             return
 
         def job():

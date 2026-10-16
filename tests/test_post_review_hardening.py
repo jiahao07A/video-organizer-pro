@@ -221,3 +221,47 @@ def test_plan_physical_migration_no_disk_move(service: VideoOrganizerService, tm
     # 未执行：源仍在，目标不存在
     assert f.exists()
     assert not Path(plan[0]["new_path"]).exists()
+    assert plan[0]["source_path"] == path
+    assert plan[0]["target_path"] == plan[0]["new_path"]
+
+
+def test_physical_migration_preview_reports_conflict_without_overwrite(
+    service: VideoOrganizerService, tmp_path: Path
+):
+    source = _touch(tmp_path / "source" / "clip.mp4")
+    target_root = tmp_path / "organized"
+    existing = target_root / "Broll" / "clip.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"existing")
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "category": "Broll", "tags": [],
+    })
+
+    plan = service.plan_physical_migration(str(target_root), [source])
+
+    assert len(plan) == 1
+    assert plan[0]["source_path"] == source
+    assert plan[0]["requested_target_path"] == str(existing)
+    assert plan[0]["target_path"].endswith("clip_1.mp4")
+    assert plan[0]["target_conflict"] is True
+    assert any(flag.startswith("目标已存在") for flag in plan[0]["risk_flags"])
+    assert plan[0]["status"] == "review"
+    assert existing.read_bytes() == b"existing"
+
+
+def test_physical_migration_preview_reports_external_change(
+    service: VideoOrganizerService, tmp_path: Path, monkeypatch
+):
+    source = _touch(tmp_path / "source" / "clip.mp4")
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "file_hash": "old-hash",
+        "status": "analyzed", "category": "Broll", "tags": [],
+    })
+    monkeypatch.setattr(service.processor, "get_file_hash", lambda _path: "new-hash")
+
+    plan = service.plan_physical_migration(str(tmp_path / "organized"), [source])
+
+    assert plan[0]["external_change"] is False
+    assert "源文件可能已被外部修改" in plan[0]["risk_flags"]
+    assert plan[0]["status"] == "blocked"
