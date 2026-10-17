@@ -4420,9 +4420,9 @@ class VideoOrganizerService:
                 return index[sid]
         return None
 
-    def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None, 
-                     custom_pattern: Optional[str] = None, regex_find: Optional[str] = None, 
-                     regex_replace: Optional[str] = "") -> List[Dict]:
+    def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None,
+                     custom_pattern: Optional[str] = None, regex_find: Optional[str] = None,
+                     regex_replace: Optional[str] = "", date_value: Optional[str] = None) -> List[Dict]:
         """批量重命名，支持自定义模式和正则表达式"""
         logger.info(f"开始批量重命名 (模拟模式: {dry_run})")
         videos = self.db.get_all_videos()
@@ -4471,7 +4471,7 @@ class VideoOrganizerService:
             summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
             
             # V6.0: 新增日期变量
-            current_date = datetime.now().strftime("%Y%m%d")
+            current_date = date_value or datetime.now().strftime("%Y%m%d")
 
             # {emotion}/{composition} 已下线：替换为空，避免旧模板残留脏值
             new_fn = pattern.replace("{category}", str(category))\

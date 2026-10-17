@@ -1311,12 +1311,28 @@ class WorkstationView(QWidget):
             return
 
         config = dialog.get_final_config()
+        rename_paths = dialog.selected_source_paths()
+        if not rename_paths:
+            QMessageBox.information(self, "无需重命名", "当前预览中没有勾选可更名的素材。")
+            return
+        rename_snapshot = self.service.resolve_operation_target_snapshot(
+            rename_paths,
+            rename_paths,
+            scope_paths=snapshot.scope_paths,
+        )
+        conflict_count = dialog.active_conflict_count
 
         if not dry_run:
+            conflict_note = (
+                f"\n\n其中 {conflict_count} 项请求目标已存在或与方案内目标重名，"
+                "执行时可能改用冲突路径；实际路径以执行日志和结果为准。"
+                if conflict_count else ""
+            )
             reply = QMessageBox.question(
                 self, "确认",
-                f"{self._format_operation_target_snapshot(snapshot)}\n\n"
-                f"确定要对 {len(selected_paths)} 个文件应用重命名吗？文件将被物理重命名。",
+                f"{self._format_operation_target_snapshot(rename_snapshot)}\n\n"
+                f"确定要对 {len(rename_paths)} 个文件应用重命名吗？文件将被物理重命名。"
+                f"\n本次从预览中排除 {dialog.excluded_count} 条。{conflict_note}",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.No:
@@ -1329,10 +1345,11 @@ class WorkstationView(QWidget):
         self.worker = RenameWorker(
             self.service,
             dry_run=dry_run,
-            selected_paths=selected_paths,
+            selected_paths=rename_paths,
             pattern=config["pattern"],
             regex_find=config["find_regex"],
             regex_replace=config["replace_str"],
+            rename_date=config["preview_date"],
         )
         self.worker.progress_updated.connect(self.update_status)
         self.worker.task_finished.connect(self.on_task_finished)
