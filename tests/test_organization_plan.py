@@ -59,6 +59,9 @@ def test_plan_summary_preserves_risk_without_claiming_execution():
     plan = _plan()
 
     assert plan.summary()["plan_id"]
+    assert plan.summary()["work_scope_paths"] == ("C:/clips",)
+    assert plan.summary()["work_scope_count"] == 1
+    assert plan.summary()["target_count"] == 3
     assert plan.summary()["filter_summary"] == "分类=B-Roll"
     assert plan.items[1].status == "review"
     assert plan.items[1].risk_flags == ("目标已存在",)

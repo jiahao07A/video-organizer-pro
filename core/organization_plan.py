@@ -29,6 +29,8 @@ class PlanItem:
     action_type: str = PHYSICAL_MIGRATION
     status: str = "planned"
     risk_flags: Tuple[str, ...] = ()
+    target_conflict: bool = False
+    external_change: Optional[bool] = None
     excluded: bool = False
     exclusion_reason: str = ""
 
@@ -45,6 +47,8 @@ class PlanItem:
             action_type=str(value.get("action_type") or action_type),
             status=str(value.get("status") or "planned"),
             risk_flags=tuple(str(flag) for flag in (value.get("risk_flags") or ())),
+            target_conflict=bool(value.get("target_conflict", False)),
+            external_change=value.get("external_change"),
             excluded=bool(value.get("excluded", False)),
             exclusion_reason=str(value.get("exclusion_reason") or ""),
         )
@@ -147,6 +151,10 @@ class OrganizationPlan:
             by_action[item.action_type] = by_action.get(item.action_type, 0) + 1
         return {
             "plan_id": self.plan_id,
+            "work_scope_paths": self.work_scope_paths,
+            "work_scope_count": len(self.work_scope_paths),
+            "target_paths": self.target_paths,
+            "target_count": len(self.target_paths),
             "total_items": len(self.items),
             "active_items": len(self.active_items),
             "excluded_items": len(self.excluded_items),

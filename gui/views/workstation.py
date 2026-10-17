@@ -59,7 +59,17 @@ class PhysicalMigrationPreviewDialog(QDialog):
 
     _COLUMNS = ("执行", "状态", "源路径", "请求目标路径", "实际目标路径", "风险")
 
-    def __init__(self, plan, target_root: str, parent=None, *, target_paths=()):
+    def __init__(
+        self,
+        plan,
+        target_root: str,
+        parent=None,
+        *,
+        target_paths=(),
+        work_scope_paths=(),
+        target_summary: str = "",
+        filter_summary: str = "未筛选",
+    ):
         super().__init__(parent)
         self.setWindowTitle("模拟预览 — 物理整理")
         self.resize(1150, 640)
@@ -67,12 +77,18 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self._plan = OrganizationPlan.from_migration_plan(
             self._raw_plan,
             target_paths=target_paths,
+            work_scope_paths=work_scope_paths,
             action_type=PHYSICAL_MIGRATION,
-            filter_summary="当前物理整理预览",
+            filter_summary=filter_summary,
         )
         self._target_root = target_root
+        self._target_summary = target_summary
 
         layout = QVBoxLayout(self)
+        self.target_summary_label = QLabel(self._target_summary)
+        self.target_summary_label.setWordWrap(True)
+        if self._target_summary:
+            layout.addWidget(self.target_summary_label)
         self.summary_label = QLabel()
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
@@ -150,30 +166,31 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self.table.setSortingEnabled(True)
 
     def _current_plan(self):
+        if not self.operation_checkbox.isChecked():
+            return self._plan.exclude_action_types([PHYSICAL_MIGRATION])
         checked_paths = set(self._checked_paths())
         excluded_paths = {
             item.source_path
             for item in self._plan.items
             if item.source_path not in checked_paths
         }
-        current = self._plan.exclude_paths(excluded_paths)
-        if not self.operation_checkbox.isChecked():
-            current = current.exclude_action_types([PHYSICAL_MIGRATION])
-        return current
+        return self._plan.exclude_paths(excluded_paths)
 
     def _update_summary(self, *_args):
         current = self._current_plan()
         active_count = len(current.active_items)
-        conflicts = sum(
-            1
-            for step in current.active_items
-            if "目标已存在" in "；".join(step.risk_flags)
-        )
+        conflicts = sum(1 for step in current.active_items if step.target_conflict)
         blocked = sum(1 for step in current.active_items if step.status == "blocked")
+        summary = self._plan.summary()
+        target_count = summary["target_count"]
+        scope_count = summary["work_scope_count"]
         self.summary_label.setText(
-            f"整理方案（尚未执行）：共 {len(self._plan.items)} 条，"
-            f"当前将执行 {active_count} 条，已排除 {len(self._plan.items) - active_count} 条；"
-            f"目标根目录：{self._target_root}；冲突 {conflicts} 条。"
+            f"整理方案（尚未执行）：工作范围素材 {scope_count} 条；"
+            f"操作目标集 {target_count} 条；方案条目 {summary['total_items']} 条；"
+            f"当前选择 {active_count} 条（可执行 {active_count - blocked} 条，阻止 {blocked} 条），"
+            f"已排除 {len(self._plan.items) - active_count} 条；"
+            f"目标根目录：{self._target_root}；冲突 {conflicts} 条；"
+            f"筛选状态：{summary['filter_summary']}。"
         )
         self.note_label.setText(
             "执行前会再次检查当前文件状态。"
@@ -1495,7 +1512,13 @@ class WorkstationView(QWidget):
             return
 
         preview_dialog = PhysicalMigrationPreviewDialog(
-            plan, target_root, self, target_paths=selected_paths
+            plan,
+            target_root,
+            self,
+            target_paths=selected_paths,
+            work_scope_paths=snapshot.scope_paths or (),
+            target_summary=self._format_operation_target_snapshot(snapshot),
+            filter_summary=self._filter_summary_text(),
         )
         if preview_dialog.exec() != QDialog.Accepted:
             return
