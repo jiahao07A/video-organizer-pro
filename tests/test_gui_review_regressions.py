@@ -336,3 +336,69 @@ def test_large_exclusion_set_is_one_sql_parameter(service, tmp_path):
     query = VideoQuery(excluded_paths=tuple(str(tmp_path / f"excluded-{i}.mp4") for i in range(1500)))
     assert service.catalog.resolve_visible_paths(query) == [kept]
     assert len(service.catalog._where(query)[1]) == 1
+
+
+def test_analysis_side_effect_summary_tracks_saved_auto_xmp_setting(service, views, monkeypatch):
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = False
+    window = MainWindow(service)
+    views.append(window)
+    workstation = window.workstation_page
+
+    assert "自动 XMP 侧车关闭" in workstation.analysis_side_effect_label.text()
+
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = True
+    monkeypatch.setattr(service, "reload_ai_from_settings", lambda: None)
+    window.on_settings_applied()
+
+    assert "生成同名 .xmp 侧车" in workstation.analysis_side_effect_label.text()
+    assert "会被覆盖" in workstation.analysis_side_effect_label.text()
+
+
+def test_analysis_confirmation_explains_auto_xmp_overwrite(service, tmp_path, views, monkeypatch):
+    _insert(service, tmp_path / "clip.mp4")
+    service.set_work_scope_paths([str(tmp_path)], scan=False)
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = True
+    view = WorkstationView(service)
+    views.append(view)
+    prompts = []
+    monkeypatch.setattr(
+        "gui.views.workstation.QMessageBox.question",
+        lambda *args, **kwargs: prompts.append(args) or QMessageBox.No,
+    )
+
+    view.start_analysis()
+
+    assert len(prompts) == 1
+    prompt = prompts[0][2]
+    assert "实际处理 1 条" in prompt
+    assert "自动 XMP 已开启" in prompt
+    assert "同名 .xmp 侧车" in prompt
+    assert "已有同名侧车会被覆盖" in prompt
+    assert "最多影响 1 个侧车" in prompt
+    assert view.worker is None
+
+
+def test_manual_xmp_sync_requires_confirmation_before_writing(service, tmp_path, views, monkeypatch):
+    _insert(service, tmp_path / "clip.mp4")
+    service.set_work_scope_paths([str(tmp_path)], scan=False)
+    view = WorkstationView(service)
+    views.append(view)
+    prompts = []
+    jobs = []
+    monkeypatch.setattr(
+        "gui.views.workstation.QMessageBox.question",
+        lambda *args, **kwargs: prompts.append(args) or QMessageBox.No,
+    )
+    monkeypatch.setattr(
+        "gui.views.workstation.run_io_job",
+        lambda *args, **kwargs: jobs.append((args, kwargs)),
+    )
+
+    view.sync_metadata()
+
+    assert len(prompts) == 1
+    prompt = prompts[0][2]
+    assert "将尝试为 1 个目标视频" in prompt
+    assert "同名 .xmp 侧车" in prompt
+    assert "若同名侧车已存在，将被覆盖" in prompt
+    assert jobs == []

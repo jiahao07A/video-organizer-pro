@@ -258,6 +258,13 @@ class WorkstationView(QWidget):
         )
         layout.addWidget(self.target_summary_label)
 
+        self.analysis_side_effect_label = QLabel()
+        self.analysis_side_effect_label.setObjectName("analysis_side_effect_summary")
+        self.analysis_side_effect_label.setStyleSheet("color: #888; padding: 0 4px 2px 4px;")
+        self.analysis_side_effect_label.setWordWrap(True)
+        layout.addWidget(self.analysis_side_effect_label)
+        self.refresh_analysis_side_effect_summary()
+
         # 2. 筛选面板
         self.filter_panel = FilterPanel(self.settings, service=self.service)
         self.filter_panel.setVisible(False)
@@ -510,6 +517,23 @@ class WorkstationView(QWidget):
             )
         except Exception as exc:
             self.target_summary_label.setText(f"操作目标集：暂时无法计算（{exc}）")
+
+    def refresh_analysis_side_effect_summary(self):
+        """显示分析写入素材库及自动 XMP 侧车的当前副作用。"""
+        auto_xmp = bool(SettingsManager.get_setting(
+            self.service.settings,
+            "processing.auto_sync_xmp_after_analysis",
+            False,
+        ))
+        if auto_xmp:
+            text = (
+                "分析副作用：分析结果写入素材库；每条成功分析的视频会生成同名 .xmp 侧车，"
+                "已有同名侧车会被覆盖；不会修改视频文件。"
+            )
+        else:
+            text = "分析副作用：分析结果写入素材库；自动 XMP 侧车关闭，不写视频文件。"
+        self.analysis_side_effect_label.setText(text)
+        self.analysis_side_effect_label.setToolTip(text)
 
     def _resolve_batch_targets(self) -> list:
         """批量操作目标：返回当前快照中的实际路径。"""
@@ -1215,11 +1239,30 @@ class WorkstationView(QWidget):
             return
 
         force = getattr(self, "force_reanalyze_cb", None) and self.force_reanalyze_cb.isChecked()
+        auto_xmp = bool(SettingsManager.get_setting(
+            self.service.settings,
+            "processing.auto_sync_xmp_after_analysis",
+            False,
+        ))
+        confirmation_lines = []
         if force:
+            confirmation_lines.append(
+                f"将对 {len(paths)} 个目标强制重新分析并整份覆盖分类/摘要/标签。"
+            )
+        if auto_xmp:
+            confirmation_lines.append(
+                "自动 XMP 已开启：本次成功分析的视频会在视频同目录生成同名 .xmp 侧车；"
+                "已有同名侧车会被覆盖，不会修改视频文件。"
+                f"最多影响 {len(paths)} 个侧车，实际数量取决于跳过和分析结果。"
+            )
+        if confirmation_lines:
+            title = "确认强制重新分析" if force else "确认分析及 XMP 写入"
             reply = QMessageBox.question(
-                self, "确认强制重新分析",
+                self,
+                title,
                 f"{self._format_operation_target_snapshot(snapshot)}\n\n"
-                f"将对 {len(paths)} 个目标强制重新分析并整份覆盖分类/摘要/标签。是否继续？",
+                + "\n".join(confirmation_lines)
+                + "\n是否继续？",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
@@ -1392,6 +1435,17 @@ class WorkstationView(QWidget):
         selected_paths = list(snapshot.target_paths)
         if not selected_paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可同步的视频。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认同步 XMP 侧车",
+            f"{self._format_operation_target_snapshot(snapshot)}\n\n"
+            f"将尝试为 {len(selected_paths)} 个目标视频，在视频同目录生成同名 .xmp 侧车。"
+            "若同名侧车已存在，将被覆盖；不会修改视频文件。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
             return
 
         def job():

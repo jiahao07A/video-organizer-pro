@@ -252,6 +252,8 @@ class MainWindow(QMainWindow):
 
     def on_settings_applied(self):
         self.apply_ui_preferences()
+        if hasattr(self.workstation_page, "refresh_analysis_side_effect_summary"):
+            self.workstation_page.refresh_analysis_side_effect_summary()
         # 敏感设置显式保存时才重建 AI 客户端。
         if hasattr(self.service, "reload_ai_from_settings"):
             try:
