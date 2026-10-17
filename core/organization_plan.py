@@ -144,6 +144,21 @@ class OrganizationPlan:
     def excluded_items(self) -> Tuple[PlanItem, ...]:
         return tuple(item for item in self.items if item.excluded)
 
+    def execution_summary(self, succeeded_count: int) -> dict[str, int]:
+        """汇总当前会话的执行计数；未成功数不推断具体失败原因。"""
+        requested = len(self.active_items)
+        succeeded = int(succeeded_count)
+        if succeeded < 0 or succeeded > requested:
+            raise ValueError(
+                f"成功数必须在 0 到确认执行数之间（收到 {succeeded}，确认执行 {requested}）"
+            )
+        return {
+            "requested_count": requested,
+            "succeeded_count": succeeded,
+            "unresolved_count": requested - succeeded,
+            "excluded_count": len(self.excluded_items),
+        }
+
     def summary(self) -> dict[str, Any]:
         """返回确认框需要的可观察计数，不包含文件写入结果。"""
         by_action: dict[str, int] = {}

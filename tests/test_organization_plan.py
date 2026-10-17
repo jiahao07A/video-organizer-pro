@@ -1,3 +1,5 @@
+import pytest
+
 from core.organization_plan import OrganizationPlan, PHYSICAL_MIGRATION
 
 
@@ -53,6 +55,27 @@ def test_plan_excludes_operation_type_and_reports_counts():
     assert plan.summary()["active_by_action"] == {PHYSICAL_MIGRATION: 2}
     assert plan.items[2].excluded is True
     assert plan.items[2].exclusion_reason == "用户排除操作类型"
+
+
+def test_execution_summary_reports_unresolved_without_guessing_failure_reason():
+    plan = _plan().exclude_paths(["C:/clips/b.mp4"])
+
+    assert plan.execution_summary(1) == {
+        "requested_count": 2,
+        "succeeded_count": 1,
+        "unresolved_count": 1,
+        "excluded_count": 1,
+    }
+    assert plan.execution_summary(2)["unresolved_count"] == 0
+
+
+def test_execution_summary_rejects_impossible_counts():
+    plan = _plan()
+
+    with pytest.raises(ValueError):
+        plan.execution_summary(4)
+    with pytest.raises(ValueError):
+        plan.execution_summary(-1)
 
 
 def test_plan_summary_preserves_risk_without_claiming_execution():

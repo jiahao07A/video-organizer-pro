@@ -1533,13 +1533,17 @@ class WorkstationView(QWidget):
         def on_ok(count):
             self._busy_io_end()
             self.load_data()
-            summary = confirmed_plan.summary()
+            summary = confirmed_plan.execution_summary(count)
             QMessageBox.information(
                 self,
                 "整理结果",
-                f"整理已执行。\\n成功整理：{count}/{summary['active_items']} 条\\n"
-                f"方案排除：{summary['excluded_items']} 条\\n\\n"
-                "本切片未持久化逐项结果，也不承诺对原始素材全部恢复。",
+                "整理执行已结束（当前会话结果）\n"
+                f"确认执行：{summary['requested_count']} 条\n"
+                f"成功整理：{summary['succeeded_count']} 条\n"
+                f"未成功或未确认：{summary['unresolved_count']} 条\n"
+                f"方案排除：{summary['excluded_count']} 条\n\n"
+                "执行入口未返回未成功项的逐条原因，请核对日志和源/目标路径。"
+                "本结果仅为本次会话摘要，不保留逐项历史，也不承诺对原始素材全部恢复。",
             )
 
         def on_fail(msg):
