@@ -2,6 +2,7 @@
 """GUI 评审回归：合成数据库与 Qt 离屏控件，不访问真实配置或素材。"""
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -10,14 +11,20 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from core.video_organizer_service import SettingsManager, VideoOrganizerService
 from gui.main_window import MainWindow
-from gui.models.video_table import COL_FILENAME, COL_LIBRARY_ID
+from gui.models.video_table import (
+    COL_FILENAME,
+    COL_LIBRARY_ID,
+    DEFAULT_TABLE_COLUMN_WIDTHS,
+)
 from gui.views.material_library import MaterialLibraryView
 from gui.views.settings import SettingsView
 from gui.views.workstation import WorkstationView
+from gui.views.workstation import PhysicalMigrationPreviewDialog
+from gui.widgets.rename_dialog import BatchRenameDialog
 
 
 @pytest.fixture(scope="module")
@@ -211,6 +218,75 @@ def test_reset_interface_layout_preserves_work_scope(service, views, monkeypatch
     assert prefs["last_work_scope"] == ["D:/素材"]
 
 
+def test_reset_interface_layout_applies_default_widths_to_open_lists(
+    service, views, monkeypatch
+):
+    window = MainWindow(service)
+    views.append(window)
+    workstation = window.workstation_page
+    library = window._ensure_page(1)
+    settings = window._ensure_page(3)
+
+    for page in (workstation, library):
+        page.table_view.setColumnWidth(4, 333)
+        page.table_view.setColumnWidth(5, 321)
+        assert page.table_view.columnWidth(4) == 333
+        assert page.table_view.columnWidth(5) == 321
+
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+
+    settings._reset_interface_layout()
+
+    for page in (workstation, library):
+        for column, expected_width in DEFAULT_TABLE_COLUMN_WIDTHS.items():
+            if column != COL_FILENAME:  # 文件名列保持拉伸模式。
+                assert page.table_view.columnWidth(column) == expected_width
+    assert "table_column_widths" not in service.settings["ui_preferences"]
+
+
+def test_reset_interface_layout_does_not_signal_when_save_fails(
+    service, views, monkeypatch
+):
+    view = SettingsView(service)
+    views.append(view)
+    emitted = []
+    view.interface_layout_reset.connect(lambda: emitted.append(True))
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.critical",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("测试保存失败")
+
+    monkeypatch.setattr(
+        SettingsManager, "save_settings", staticmethod(fail_save)
+    )
+
+    view._reset_interface_layout()
+
+    assert emitted == []
+
+
+@pytest.mark.parametrize("view_type", [MaterialLibraryView, WorkstationView])
+def test_column_width_changes_are_saved_to_shared_preferences(
+    service, views, view_type
+):
+    view = view_type(service)
+    views.append(view)
+
+    view.table_view.setColumnWidth(4, 333)
+
+    assert service.settings["ui_preferences"]["table_column_widths"]["4"] == 333
+
+
 def test_autosave_timer_emits_success_and_clears_pending_status(service, qt_app, views):
     view = SettingsView(service)
     views.append(view)
@@ -336,3 +412,253 @@ def test_large_exclusion_set_is_one_sql_parameter(service, tmp_path):
     query = VideoQuery(excluded_paths=tuple(str(tmp_path / f"excluded-{i}.mp4") for i in range(1500)))
     assert service.catalog.resolve_visible_paths(query) == [kept]
     assert len(service.catalog._where(query)[1]) == 1
+
+
+def test_analysis_side_effect_summary_tracks_saved_auto_xmp_setting(service, views, monkeypatch):
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = False
+    window = MainWindow(service)
+    views.append(window)
+    workstation = window.workstation_page
+
+    assert "自动 XMP 侧车关闭" in workstation.analysis_side_effect_label.text()
+
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = True
+    monkeypatch.setattr(service, "reload_ai_from_settings", lambda: None)
+    window.on_settings_applied()
+
+    assert "生成同名 .xmp 侧车" in workstation.analysis_side_effect_label.text()
+    assert "会被覆盖" in workstation.analysis_side_effect_label.text()
+
+
+def test_analysis_confirmation_explains_auto_xmp_overwrite(service, tmp_path, views, monkeypatch):
+    _insert(service, tmp_path / "clip.mp4")
+    service.set_work_scope_paths([str(tmp_path)], scan=False)
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = True
+    view = WorkstationView(service)
+    views.append(view)
+    prompts = []
+    monkeypatch.setattr(
+        "gui.views.workstation.QMessageBox.question",
+        lambda *args, **kwargs: prompts.append(args) or QMessageBox.No,
+    )
+
+    view.start_analysis()
+
+    assert len(prompts) == 1
+    prompt = prompts[0][2]
+    assert "实际处理 1 条" in prompt
+    assert "自动 XMP 已开启" in prompt
+    assert "同名 .xmp 侧车" in prompt
+    assert "已有同名侧车会被覆盖" in prompt
+    assert "最多影响 1 个侧车" in prompt
+    assert view.worker is None
+
+
+def test_manual_xmp_sync_requires_confirmation_before_writing(service, tmp_path, views, monkeypatch):
+    _insert(service, tmp_path / "clip.mp4")
+    service.set_work_scope_paths([str(tmp_path)], scan=False)
+    view = WorkstationView(service)
+    views.append(view)
+    prompts = []
+    jobs = []
+    monkeypatch.setattr(
+        "gui.views.workstation.QMessageBox.question",
+        lambda *args, **kwargs: prompts.append(args) or QMessageBox.No,
+    )
+    monkeypatch.setattr(
+        "gui.views.workstation.run_io_job",
+        lambda *args, **kwargs: jobs.append((args, kwargs)),
+    )
+
+    view.sync_metadata()
+
+    assert len(prompts) == 1
+    prompt = prompts[0][2]
+    assert "将尝试为 1 个目标视频" in prompt
+    assert "同名 .xmp 侧车" in prompt
+    assert "若同名侧车已存在，将被覆盖" in prompt
+    assert jobs == []
+
+
+def test_rename_preview_shows_full_paths_conflicts_and_keeps_exclusions_after_sort(
+    service, tmp_path, views
+):
+    source_b = tmp_path / "b.mp4"
+    source_a = tmp_path / "a.mp4"
+    source_b.write_bytes(b"b")
+    source_a.write_bytes(b"a")
+    videos = [
+        {"path": str(source_b), "filename": source_b.name, "category": "B", "tags": [], "summary": ""},
+        {"path": str(source_a), "filename": source_a.name, "category": "A", "tags": [], "summary": ""},
+    ]
+    dialog = BatchRenameDialog(service, videos)
+    views.append(dialog)
+    dialog._preview_date = "20261017"
+    dialog.pattern_input.setText("{date}-{category}-{original_name}")
+
+    expected_a = str(tmp_path / "20261017-A-a.mp4")
+    assert expected_a in [
+        dialog.preview_table.item(row, 2).text()
+        for row in range(dialog.preview_table.rowCount())
+    ]
+
+    Path(expected_a).write_bytes(b"existing target")
+    dialog.update_preview()
+    row_a = next(
+        row for row in range(dialog.preview_table.rowCount())
+        if dialog.preview_table.item(row, 1).text() == str(source_a)
+    )
+    assert "目标已存在" in dialog.preview_table.item(row_a, 3).text()
+    assert dialog.active_conflict_count == 1
+
+    dialog.preview_table.sortItems(1, Qt.AscendingOrder)
+    row_a = next(
+        row for row in range(dialog.preview_table.rowCount())
+        if dialog.preview_table.item(row, 1).text() == str(source_a)
+    )
+    dialog.preview_table.item(row_a, 0).setCheckState(Qt.Unchecked)
+    assert dialog.selected_source_paths() == [str(source_b)]
+    assert dialog.excluded_count == 1
+
+    dialog.search_input.setText("b.mp4")
+    assert all(
+        dialog.preview_table.isRowHidden(row)
+        == ("b.mp4" not in dialog.preview_table.item(row, 1).text())
+        for row in range(dialog.preview_table.rowCount())
+    )
+    assert dialog.selected_source_paths() == [str(source_b)]
+    dialog.close()
+
+
+def test_rename_preview_date_is_used_by_service_dry_run(service, tmp_path):
+    source = Path(_insert(service, tmp_path / "clip.mp4", category="A", tags=[], summary=""))
+    source.write_bytes(b"clip")
+
+    preview = service.batch_rename(
+        dry_run=True,
+        selected_paths=[str(source)],
+        custom_pattern="{date}-{original_name}",
+        date_value="20261017",
+    )
+
+    assert preview == [{
+        "old": "clip.mp4",
+        "new": "20261017-clip.mp4",
+        "path": str(source),
+    }]
+    assert source.exists()
+    assert not (source.parent / "20261017-clip.mp4").exists()
+
+
+def test_rename_confirmation_and_worker_use_preview_exclusion_snapshot(
+    service, tmp_path, views, monkeypatch
+):
+    first = str(tmp_path / "first.mp4")
+    second = str(tmp_path / "second.mp4")
+    for path in (first, second):
+        Path(path).write_bytes(b"clip")
+    service.set_work_scope_paths([first, second], scan=False)
+
+    class _FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class _FakeDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.Accepted
+
+        def get_final_config(self):
+            return {
+                "pattern": "{date}-{original_name}",
+                "find_regex": "",
+                "replace_str": "",
+                "preview_date": "20261017",
+            }
+
+        def selected_source_paths(self):
+            return [first]
+
+        @property
+        def active_conflict_count(self):
+            return 1
+
+        @property
+        def excluded_count(self):
+            return 1
+
+    workers = []
+
+    class _FakeWorker:
+        def __init__(self, *_args, **kwargs):
+            self.kwargs = kwargs
+            self.progress_updated = _FakeSignal()
+            self.task_finished = _FakeSignal()
+            workers.append(self)
+
+        def start(self):
+            pass
+
+    from types import SimpleNamespace
+
+    view = WorkstationView(service)
+    views.append(view)
+    view._resolve_batch_snapshot = lambda: SimpleNamespace(
+        target_paths=(first, second), scope_paths=(first, second)
+    )
+    monkeypatch.setattr(
+        service,
+        "get_videos_for_operation",
+        lambda *_args, **_kwargs: [
+            {"path": first, "filename": "first.mp4"},
+            {"path": second, "filename": "second.mp4"},
+        ],
+    )
+    confirmations = []
+    monkeypatch.setattr("gui.views.workstation.BatchRenameDialog", _FakeDialog)
+    monkeypatch.setattr("gui.views.workstation.RenameWorker", _FakeWorker)
+    monkeypatch.setattr(
+        "gui.views.workstation.QMessageBox.question",
+        lambda *args, **_kwargs: confirmations.append(args) or QMessageBox.Yes,
+    )
+
+    view.start_rename(dry_run=False)
+
+    assert len(workers) == 1
+    assert workers[0].kwargs["selected_paths"] == [first]
+    assert workers[0].kwargs["rename_date"] == "20261017"
+    assert len(confirmations) == 1
+    assert "实际处理 1 条" in confirmations[0][2]
+    assert "本次从预览中排除 1 条" in confirmations[0][2]
+    assert "执行时可能改用冲突路径" in confirmations[0][2]
+
+
+def test_physical_migration_preview_exclusion_uses_source_path_snapshot(
+    service, tmp_path, qt_app, views
+):
+    first = str(tmp_path / "first.mp4")
+    second = str(tmp_path / "second.mp4")
+    plan = [
+        {
+            "old_path": first, "new_path": str(tmp_path / "out" / "A" / "first.mp4"),
+            "source_path": first, "target_path": str(tmp_path / "out" / "A" / "first.mp4"),
+            "requested_target_path": str(tmp_path / "out" / "A" / "first.mp4"),
+            "status": "ready", "risk_flags": [], "category": "A", "filename": "first.mp4",
+        },
+        {
+            "old_path": second, "new_path": str(tmp_path / "out" / "B" / "second.mp4"),
+            "source_path": second, "target_path": str(tmp_path / "out" / "B" / "second.mp4"),
+            "requested_target_path": str(tmp_path / "out" / "B" / "second.mp4"),
+            "status": "ready", "risk_flags": [], "category": "B", "filename": "second.mp4",
+        },
+    ]
+    dialog = PhysicalMigrationPreviewDialog(plan, str(tmp_path / "out"))
+    views.append(dialog)
+    dialog.table.item(0, 0).setCheckState(Qt.Unchecked)
+    dialog.table.sortItems(2, Qt.DescendingOrder)
+    assert dialog.excluded_count == 1
+    assert [row["old_path"] for row in dialog.selected_plan()] == [second]
+    assert dialog.confirm_button.isEnabled()
+    dialog.close()

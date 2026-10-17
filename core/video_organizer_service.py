@@ -32,7 +32,11 @@ from core.storage_backup import (
     write_json_atomic,
 )
 from core.video_catalog import VideoCatalog, VideoQuery
-from core.physical_migration import build_physical_migration_plan
+from core.physical_migration import (
+    build_physical_migration_plan,
+    _is_within_root,
+    _safe_category_name,
+)
 
 # 资源路径处理函数
 def get_resource_path(relative_path):
@@ -432,6 +436,41 @@ class DatabaseManager:
     def delete_video(self, path: str):
         self.execute_non_query("DELETE FROM videos WHERE path = ?", (path,))
 
+    def move_video_record(self, old_path: str, new_path: str, reason: str) -> None:
+        """事务性更新素材路径并记录物理迁移历史。"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE videos SET path = ?, filename = ? WHERE path = ?",
+                    (new_path, os.path.basename(new_path), old_path),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("素材库记录已不存在，无法安全更新迁移路径")
+                cursor.execute(
+                    "INSERT INTO migration_history (old_path, new_path, reason) VALUES (?, ?, ?)",
+                    (old_path, new_path, reason),
+                )
+                conn.commit()
+
+    def restore_video_record_move(self, old_path: str, new_path: str) -> None:
+        """撤销尚未完成文件删除的单条路径更新，并删除对应迁移历史。"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE videos SET path = ?, filename = ? WHERE path = ?",
+                    (old_path, os.path.basename(old_path), new_path),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("素材库目标记录已不存在，无法恢复源路径")
+                cursor.execute(
+                    "DELETE FROM migration_history WHERE old_path = ? AND new_path = ? "
+                    "AND id = (SELECT MAX(id) FROM migration_history WHERE old_path = ? AND new_path = ?)",
+                    (old_path, new_path, old_path, new_path),
+                )
+                conn.commit()
+
     def get_video_by_path(self, path: str) -> Optional[Dict]:
         """按路径取单条视频记录；不存在则返回 None。"""
         rows = self.execute_query("SELECT * FROM videos WHERE path = ?", (path,))
@@ -648,6 +687,13 @@ class DatabaseManager:
 
     def add_rename_record(self, session_id: str, old_path: str, new_path: str):
         self.execute_non_query("INSERT INTO rename_history (session_id, old_path, new_path) VALUES (?, ?, ?)", (session_id, old_path, new_path))
+
+    def delete_rename_record(self, session_id: str, old_path: str, new_path: str) -> None:
+        """删除一条尚未对外报告成功的重命名历史记录。"""
+        self.execute_non_query(
+            "DELETE FROM rename_history WHERE session_id = ? AND old_path = ? AND new_path = ?",
+            (session_id, old_path, new_path),
+        )
 
     def get_last_session_id(self) -> Optional[str]:
         rows = self.execute_query("SELECT session_id FROM rename_history ORDER BY timestamp DESC LIMIT 1")
@@ -956,15 +1002,13 @@ class SettingsManager:
             write_json_atomic(settings_path, payload)
 
             if db:
-                try:
-                    # 整包持久化（含 api.key 等嵌套字段）
-                    db.save_setting("settings_blob", payload)
-                    # 兼容旧扁平键
-                    for k, v in payload.items():
-                        if not isinstance(v, dict):
-                            db.save_setting(k, v)
-                except Exception as e:
-                    logger.warning(f"写入数据库 settings 失败: {e}")
+                # 数据库写入失败必须向调用方传播：文件已落盘但数据库未同步时，界面不能显示“已保存”。
+                # 调用方可据此保留 dirty 状态并允许重试；不吞掉异常制造假成功。
+                db.save_setting("settings_blob", payload)
+                # 兼容旧扁平键
+                for k, v in payload.items():
+                    if not isinstance(v, dict):
+                        db.save_setting(k, v)
 
 class VideoProcessor:
     """处理视频文件：抽帧、压缩、场景检测、哈希计算"""
@@ -2092,6 +2136,7 @@ class VideoOrganizerService:
         self._extract_sem = threading.Semaphore(ep)
         self._xmp_ctx_cache = None
         self._xmp_ctx_lock = threading.Lock()
+        self._last_rollback_result = None
         # 测试可注入：跳过真实 sleep
         self._retry_sleeper: Optional[Callable[[float], None]] = None
         self.processor = VideoProcessor()
@@ -3788,8 +3833,13 @@ class VideoOrganizerService:
         else:
             self.on_progress(done, total)
 
-    def _persist_analysis_success(self, res: Dict) -> int:
-        """入库；可选自动写 XMP。返回 xmp 失败 0/1（未写 XMP 视为 0）。"""
+    def _persist_analysis_success(
+        self,
+        res: Dict,
+        *,
+        xmp_failure_sink: Optional[List[Dict[str, str]]] = None,
+    ) -> int:
+        """入库；可选自动写 XMP，返回自动 XMP 失败条数。"""
         self.db.upsert_video(res)
         # 仅在完整缓存上按路径对齐更新，禁止写破缓存
         self._cache_put_video_row(res.get("path") or "", res)
@@ -3800,9 +3850,20 @@ class VideoOrganizerService:
             return 0
         try:
             # 单条路径：禁止走全库 get_all_videos（1700+×高并发会卡死）
-            self.sync_metadata_to_xmp([res["path"]], video_rows=[res])
+            report = self.sync_metadata_to_xmp(
+                [res["path"]], video_rows=[res], return_details=True
+            )
+            if isinstance(report, dict):
+                failures = list(report.get("failed_items") or [])
+                if xmp_failure_sink is not None:
+                    xmp_failure_sink.extend(failures)
+                return int(report.get("failed_count", 0) or 0)
+            # 兼容测试/外部旧注入实现：旧接口返回成功数量，不能把它当失败。
             return 0
         except Exception as e:
+            failure = {"path": str(res.get("path") or ""), "reason": str(e) or e.__class__.__name__}
+            if xmp_failure_sink is not None:
+                xmp_failure_sink.append(failure)
             logger.warning(f"XMP 同步失败 {res.get('path')}: {e}")
             self.log(f"XMP 同步失败 {os.path.basename(res.get('path') or '')}: {e}", ui=False)
             return 1
@@ -3960,6 +4021,7 @@ class VideoOrganizerService:
         succeeded = 0
         failed = 0
         xmp_failed = 0
+        xmp_failure_items: List[Dict[str, str]] = []
         failure_reasons: List[str] = []
         cancelled = False
 
@@ -4003,7 +4065,16 @@ class VideoOrganizerService:
                     except Exception as e:
                         res, err_reason = None, str(e)
                     if res and res.get("status") == "analyzed":
-                        xmp_failed += self._persist_analysis_success(res)
+                        item_xmp_failures: List[Dict[str, str]] = []
+                        xmp_failed += self._persist_analysis_success(
+                            res, xmp_failure_sink=item_xmp_failures
+                        )
+                        xmp_failure_items.extend(item_xmp_failures)
+                        for failure in item_xmp_failures:
+                            failure_reasons.append(
+                                f"XMP {failure.get('path') or video_path}: "
+                                f"{failure.get('reason') or '写入失败'}"
+                            )
                         succeeded += 1
                         with self._progress_lock:
                             reducer.apply("item_terminal", path=video_path, ok=True)
@@ -4133,6 +4204,7 @@ class VideoOrganizerService:
             "failed": failed,
             "skipped": skipped,
             "xmp_failed": xmp_failed,
+            "xmp_failure_items": xmp_failure_items,
             "failure_reasons": failure_reasons,
             "batch_rerun": rerun_done,
             "cancelled": cancelled,
@@ -4420,9 +4492,9 @@ class VideoOrganizerService:
                 return index[sid]
         return None
 
-    def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None, 
-                     custom_pattern: Optional[str] = None, regex_find: Optional[str] = None, 
-                     regex_replace: Optional[str] = "") -> List[Dict]:
+    def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None,
+                     custom_pattern: Optional[str] = None, regex_find: Optional[str] = None,
+                     regex_replace: Optional[str] = "", date_value: Optional[str] = None) -> List[Dict]:
         """批量重命名，支持自定义模式和正则表达式"""
         logger.info(f"开始批量重命名 (模拟模式: {dry_run})")
         videos = self.db.get_all_videos()
@@ -4438,13 +4510,22 @@ class VideoOrganizerService:
         file_index = FileManager.get_file_index(os.getcwd())
 
         success_count = 0
+        failed_items = []
+        self._last_rename_result = None
         preview_results = []
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         for item in items_to_rename:
             physical_path = self.find_physical_file(item, file_index)
             if not physical_path or not os.path.exists(physical_path):
-                self.log(f"未找到物理文件: {item.get('filename')}")
+                message = f"未找到物理文件: {item.get('filename')}"
+                self.log(message)
+                if not dry_run:
+                    failed_items.append({
+                        "path": str(item.get("path") or ""),
+                        "target_path": "",
+                        "reason": message,
+                    })
                 continue
             
             dir_name = os.path.dirname(physical_path)
@@ -4471,7 +4552,7 @@ class VideoOrganizerService:
             summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
             
             # V6.0: 新增日期变量
-            current_date = datetime.now().strftime("%Y%m%d")
+            current_date = date_value or datetime.now().strftime("%Y%m%d")
 
             # {emotion}/{composition} 已下线：替换为空，避免旧模板残留脏值
             new_fn = pattern.replace("{category}", str(category))\
@@ -4501,30 +4582,71 @@ class VideoOrganizerService:
                 continue
                 
             try:
+                renamed = False
+                history_recorded = False
+                xmp_renamed = False
+                original_item = dict(item)
+                old_xmp = os.path.splitext(physical_path)[0] + ".xmp"
+                new_xmp = os.path.splitext(target_path)[0] + ".xmp"
                 if os.path.exists(target_path):
                     base, ext = os.path.splitext(new_fn)
                     target_path = os.path.join(dir_name, f"{base}_dup_{int(time.time()) % 1000}{ext}")
                 
                 os.rename(physical_path, target_path)
-                
+                renamed = True
+
                 # 同步重命名 XMP 文件
                 old_xmp = os.path.splitext(physical_path)[0] + ".xmp"
                 new_xmp = os.path.splitext(target_path)[0] + ".xmp"
+                xmp_renamed = False
                 if os.path.exists(old_xmp):
                     try:
                         os.rename(old_xmp, new_xmp)
+                        xmp_renamed = True
                         logger.info(f"同步重命名 XMP: {os.path.basename(old_xmp)} -> {os.path.basename(new_xmp)}")
                     except Exception as xe:
-                        logger.warning(f"XMP 重命名失败: {xe}")
+                        raise IOError(f"XMP 侧车重命名失败：{xe}") from xe
 
                 self.db.add_rename_record(session_id, physical_path, target_path)
-                
+                history_recorded = True
+                original_item = dict(item)
                 item["path"] = target_path
                 item["filename"] = os.path.basename(target_path)
                 item["status"] = "renamed"
                 self.db.upsert_video(item)
                 success_count += 1
             except Exception as e:
+                # 数据库历史/路径更新失败时，立即补偿物理重命名；补偿失败则明确留下人工处理项。
+                compensation_errors = []
+                if locals().get("history_recorded"):
+                    try:
+                        self.db.delete_rename_record(session_id, physical_path, target_path)
+                    except Exception as cleanup_exc:
+                        compensation_errors.append(f"清理重命名历史失败：{cleanup_exc}")
+                if locals().get("xmp_renamed") and os.path.exists(new_xmp):
+                    try:
+                        os.rename(new_xmp, old_xmp)
+                    except Exception as xmp_exc:
+                        compensation_errors.append(f"XMP 补偿失败：{xmp_exc}")
+                if locals().get("renamed") and os.path.exists(target_path):
+                    try:
+                        if not os.path.exists(physical_path):
+                            os.rename(target_path, physical_path)
+                    except Exception as file_exc:
+                        compensation_errors.append(f"文件名补偿失败：{file_exc}")
+                if locals().get("renamed"):
+                    try:
+                        original_item["path"] = physical_path
+                        original_item["filename"] = os.path.basename(physical_path)
+                        self.db.upsert_video(original_item)
+                    except Exception as db_restore_exc:
+                        compensation_errors.append(f"素材库源路径恢复失败：{db_restore_exc}")
+                failed_items.append({
+                    "path": physical_path,
+                    "target_path": target_path,
+                    "reason": f"重命名失败：{e}"
+                    + ("；" + "；".join(compensation_errors) if compensation_errors else "；已恢复源路径"),
+                })
                 self.log(f"重命名失败 {current_fn}: {e}")
 
         if not dry_run:
@@ -4532,48 +4654,79 @@ class VideoOrganizerService:
             self.log(f"重命名完成！成功: {success_count}")
         else:
             self.log(f"预览完成！拟重命名: {success_count}")
-            
+        self._last_rename_result = {
+            "planned_count": len(preview_results) if dry_run else success_count + len(failed_items),
+            "success_count": success_count,
+            "failed_count": len(failed_items),
+            "failed_items": list(failed_items),
+        }
         return preview_results
 
     def rollback_last_session(self) -> bool:
-        """回滚上一次重命名会话"""
+        """尽力回滚上一次重命名会话，并准确报告完整或部分恢复。"""
         session_id = self.db.get_last_session_id()
+        self._last_rollback_result = None
         if not session_id:
             self.log("没有可回滚的历史记录。")
             return False
-        
+
         history = self.db.get_history_by_session(session_id)
-        count = 0
-        for record in history:
+        restored = 0
+        failures = []
+        for record in reversed(history):
             old_path, new_path = record["old_path"], record["new_path"]
             try:
-                if os.path.exists(new_path):
-                    os.rename(new_path, old_path)
-                    
-                    # 同步回滚 XMP
-                    new_xmp = os.path.splitext(new_path)[0] + ".xmp"
-                    old_xmp = os.path.splitext(old_path)[0] + ".xmp"
-                    if os.path.exists(new_xmp):
+                if not os.path.exists(new_path):
+                    raise FileNotFoundError(f"目标文件不存在：{new_path}")
+                if os.path.exists(old_path):
+                    raise FileExistsError(f"源路径已有文件：{old_path}")
+                os.rename(new_path, old_path)
+
+                new_xmp = os.path.splitext(new_path)[0] + ".xmp"
+                old_xmp = os.path.splitext(old_path)[0] + ".xmp"
+                xmp_issue = None
+                if os.path.exists(new_xmp):
+                    if os.path.exists(old_xmp):
+                        xmp_issue = "源路径已有 XMP 侧车，未覆盖；目标侧车仍留在原目标路径"
+                    else:
                         try:
                             os.rename(new_xmp, old_xmp)
-                        except:
-                            pass
+                        except Exception as exc:
+                            xmp_issue = f"XMP 侧车恢复失败：{exc}"
 
-                    # 更新数据库中的路径
-                    rows = self.db.execute_query("SELECT * FROM videos WHERE path = ?", (new_path,))
-                    if rows:
-                        video_data = dict(rows[0])
-                        video_data["path"] = old_path
-                        video_data["filename"] = os.path.basename(old_path)
-                        video_data["status"] = "analyzed"
-                        self.db.upsert_video(video_data)
-                    count += 1
-            except Exception as e:
-                self.log(f"回滚失败 {new_path}: {e}")
-        
-        self.db.delete_session(session_id)
-        self.log(f"回滚完成，还原了 {count} 个文件。")
-        return True
+                rows = self.db.execute_query("SELECT * FROM videos WHERE path = ?", (new_path,))
+                if not rows:
+                    raise ValueError("素材库中找不到目标路径记录")
+                video_data = dict(rows[0])
+                video_data["path"] = old_path
+                video_data["filename"] = os.path.basename(old_path)
+                video_data["status"] = "analyzed"
+                self.db.upsert_video(video_data)
+                restored += 1
+                if xmp_issue:
+                    failures.append(f"{new_path}：视频已恢复，但{xmp_issue}")
+            except Exception as exc:
+                failures.append(f"{new_path}：{exc}")
+                self.log(f"回滚失败 {new_path}: {exc}")
+
+        complete = bool(history) and restored == len(history) and not failures
+        self._last_rollback_result = {
+            "session_id": session_id,
+            "restored_count": restored,
+            "total_count": len(history),
+            "failed_count": len(failures),
+            "failures": list(failures),
+            "complete": complete,
+        }
+        if complete:
+            self.db.delete_session(session_id)
+            self.log(f"回滚完成，还原了 {restored} 个文件。")
+        else:
+            self.log(
+                f"回滚未完全完成：已还原 {restored}/{len(history)} 个文件，"
+                f"{len(failures)} 项需人工处理；历史记录保留。"
+            )
+        return complete
 
     def export_to_fcpx_xml(self, output_path: str, selected_paths: Optional[List[str]] = None):
         """导出 FCPX XML；selected_paths 限定导出集合（None 表示调用方已筛好则应显式传入）。"""
@@ -4664,6 +4817,7 @@ class VideoOrganizerService:
         selected_paths: Optional[List[str]] = None,
         *,
         video_rows: Optional[List[Dict]] = None,
+        return_details: bool = False,
     ):
         """
         为视频生成 XMP 侧边文件，优化了达芬奇与 PR 的双重兼容性。
@@ -4750,9 +4904,11 @@ class VideoOrganizerService:
             return path
 
         success_count = 0
+        failed_items = []
         for item in videos:
             video_path = item.get("path")
             if not video_path or not os.path.exists(video_path):
+                failed_items.append({"path": video_path or "", "reason": "视频文件不存在"})
                 continue
                 
             xmp_path = os.path.splitext(video_path)[0] + ".xmp"
@@ -4889,9 +5045,17 @@ class VideoOrganizerService:
                     f.write(xmp_content)
                 success_count += 1
             except Exception as e:
+                failed_items.append({"path": video_path, "reason": str(e) or e.__class__.__name__})
                 self.log(f"生成 XMP 失败 {video_path}: {e}")
                 
         self.log(f"元数据同步完成，生成了 {success_count} 个 XMP 文件。", ui=False)
+        if return_details:
+            return {
+                "planned_count": len(videos),
+                "success_count": success_count,
+                "failed_count": len(failed_items),
+                "failed_items": failed_items,
+            }
         return success_count
 
     def plan_physical_migration(
@@ -4936,57 +5100,324 @@ class VideoOrganizerService:
             != os.path.normcase(os.path.normpath(step["new_path"]))
         ]
 
-    def execute_physical_migration(self, target_root: str, selected_paths: Optional[List[str]] = None):
-        """V4.0: 执行物理迁移，按分类自动归档文件"""
-        plan = self.plan_physical_migration(target_root, selected_paths)
-        success_count = 0
+    def execute_physical_migration(
+        self,
+        target_root: str,
+        selected_paths: Optional[List[str]] = None,
+        *,
+        return_details: bool = False,
+        plan: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """执行物理迁移，并可返回当前会话的逐项结果摘要。
+
+        默认仍返回成功迁移数量，保持旧调用方兼容；GUI 传入
+        ``return_details=True`` 时返回不持久化的逐项结果。结果只描述本次
+        执行，不承诺对原始视频或 XMP 侧车提供完整恢复能力。
+        """
+        plan_supplied = plan is not None
+        plan = (
+            [dict(step) for step in plan]
+            if plan_supplied
+            else self.plan_physical_migration(target_root, selected_paths)
+        )
+        # 即使调用方传入预览快照，也必须在执行层验证来源、推导目标和校验快照，
+        # 防止外部/旧调用方伪造 plan 后把任意源文件复制并删除。
+        root_path = os.path.abspath(str(target_root))
+        allowed_sources = {
+            normalize_work_path(path)
+            for path in (selected_paths or [])
+            if path
+        }
+        plan_requires_scope = plan_supplied
+        validated_plan = []
+
+        def has_link_component(path: str, root: str) -> bool:
+            """拒绝目标根以下的符号链接/目录联接组件，降低确认后重定向到根外的风险。"""
+            current = os.path.abspath(path)
+            root_abs = os.path.abspath(root)
+            is_junction = getattr(os.path, "isjunction", lambda _path: False)
+            while current != root_abs:
+                if os.path.islink(current) or is_junction(current):
+                    return True
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+            return False
+
         for step in plan:
-            old_path = step["old_path"]
-            new_path = step["new_path"]
+            checked = dict(step)
+            old_path = os.path.abspath(str(checked.get("old_path") or checked.get("source_path") or ""))
+            row = self.db.get_video_by_path(old_path) if old_path else None
+            reasons = list(checked.get("risk_flags") or [])
+            category, category_safe = _safe_category_name(row.get("category") if row else checked.get("category"))
+            filename = os.path.basename(old_path)
+            expected_requested = os.path.abspath(os.path.join(root_path, category, filename)) if old_path else ""
+            target_path = os.path.abspath(str(checked.get("new_path") or checked.get("target_path") or ""))
+            target_ok = bool(target_path) and _is_within_root(target_path, root_path)
+            target_dir_ok = target_ok and os.path.normcase(os.path.dirname(target_path)) == os.path.normcase(os.path.dirname(expected_requested))
+            target_name = os.path.basename(target_path)
+            requested_name = os.path.basename(expected_requested)
+            base, ext = os.path.splitext(requested_name)
+            target_name_ok = target_name == requested_name or bool(re.fullmatch(re.escape(base) + r"_\d+" + re.escape(ext), target_name))
+            valid = bool(row) and (not plan_requires_scope or normalize_work_path(old_path) in allowed_sources)
+            valid = valid and category_safe and target_dir_ok and target_name_ok
+            if row:
+                expected_hash = str(row.get("file_hash") or "").strip()
+                supplied_hash = str(checked.get("expected_file_hash") or "").strip()
+                if expected_hash:
+                    valid = valid and supplied_hash == expected_hash
+                else:
+                    valid = valid and checked.get("source_size") is not None and checked.get("source_mtime_ns") is not None
+            else:
+                reasons.append("素材库中不存在源路径记录")
+            if plan_requires_scope and normalize_work_path(old_path) not in allowed_sources:
+                reasons.append("源路径不属于非空的本次操作目标集")
+            if not target_ok or not target_dir_ok or not target_name_ok:
+                reasons.append("执行目标路径不是由目标根、分类和源文件名安全推导出的路径")
+            if not category_safe:
+                reasons.append("分类名称不安全")
+            if row and str(row.get("file_hash") or "").strip() and str(checked.get("expected_file_hash") or "").strip() != str(row.get("file_hash") or "").strip():
+                reasons.append("预览校验哈希与素材库记录不一致")
+            if row and not str(row.get("file_hash") or "").strip() and (checked.get("source_size") is None or checked.get("source_mtime_ns") is None):
+                reasons.append("预览缺少源文件大小/修改时间校验")
+            if not valid:
+                checked["status"] = "blocked"
+                checked["risk_flags"] = list(dict.fromkeys(reasons))
+            checked["old_path"] = old_path
+            checked["new_path"] = target_path
+            checked["category"] = category
+            checked["filename"] = filename
+            validated_plan.append(checked)
+        plan = validated_plan
+        result = {
+            "planned_count": len(plan),
+            "success_count": 0,
+            "warning_count": 0,
+            "failed_count": 0,
+            "blocked_count": 0,
+            "conflict_count": sum(1 for step in plan if step.get("target_conflict")),
+            "xmp_conflict_count": sum(
+                1
+                for step in plan
+                if step.get("source_xmp_exists") and step.get("target_xmp_exists_before")
+            ),
+            "items": [],
+        }
+
+        def copy_without_overwrite(source: str, destination: str) -> None:
+            """独占创建目标；复制或元数据复制失败时清理本次创建的残留。"""
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            descriptor = -1
+            created = False
+            try:
+                descriptor = os.open(destination, flags, 0o666)
+                created = True
+                with os.fdopen(descriptor, "wb") as dst:
+                    descriptor = -1
+                    with open(source, "rb") as src:
+                        shutil.copyfileobj(src, dst)
+                shutil.copystat(source, destination)
+            except Exception:
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                if created:
+                    try:
+                        os.remove(destination)
+                    except OSError:
+                        pass
+                raise
+
+        for step in plan:
+            old_path = step.get("old_path") or ""
+            new_path = step.get("new_path") or ""
             category = step.get("category") or "Other"
             filename = step.get("filename") or os.path.basename(old_path)
-            if not old_path or not os.path.exists(old_path):
+            item_result = {
+                "source_path": old_path,
+                "target_path": new_path,
+                "target_conflict": bool(step.get("target_conflict")),
+                "external_change": step.get("external_change"),
+                "risk_flags": list(step.get("risk_flags") or []),
+                "status": "blocked",
+                "reason": "",
+            }
+
+            if step.get("status") == "blocked":
+                result["blocked_count"] += 1
+                item_result["reason"] = "；".join(item_result["risk_flags"]) or "预览已阻止执行"
+                self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                result["items"].append(item_result)
                 continue
-            dest_dir = os.path.dirname(new_path)
+
+            if not old_path or not os.path.exists(old_path):
+                result["blocked_count"] += 1
+                item_result["reason"] = "源文件不存在（执行前再次检查）"
+                self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                result["items"].append(item_result)
+                continue
+
+            if os.path.exists(new_path):
+                result["blocked_count"] += 1
+                item_result["reason"] = "实际目标路径在确认后出现文件；为避免覆盖，已停止此项，请重新预览"
+                self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                result["items"].append(item_result)
+                continue
+
+            item = self.db.get_video_by_path(new_path)
+            if item is not None:
+                result["blocked_count"] += 1
+                item_result["reason"] = "素材库中已有目标路径记录；为避免覆盖记录，已停止此项"
+                self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                result["items"].append(item_result)
+                continue
+
+            expected_hash = str(step.get("expected_file_hash") or "").strip()
             try:
+                if expected_hash:
+                    actual_source_hash = self.processor.get_file_hash(old_path)
+                    if actual_source_hash != expected_hash:
+                        result["blocked_count"] += 1
+                        item_result["external_change"] = True
+                        item_result["reason"] = "源文件在预览后发生变化；为避免移动已变化素材，已停止此项"
+                        self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                        result["items"].append(item_result)
+                        continue
+                else:
+                    stat_now = os.stat(old_path)
+                    mtime_ns = getattr(
+                        stat_now, "st_mtime_ns", int(stat_now.st_mtime * 1e9)
+                    )
+                    if (
+                        step.get("source_size") is not None
+                        and stat_now.st_size != step["source_size"]
+                    ) or (
+                        step.get("source_mtime_ns") is not None
+                        and mtime_ns != step["source_mtime_ns"]
+                    ):
+                        result["blocked_count"] += 1
+                        item_result["external_change"] = True
+                        item_result["reason"] = "源文件在预览后发生变化；为避免移动已变化素材，已停止此项"
+                        self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                        result["items"].append(item_result)
+                        continue
+            except (OSError, IOError) as exc:
+                result["blocked_count"] += 1
+                item_result["reason"] = f"无法重新校验源文件：{exc}"
+                self.log(f"跳过物理迁移 {filename}：{item_result['reason']}")
+                result["items"].append(item_result)
+                continue
+
+            warnings = []
+            dest_dir = os.path.dirname(new_path)
+            new_xmp = os.path.splitext(new_path)[0] + ".xmp"
+            old_xmp = os.path.splitext(old_path)[0] + ".xmp"
+            target_created = False
+            target_xmp_created = False
+            source_removed = False
+            database_updated = False
+            try:
+                root_path = os.path.abspath(str(target_root))
+                if not _is_within_root(new_path, root_path) or has_link_component(dest_dir, root_path):
+                    raise ValueError("目标路径越出目标根目录或包含不安全的链接目录，已阻止执行")
                 if not os.path.exists(dest_dir):
                     os.makedirs(dest_dir)
+                # 目录创建后再次按真实路径检查，防止确认后目录被替换为链接。
+                if not _is_within_root(new_path, root_path) or has_link_component(dest_dir, root_path):
+                    raise ValueError("执行前目标目录已变化或包含不安全的链接目录，已阻止执行")
                 logger.info(f"执行物理迁移: {filename} -> {category}/")
                 self.log(f"正在迁移: {filename} -> {category}/")
-                shutil.copy2(old_path, new_path)
+                copy_without_overwrite(old_path, new_path)
+                target_created = True
 
-                old_xmp = os.path.splitext(old_path)[0] + ".xmp"
-                new_xmp = os.path.splitext(new_path)[0] + ".xmp"
+                if os.path.getsize(old_path) != os.path.getsize(new_path):
+                    raise IOError("复制校验失败：源文件与目标文件大小不一致")
+                if expected_hash and self.processor.get_file_hash(new_path) != expected_hash:
+                    raise IOError("复制校验失败：目标文件内容与预览时源文件不一致")
+
                 if os.path.exists(old_xmp):
-                    try:
-                        shutil.copy2(old_xmp, new_xmp)
-                    except Exception:
-                        pass
-
-                if os.path.getsize(old_path) == os.path.getsize(new_path):
-                    os.remove(old_path)
-                    if os.path.exists(old_xmp) and os.path.exists(new_xmp):
+                    if os.path.exists(new_xmp):
+                        warnings.append("目标 XMP 侧车已存在，未覆盖；源侧车保留在原位置")
+                    else:
                         try:
-                            os.remove(old_xmp)
-                        except Exception:
-                            pass
-                    item = self.db.get_video_by_path(old_path) or {"path": old_path}
-                    item["path"] = new_path
-                    item["filename"] = os.path.basename(new_path)
-                    self.db.upsert_video(item)
-                    self.db.execute_non_query(
-                        "INSERT INTO migration_history (old_path, new_path, reason) VALUES (?, ?, ?)",
-                        (old_path, new_path, "Auto-categorization"),
-                    )
-                    success_count += 1
+                            copy_without_overwrite(old_xmp, new_xmp)
+                            target_xmp_created = True
+                        except Exception as exc:
+                            warnings.append(f"XMP 侧车复制失败，源侧车保留：{exc}")
+                            self.log(f"XMP 侧车复制失败 {filename}: {exc}")
+
+                # 先更新数据库；若数据库失败，源文件仍在，可清理本次新建目标并安全重试。
+                self.db.move_video_record(
+                    old_path,
+                    new_path,
+                    "Auto-categorization",
+                )
+                database_updated = True
+                try:
+                    os.remove(old_path)
+                    source_removed = True
+                except Exception:
+                    # 文件删除失败时恢复数据库指针，避免库内先于磁盘产生错误路径。
+                    self.db.restore_video_record_move(old_path, new_path)
+                    database_updated = False
+                    raise
+
+                if os.path.exists(old_xmp) and target_xmp_created:
+                    try:
+                        os.remove(old_xmp)
+                    except Exception as exc:
+                        warnings.append(f"原 XMP 侧车未删除，仍保留在源位置：{exc}")
+                        self.log(f"原 XMP 侧车删除失败 {filename}: {exc}")
+
+                result["success_count"] += 1
+                if item_result["target_conflict"]:
+                    warnings.insert(0, "请求目标已存在，已使用不覆盖路径")
+                if warnings:
+                    result["warning_count"] += 1
+                    item_result["status"] = "success_with_warning"
+                    item_result["reason"] = "；".join(warnings)
                 else:
-                    self.log(f"迁移校验失败 (大小不一致): {filename}")
-            except Exception as e:
-                self.log(f"迁移过程出错 {filename}: {e}")
+                    item_result["status"] = "success"
+                    item_result["reason"] = "已完成物理移动"
+            except Exception as exc:
+                # 数据库尚未提交或已回滚时，清理由本次操作独占创建的目标。
+                # 若数据库回滚失败或源已删除，则保留目标并明确要求人工核对。
+                if database_updated and not source_removed:
+                    try:
+                        self.db.restore_video_record_move(old_path, new_path)
+                        database_updated = False
+                    except Exception as rollback_exc:
+                        item_result["reason"] = (
+                            f"执行失败：{exc}；数据库路径回滚失败：{rollback_exc}，请人工核对"
+                        )
+                if not source_removed and not database_updated:
+                    if target_xmp_created and os.path.exists(new_xmp):
+                        try:
+                            os.remove(new_xmp)
+                        except OSError:
+                            pass
+                    if target_created and os.path.exists(new_path):
+                        try:
+                            os.remove(new_path)
+                        except OSError:
+                            pass
+                result["failed_count"] += 1
+                item_result["status"] = "failed"
+                if not item_result["reason"]:
+                    item_result["reason"] = f"执行失败：{exc}"
+                if source_removed:
+                    item_result["reason"] += "；源文件已移除，目标文件保留，请人工核对素材库记录和目标路径"
+                self.log(f"迁移过程出错 {filename}: {exc}")
+            result["items"].append(item_result)
 
         self.invalidate_video_memory_cache()
-        self.log(f"物理整理完成，成功迁移: {success_count}")
-        return success_count
+        self.log(f"物理整理完成，成功迁移: {result['success_count']}")
+        if return_details:
+            return result
+        return result["success_count"]
 
     def smart_semantic_search(self, query: str) -> List[Dict]:
         """V5.0: 增强搜索，支持 tag1 + tag2 (AND) 和 tag1 | tag2 (OR)"""

@@ -19,6 +19,8 @@ from ..models.video_table import (
     COL_STATUS,
     COL_TAGS,
     COL_THUMB,
+    DEFAULT_TABLE_COLUMN_WIDTHS,
+    migrate_table_column_prefs,
 )
 from ..models.proxy_model import AdvancedSortFilterProxyModel
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
@@ -52,6 +54,7 @@ class MaterialLibraryView(QWidget):
         super().__init__(parent)
         self.service = service
         self.settings = service.settings
+        self._applying_column_widths = False
         self._query_generation = 0
         self._detail_generation = 0
         self._page_offset = 0
@@ -144,10 +147,11 @@ class MaterialLibraryView(QWidget):
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setSectionResizeMode(COL_FILENAME, QHeaderView.Stretch)
-        self.table_view.setColumnWidth(COL_LIST_NO, 40)
-        self.table_view.setColumnWidth(COL_LIBRARY_ID, 70)
-        self.table_view.setColumnWidth(COL_THUMB, 140)
-        self.table_view.setColumnWidth(COL_STATUS, 80)
+        for column, width in DEFAULT_TABLE_COLUMN_WIDTHS.items():
+            self.table_view.setColumnWidth(column, width)
+        header.sectionResized.connect(self._on_column_resized)
+        header.sectionDoubleClicked.connect(self._on_header_double_clicked)
+        self._restore_column_widths()
         self.table_view.setItemDelegateForColumn(COL_THUMB, ThumbnailDelegate(self.table_view))
         self.table_view.setItemDelegateForColumn(COL_STATUS, StatusDelegate(self.table_view))
         self.table_view.setItemDelegateForColumn(COL_TAGS, MaterialTagsColumnDelegate(self.table_view))
@@ -210,6 +214,51 @@ class MaterialLibraryView(QWidget):
         if not hasattr(self, "_selection_shortcuts"):
             self._selection_shortcuts = []
         self._selection_shortcuts.append(sc)
+
+    def _on_column_resized(self, logical, _old, new):
+        if self._applying_column_widths:
+            return
+        if logical < 0 or logical >= self.model.columnCount():
+            return
+        prefs = self.settings.setdefault("ui_preferences", {})
+        widths = prefs.setdefault("table_column_widths", {})
+        widths[str(logical)] = new
+        try:
+            SettingsManager.save_settings(self.settings, self.service.db)
+        except Exception:
+            pass
+
+    def _restore_column_widths(self):
+        raw = (self.settings.get("ui_preferences") or {}).get("table_column_widths") or {}
+        widths = migrate_table_column_prefs(raw, self.model.columnCount())
+        self._applying_column_widths = True
+        try:
+            for key, width in widths.items():
+                try:
+                    column = int(key)
+                    if 0 <= column < self.model.columnCount():
+                        self.table_view.setColumnWidth(column, int(width))
+                except (TypeError, ValueError):
+                    continue
+        finally:
+            self._applying_column_widths = False
+
+    def _on_header_double_clicked(self, logical):
+        if 0 <= logical < self.model.columnCount():
+            self.table_view.resizeColumnToContents(logical)
+
+    def reset_column_widths(self):
+        """恢复素材库表格列宽默认值，与工作台使用相同宽度。"""
+        self.apply_default_column_widths()
+
+    def apply_default_column_widths(self):
+        """只更新当前表格，不写回列宽偏好。"""
+        self._applying_column_widths = True
+        try:
+            for column, width in DEFAULT_TABLE_COLUMN_WIDTHS.items():
+                self.table_view.setColumnWidth(column, width)
+        finally:
+            self._applying_column_widths = False
 
     def apply_default_view(self):
         mode = self.settings.get("ui_preferences", {}).get("default_view", "list")

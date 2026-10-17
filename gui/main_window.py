@@ -188,6 +188,7 @@ class MainWindow(QMainWindow):
         elif index == 3:
             page.settings_applied.connect(self.on_settings_applied)
             page.ui_preferences_applied.connect(self.apply_ui_preferences)
+            page.interface_layout_reset.connect(self.reset_open_list_column_widths)
 
         if hasattr(page, "apply_default_view"):
             page.apply_default_view()
@@ -252,6 +253,8 @@ class MainWindow(QMainWindow):
 
     def on_settings_applied(self):
         self.apply_ui_preferences()
+        if hasattr(self.workstation_page, "refresh_analysis_side_effect_summary"):
+            self.workstation_page.refresh_analysis_side_effect_summary()
         # 敏感设置显式保存时才重建 AI 客户端。
         if hasattr(self.service, "reload_ai_from_settings"):
             try:
@@ -276,6 +279,13 @@ class MainWindow(QMainWindow):
         for page in (self.workstation_page, self.library_page):
             if hasattr(page, "detail_panel"):
                 page.detail_panel.setVisible(bool(expanded))
+
+    def reset_open_list_column_widths(self):
+        """让已创建的列表页立即采用重置后的默认列宽。"""
+        for page in (self.workstation_page, self.library_page):
+            apply_widths = getattr(page, "apply_default_column_widths", None)
+            if callable(apply_widths):
+                apply_widths()
 
     def toggle_theme(self):
         current_theme = normalize_theme(
