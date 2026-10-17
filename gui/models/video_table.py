@@ -15,6 +15,16 @@ COL_CATEGORY = 4
 COL_TAGS = 5
 COL_STATUS = 6
 
+DEFAULT_TABLE_COLUMN_WIDTHS = {
+    COL_LIST_NO: 40,
+    COL_LIBRARY_ID: 70,
+    COL_THUMB: 140,
+    COL_FILENAME: 200,
+    COL_CATEGORY: 100,
+    COL_TAGS: 150,
+    COL_STATUS: 80,
+}
+
 # 表头只决定 SQL 排序；代理模型不能仅对已加载的一页重新排序。
 CATALOG_SORT_COLUMNS = {
     COL_LIST_NO: "timestamp",

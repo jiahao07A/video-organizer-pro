@@ -24,6 +24,7 @@ from ..models.video_table import (
     COL_THUMB,
     COL_CATEGORY,
     COL_TAGS,
+    DEFAULT_TABLE_COLUMN_WIDTHS,
     migrate_table_column_prefs,
 )
 from ..models.proxy_model import AdvancedSortFilterProxyModel
@@ -54,20 +55,22 @@ class _ClearSelectionOnEmptyClickFilter(QObject):
 
 
 class PhysicalMigrationPreviewDialog(QDialog):
-    """显示物理整理的完整路径和风险；不执行任何文件操作。"""
+    """显示物理整理的完整路径和风险，并允许逐项排除；不执行任何文件操作。"""
 
-    _COLUMNS = ("状态", "源路径", "请求目标路径", "实际目标路径", "风险")
+    _COLUMNS = ("执行", "状态", "源路径", "请求目标路径", "实际目标路径", "风险")
 
     def __init__(self, plan, target_root: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("模拟预览 — 物理整理")
-        self.resize(1100, 620)
-        self._plan = list(plan or [])
+        self.resize(1150, 620)
+        self._plan = [dict(step) for step in (plan or [])]
+        self._target_root = target_root
+        self._excluded_paths = set()
 
         layout = QVBoxLayout(self)
-        summary = QLabel(self._summary_text(target_root))
-        summary.setWordWrap(True)
-        layout.addWidget(summary)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
 
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText("搜索源路径、目标路径、分类或风险…")
@@ -83,50 +86,78 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self.table.setWordWrap(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 90)
-        self.table.setColumnWidth(1, 360)
+        self.table.setColumnWidth(0, 65)
+        self.table.setColumnWidth(1, 90)
         self.table.setColumnWidth(2, 360)
         self.table.setColumnWidth(3, 360)
+        self.table.setColumnWidth(4, 360)
         self._populate_rows()
+        self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table, 1)
 
-        blocked = sum(1 for row in self._plan if row.get("status") == "blocked")
-        review = sum(1 for row in self._plan if row.get("status") == "review")
-        note = QLabel(
-            "执行前会再次检查当前文件状态。"
-            + (f" 当前有 {review} 条需要复核。" if review else "")
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No, parent=self)
+        self.confirm_button = buttons.button(QDialogButtonBox.Yes)
+        self.confirm_button.setText("确认执行物理整理")
+        buttons.button(QDialogButtonBox.No).setText("取消")
+        buttons.accepted.connect(self._accept_if_selected)
+        buttons.rejected.connect(self.reject)
+        self._buttons = buttons
+        layout.addWidget(buttons)
+        self._refresh_summary(target_root)
+
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(os.path.normpath(os.path.abspath(str(path or ""))))
+
+    def selected_plan(self):
+        """返回用户确认执行的同一份预览快照，不重新规划路径。"""
+        return [
+            dict(step)
+            for step in self._plan
+            if self._path_key(step.get("source_path") or step.get("old_path")) not in self._excluded_paths
+        ]
+
+    @property
+    def excluded_count(self):
+        return len(self._excluded_paths)
+
+    def _refresh_summary(self, target_root):
+        selected = self.selected_plan()
+        conflicts = sum(1 for row in selected if row.get("target_conflict"))
+        xmp_conflicts = sum(
+            1 for row in selected
+            if row.get("source_xmp_exists") and row.get("target_xmp_exists_before")
+        )
+        blocked = sum(1 for row in selected if row.get("status") == "blocked")
+        self.summary.setText(
+            f"预览 {len(self._plan)} 条，当前执行 {len(selected)} 条，已排除 {self.excluded_count} 条；"
+            f"目标根目录：{target_root}\n"
+            f"视频目标冲突：{conflicts} 条；XMP 侧车冲突：{xmp_conflicts} 条。"
+            "视频目标冲突会选择不覆盖路径；XMP 侧车冲突会保留原侧车，不覆盖目标侧车。"
+        )
+        self.note.setText(
+            "勾选“执行”后才会纳入本次操作；可以逐项排除。执行前会再次检查当前文件状态。"
             + (f" 当前有 {blocked} 条被阻止，不能执行。" if blocked else "")
             + " 本轮不提供对原始素材的全部恢复承诺。"
         )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No, parent=self)
-        buttons.button(QDialogButtonBox.Yes).setText("确认执行物理整理")
-        buttons.button(QDialogButtonBox.No).setText("取消")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.Yes).setEnabled(blocked == 0)
-        layout.addWidget(buttons)
-
-    def _summary_text(self, target_root: str) -> str:
-        conflicts = sum(1 for row in self._plan if row.get("target_conflict"))
-        return (
-            f"预览 {len(self._plan)} 条整理步骤；目标根目录：{target_root}\\n"
-            f"冲突：{conflicts} 条。目标冲突仅显示为不覆盖的实际目标路径，"
-            "不会覆盖已有文件。"
-        )
+        self.confirm_button.setEnabled(bool(selected) and blocked == 0)
 
     def _populate_rows(self):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self._plan))
         for row_index, step in enumerate(self._plan):
+            source_path = step.get("source_path") or step.get("old_path") or ""
             risks = "；".join(step.get("risk_flags") or []) or "无"
             values = (
+                "",
                 {"ready": "可执行", "review": "需复核", "blocked": "已阻止"}.get(
                     step.get("status"), str(step.get("status") or "未知")
                 ),
-                step.get("source_path") or step.get("old_path") or "",
+                source_path,
                 step.get("requested_target_path") or "",
                 step.get("target_path") or step.get("new_path") or "",
                 risks,
@@ -134,18 +165,108 @@ class PhysicalMigrationPreviewDialog(QDialog):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(value))
+                if column == 0:
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                    item.setCheckState(Qt.Checked)
+                    item.setData(Qt.UserRole, source_path)
                 self.table.setItem(row_index, column, item)
         self.table.setSortingEnabled(True)
+
+    def _on_item_changed(self, item):
+        if item.column() != 0:
+            return
+        key = self._path_key(item.data(Qt.UserRole))
+        if item.checkState() == Qt.Checked:
+            self._excluded_paths.discard(key)
+        else:
+            self._excluded_paths.add(key)
+        self._refresh_summary(self._target_root)
 
     def _filter_rows(self, text: str):
         query = text.strip().casefold()
         for row in range(self.table.rowCount()):
             content = " ".join(
                 self.table.item(row, column).text()
-                for column in range(self.table.columnCount())
+                for column in range(1, self.table.columnCount())
                 if self.table.item(row, column) is not None
             ).casefold()
             self.table.setRowHidden(row, bool(query and query not in content))
+
+    def _accept_if_selected(self):
+        if self.selected_plan():
+            self.accept()
+
+
+class PhysicalMigrationResultDialog(QDialog):
+    """显示本次物理整理的逐项执行结果；不持久化结果。"""
+
+    _COLUMNS = ("结果", "源路径", "目标路径", "说明")
+
+    def __init__(self, result, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("物理整理结果")
+        self.resize(1100, 620)
+        result = result if isinstance(result, dict) else {}
+        items = list(result.get("items") or [])
+
+        layout = QVBoxLayout(self)
+        summary = QLabel(
+            f"计划 {result.get('planned_count', len(items))} 条；"
+            f"成功 {result.get('success_count', 0)} 条；"
+            f"有警告 {result.get('warning_count', 0)} 条；"
+            f"失败 {result.get('failed_count', 0)} 条；"
+            f"需人工处理 {result.get('blocked_count', 0)} 条；"
+            f"目标冲突 {result.get('conflict_count', 0)} 条；"
+            f"XMP 侧车冲突 {result.get('xmp_conflict_count', 0)} 条。"
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        self.table = QTableWidget(len(items), len(self._COLUMNS), self)
+        self.table.setHorizontalHeaderLabels(list(self._COLUMNS))
+        self.table.setSortingEnabled(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 130)
+        self.table.setColumnWidth(1, 360)
+        self.table.setColumnWidth(2, 360)
+
+        labels = {
+            "success": "已完成",
+            "success_with_warning": "已完成（有警告）",
+            "blocked": "未执行，需人工处理",
+            "failed": "执行失败",
+        }
+        self.table.setSortingEnabled(False)
+        for row_index, item in enumerate(items):
+            status = str(item.get("status") or "failed")
+            values = (
+                labels.get(status, status),
+                item.get("source_path") or "",
+                item.get("target_path") or "",
+                item.get("reason") or "",
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setToolTip(str(value))
+                self.table.setItem(row_index, column, cell)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table, 1)
+
+        note = QLabel(
+            "结果仅记录本次物理整理会话。目标冲突表示使用了不覆盖路径；"
+            "失败和需人工处理的项目不会被显示为成功。当前入口不承诺原始视频或 XMP 侧车的完整恢复。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=self)
+        buttons.rejected.connect(self.accept)
+        layout.addWidget(buttons)
 
 
 class WorkstationView(QWidget):
@@ -159,6 +280,7 @@ class WorkstationView(QWidget):
         self.service = service
         self.settings = service.settings
         self.worker = None
+        self._applying_column_widths = False
         self._query_generation = 0
         self._detail_generation = 0
         self._page_offset = 0
@@ -298,12 +420,10 @@ class WorkstationView(QWidget):
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setSectionResizeMode(COL_FILENAME, QHeaderView.Stretch)
+        self.apply_default_column_widths()
         header.sectionResized.connect(self._on_column_resized)
         header.sectionDoubleClicked.connect(self._on_header_double_clicked)
-        self.table_view.setColumnWidth(COL_LIST_NO, 40)
-        self.table_view.setColumnWidth(COL_LIBRARY_ID, 70)
-        self.table_view.setColumnWidth(COL_THUMB, 140)
-        self.table_view.setColumnWidth(COL_STATUS, 80)
+        self._restore_column_widths()
 
         self.thumb_delegate = ThumbnailDelegate()
         self.status_delegate = StatusDelegate()
@@ -561,7 +681,7 @@ class WorkstationView(QWidget):
             act.toggled.connect(lambda checked, col=i: self._set_column_visible(col, checked))
             self._col_actions[i] = act
         reset_act = menu.addAction("重置列宽")
-        reset_act.triggered.connect(self._reset_column_widths)
+        reset_act.triggered.connect(self.reset_column_widths)
         self.cols_btn.setMenu(menu)
 
     def _set_column_visible(self, col: int, visible: bool):
@@ -593,6 +713,8 @@ class WorkstationView(QWidget):
                 pass
 
     def _on_column_resized(self, logical, _old, new):
+        if self._applying_column_widths:
+            return
         if logical < 0 or logical >= self.model.columnCount():
             return
         prefs = self.settings.setdefault("ui_preferences", {})
@@ -606,28 +728,33 @@ class WorkstationView(QWidget):
     def _restore_column_widths(self):
         raw = (self.settings.get("ui_preferences") or {}).get("table_column_widths") or {}
         widths = migrate_table_column_prefs(raw, self.model.columnCount())
-        for k, w in widths.items():
-            try:
-                col = int(k)
-                if 0 <= col < self.model.columnCount():
-                    self.table_view.setColumnWidth(col, int(w))
-            except Exception:
-                pass
+        self._applying_column_widths = True
+        try:
+            for key, width in widths.items():
+                try:
+                    column = int(key)
+                    if 0 <= column < self.model.columnCount():
+                        self.table_view.setColumnWidth(column, int(width))
+                except (TypeError, ValueError):
+                    continue
+        finally:
+            self._applying_column_widths = False
 
-    def _reset_column_widths(self):
-        defaults = {
-            COL_LIST_NO: 40,
-            COL_LIBRARY_ID: 70,
-            COL_THUMB: 140,
-            COL_FILENAME: 200,
-            COL_CATEGORY: 100,
-            COL_TAGS: 150,
-            COL_STATUS: 80,
-        }
-        for c, w in defaults.items():
-            self.table_view.setColumnWidth(c, w)
+    def apply_default_column_widths(self):
+        self._applying_column_widths = True
+        try:
+            for column, width in DEFAULT_TABLE_COLUMN_WIDTHS.items():
+                self.table_view.setColumnWidth(column, width)
+        finally:
+            self._applying_column_widths = False
+
+    def reset_column_widths(self):
+        self.apply_default_column_widths()
         prefs = self.settings.setdefault("ui_preferences", {})
-        prefs["table_column_widths"] = {str(k): v for k, v in defaults.items()}
+        prefs["table_column_widths"] = {
+            str(column): width
+            for column, width in DEFAULT_TABLE_COLUMN_WIDTHS.items()
+        }
         try:
             SettingsManager.save_settings(self.settings, self.service.db)
         except Exception:
@@ -1357,10 +1484,21 @@ class WorkstationView(QWidget):
 
     def rollback_rename(self):
         if self.service.rollback_last_session():
-            QMessageBox.information(self, "成功", "已成功回滚上一次重命名操作。")
+            QMessageBox.information(self, "成功", "已完整恢复上一次重命名会话。")
             self.load_data()
+            return
+        detail = getattr(self.service, "_last_rollback_result", None) or {}
+        failures = detail.get("failures") or []
+        if detail:
+            message = (
+                f"已恢复 {detail.get('restored_count', 0)}/{detail.get('total_count', 0)} 项，"
+                "其余项目未能自动恢复，请按下方路径人工处理：\n"
+                + "\n".join(failures[:8])
+            )
         else:
-            QMessageBox.warning(self, "错误", "没有可回滚的记录。")
+            message = "没有可回滚的记录。"
+        QMessageBox.warning(self, "回滚未完成", message)
+        self.load_data()
 
     def _busy_io_start(self, msg: str = "处理中…"):
         self.set_ui_enabled(False)
@@ -1466,11 +1604,30 @@ class WorkstationView(QWidget):
             return
 
         def job():
-            return self.service.sync_metadata_to_xmp(selected_paths)
+            return self.service.sync_metadata_to_xmp(selected_paths, return_details=True)
 
-        def on_ok(count):
+        def on_ok(report):
             self._busy_io_end()
-            QMessageBox.information(self, "完成", f"已成功为 {count} 个视频生成 XMP 侧边文件。")
+            if isinstance(report, dict):
+                success = report.get("success_count", 0)
+                failed = report.get("failed_count", 0)
+                if failed:
+                    items = report.get("failed_items") or []
+                    details = "\n".join(
+                        f"{entry.get('path', '')}：{entry.get('reason', '写入失败')}"
+                        for entry in items[:12]
+                    )
+                    if len(items) > 12:
+                        details += f"\n……另有 {len(items) - 12} 项"
+                    QMessageBox.warning(
+                        self,
+                        "XMP 同步部分失败",
+                        f"成功生成 {success} 个，失败 {failed} 个。失败路径：\n{details or '请检查运行日志。'}",
+                    )
+                else:
+                    QMessageBox.information(self, "完成", f"已成功为 {success} 个视频生成 XMP 侧边文件。")
+                return
+            QMessageBox.information(self, "完成", f"已成功为 {report} 个视频生成 XMP 侧边文件。")
 
         def on_fail(msg):
             self._busy_io_end()
@@ -1506,14 +1663,32 @@ class WorkstationView(QWidget):
         preview_dialog = PhysicalMigrationPreviewDialog(plan, target_root, self)
         if preview_dialog.exec() != QDialog.Accepted:
             return
+        selected_plan = preview_dialog.selected_plan()
+        if not selected_plan:
+            QMessageBox.information(self, "无需整理", "预览中的项目已全部排除，没有需要执行的文件。")
+            return
+        selected_paths = [
+            step.get("old_path") or step.get("source_path")
+            for step in selected_plan
+            if step.get("old_path") or step.get("source_path")
+        ]
 
         def job():
-            return self.service.execute_physical_migration(target_root, selected_paths)
+            return self.service.execute_physical_migration(
+                target_root,
+                selected_paths,
+                return_details=True,
+                plan=selected_plan,
+            )
 
-        def on_ok(count):
+        def on_ok(result):
             self._busy_io_end()
             self.load_data()
-            QMessageBox.information(self, "完成", f"已成功整理 {count} 个文件。")
+            if isinstance(result, dict):
+                PhysicalMigrationResultDialog(result, self).exec()
+                return
+            # 兼容旧服务实现或外部调用替换：至少保留明确的成功数量。
+            QMessageBox.information(self, "完成", f"已成功整理 {result} 个文件。")
 
         def on_fail(msg):
             self._busy_io_end()

@@ -38,6 +38,7 @@ class SettingsView(QWidget):
     """设置视图 - 可搜索目录 + 按用户任务分类导航的高级设置系统"""
     settings_applied = Signal()
     ui_preferences_applied = Signal()  # 普通偏好应用不触发 AI 客户端重建。
+    interface_layout_reset = Signal()  # 完整布局重置成功后通知主窗口刷新现存列表列宽。
 
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
@@ -983,8 +984,10 @@ class SettingsView(QWidget):
             # 立即写穿并重建 AI 客户端，避免「设为当前」后仍用旧 Key
             try:
                 SettingsManager.save_settings(self.settings, self.service.db)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._set_save_status(f"切换供应商保存失败：{exc}", error=True)
+                QMessageBox.critical(self, "保存失败", f"当前供应商已在内存中切换，但尚未可靠写入配置：{exc}\n请重试保存。")
+                return
             if hasattr(self.service, "reload_ai_from_settings"):
                 self.service.reload_ai_from_settings()
             self._set_save_status("已切换当前供应商并保存")
@@ -1407,6 +1410,7 @@ class SettingsView(QWidget):
             SettingsManager.save_settings(self.settings, self.service.db)
             self._set_save_status("默认界面布局已恢复")
             self.ui_preferences_applied.emit()
+            self.interface_layout_reset.emit()
         except Exception as exc:
             self._set_save_status(f"恢复布局失败：{exc}", error=True)
             QMessageBox.critical(self, "错误", f"恢复默认界面布局失败：{exc}")

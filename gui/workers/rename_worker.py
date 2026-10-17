@@ -29,6 +29,15 @@ class RenameWorker(QThread):
                 regex_replace=self.regex_replace,
                 date_value=self.rename_date,
             )
+            report = getattr(self.service, "_last_rename_result", None) or {}
+            failed = int(report.get("failed_count", 0) or 0)
+            if failed:
+                self.task_finished.emit(
+                    False,
+                    f"重命名部分完成：成功 {report.get('success_count', 0)} 项，"
+                    f"失败 {failed} 项；失败项需要人工处理。",
+                )
+                return
             msg = "模拟重命名完成" if self.dry_run else "重命名应用完成"
             self.task_finished.emit(True, msg)
         except Exception as e:

@@ -15,10 +15,15 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from core.video_organizer_service import SettingsManager, VideoOrganizerService
 from gui.main_window import MainWindow
-from gui.models.video_table import COL_FILENAME, COL_LIBRARY_ID
+from gui.models.video_table import (
+    COL_FILENAME,
+    COL_LIBRARY_ID,
+    DEFAULT_TABLE_COLUMN_WIDTHS,
+)
 from gui.views.material_library import MaterialLibraryView
 from gui.views.settings import SettingsView
 from gui.views.workstation import WorkstationView
+from gui.views.workstation import PhysicalMigrationPreviewDialog
 from gui.widgets.rename_dialog import BatchRenameDialog
 
 
@@ -211,6 +216,75 @@ def test_reset_interface_layout_preserves_work_scope(service, views, monkeypatch
     assert "table_columns_visible" not in prefs
     assert "table_column_widths" not in prefs
     assert prefs["last_work_scope"] == ["D:/素材"]
+
+
+def test_reset_interface_layout_applies_default_widths_to_open_lists(
+    service, views, monkeypatch
+):
+    window = MainWindow(service)
+    views.append(window)
+    workstation = window.workstation_page
+    library = window._ensure_page(1)
+    settings = window._ensure_page(3)
+
+    for page in (workstation, library):
+        page.table_view.setColumnWidth(4, 333)
+        page.table_view.setColumnWidth(5, 321)
+        assert page.table_view.columnWidth(4) == 333
+        assert page.table_view.columnWidth(5) == 321
+
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+
+    settings._reset_interface_layout()
+
+    for page in (workstation, library):
+        for column, expected_width in DEFAULT_TABLE_COLUMN_WIDTHS.items():
+            if column != COL_FILENAME:  # 文件名列保持拉伸模式。
+                assert page.table_view.columnWidth(column) == expected_width
+    assert "table_column_widths" not in service.settings["ui_preferences"]
+
+
+def test_reset_interface_layout_does_not_signal_when_save_fails(
+    service, views, monkeypatch
+):
+    view = SettingsView(service)
+    views.append(view)
+    emitted = []
+    view.interface_layout_reset.connect(lambda: emitted.append(True))
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+    monkeypatch.setattr(
+        "gui.views.settings.QMessageBox.critical",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("测试保存失败")
+
+    monkeypatch.setattr(
+        SettingsManager, "save_settings", staticmethod(fail_save)
+    )
+
+    view._reset_interface_layout()
+
+    assert emitted == []
+
+
+@pytest.mark.parametrize("view_type", [MaterialLibraryView, WorkstationView])
+def test_column_width_changes_are_saved_to_shared_preferences(
+    service, views, view_type
+):
+    view = view_type(service)
+    views.append(view)
+
+    view.table_view.setColumnWidth(4, 333)
+
+    assert service.settings["ui_preferences"]["table_column_widths"]["4"] == 333
 
 
 def test_autosave_timer_emits_success_and_clears_pending_status(service, qt_app, views):
@@ -559,3 +633,32 @@ def test_rename_confirmation_and_worker_use_preview_exclusion_snapshot(
     assert "实际处理 1 条" in confirmations[0][2]
     assert "本次从预览中排除 1 条" in confirmations[0][2]
     assert "执行时可能改用冲突路径" in confirmations[0][2]
+
+
+def test_physical_migration_preview_exclusion_uses_source_path_snapshot(
+    service, tmp_path, qt_app, views
+):
+    first = str(tmp_path / "first.mp4")
+    second = str(tmp_path / "second.mp4")
+    plan = [
+        {
+            "old_path": first, "new_path": str(tmp_path / "out" / "A" / "first.mp4"),
+            "source_path": first, "target_path": str(tmp_path / "out" / "A" / "first.mp4"),
+            "requested_target_path": str(tmp_path / "out" / "A" / "first.mp4"),
+            "status": "ready", "risk_flags": [], "category": "A", "filename": "first.mp4",
+        },
+        {
+            "old_path": second, "new_path": str(tmp_path / "out" / "B" / "second.mp4"),
+            "source_path": second, "target_path": str(tmp_path / "out" / "B" / "second.mp4"),
+            "requested_target_path": str(tmp_path / "out" / "B" / "second.mp4"),
+            "status": "ready", "risk_flags": [], "category": "B", "filename": "second.mp4",
+        },
+    ]
+    dialog = PhysicalMigrationPreviewDialog(plan, str(tmp_path / "out"))
+    views.append(dialog)
+    dialog.table.item(0, 0).setCheckState(Qt.Unchecked)
+    dialog.table.sortItems(2, Qt.DescendingOrder)
+    assert dialog.excluded_count == 1
+    assert [row["old_path"] for row in dialog.selected_plan()] == [second]
+    assert dialog.confirm_button.isEnabled()
+    dialog.close()

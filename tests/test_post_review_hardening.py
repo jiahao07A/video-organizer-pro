@@ -265,3 +265,181 @@ def test_physical_migration_preview_reports_external_change(
     assert plan[0]["external_change"] is False
     assert "源文件可能已被外部修改" in plan[0]["risk_flags"]
     assert plan[0]["status"] == "blocked"
+
+
+def test_physical_migration_unsafe_category_stays_under_target_root(service, tmp_path):
+    source = _touch(tmp_path / "source" / "clip.mp4")
+    target_root = tmp_path / "organized"
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "category": "..\\outside", "tags": [],
+    })
+    plan = service.plan_physical_migration(str(target_root), [source])
+    assert len(plan) == 1
+    assert plan[0]["category"] == "Other"
+    assert Path(plan[0]["target_path"]).parent == target_root / "Other"
+    assert any("安全目录 Other" in flag for flag in plan[0]["risk_flags"])
+
+
+def test_physical_migration_database_failure_restores_source_and_cleans_target(
+    service, tmp_path, monkeypatch
+):
+    source = _touch(tmp_path / "source" / "clip.mp4")
+    target_root = tmp_path / "organized"
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "category": "Broll", "tags": [],
+    })
+    monkeypatch.setattr(
+        service.db,
+        "move_video_record",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+    result = service.execute_physical_migration(str(target_root), [source], return_details=True)
+    assert result["failed_count"] == 1
+    assert result["success_count"] == 0
+    assert Path(source).exists()
+    assert not list(target_root.rglob("clip.mp4"))
+    assert service.db.get_video_by_path(source) is not None
+
+
+def test_physical_migration_rejects_forged_plan_source(service, tmp_path):
+    source = _touch(tmp_path / "source" / "clip.mp4")
+    outside = _touch(tmp_path / "outside.mp4")
+    target_root = tmp_path / "organized"
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "category": "Broll", "tags": [],
+    })
+    forged = {
+        "old_path": outside,
+        "new_path": str(target_root / "Broll" / "outside.mp4"),
+        "source_path": outside,
+        "target_path": str(target_root / "Broll" / "outside.mp4"),
+        "category": "Broll",
+        "filename": "outside.mp4",
+        "status": "ready",
+        "risk_flags": [],
+        "source_size": outside and Path(outside).stat().st_size,
+        "source_mtime_ns": Path(outside).stat().st_mtime_ns,
+    }
+    result = service.execute_physical_migration(
+        str(target_root), [source], plan=[forged], return_details=True
+    )
+    assert result["blocked_count"] == 1
+    assert result["success_count"] == 0
+    assert Path(outside).exists()
+    assert not Path(forged["new_path"]).exists()
+
+
+def test_physical_migration_forged_plan_with_empty_scope_is_blocked(service, tmp_path):
+    source = _touch(tmp_path / "source" / "clip.mp4")
+    target_root = tmp_path / "organized"
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "category": "Broll", "tags": [],
+    })
+    forged = {
+        "old_path": source,
+        "new_path": str(target_root / "Broll" / "clip.mp4"),
+        "source_path": source,
+        "target_path": str(target_root / "Broll" / "clip.mp4"),
+        "category": "Broll",
+        "filename": "clip.mp4",
+        "status": "ready",
+        "risk_flags": [],
+        "source_size": Path(source).stat().st_size,
+        "source_mtime_ns": Path(source).stat().st_mtime_ns,
+    }
+    result = service.execute_physical_migration(
+        str(target_root), [], plan=[forged], return_details=True
+    )
+    assert result["blocked_count"] == 1
+    assert result["success_count"] == 0
+    assert Path(source).exists()
+
+
+def test_rename_xmp_failure_is_reported_and_video_path_is_compensated(
+    service, tmp_path, monkeypatch
+):
+    source = _touch(tmp_path / "clip.mp4")
+    source_xmp = Path(source).with_suffix(".xmp")
+    source_xmp.write_text("xmp", encoding="utf-8")
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "tags": [], "category": "Broll", "summary": "",
+    })
+    original_rename = __import__("os").rename
+
+    def fail_sidecar(src, dst):
+        if str(src).endswith(".xmp"):
+            raise OSError("sidecar locked")
+        return original_rename(src, dst)
+
+    monkeypatch.setattr("core.video_organizer_service.os.rename", fail_sidecar)
+    service.batch_rename(
+        dry_run=False,
+        selected_paths=[source],
+        custom_pattern="renamed-{original_name}",
+        date_value="20261017",
+    )
+    assert Path(source).exists()
+    assert source_xmp.exists()
+    assert service._last_rename_result["failed_count"] == 1
+    assert service.db.get_video_by_path(source) is not None
+
+
+def test_automatic_xmp_exception_is_reported_with_path(service, tmp_path, monkeypatch):
+    source = _touch(tmp_path / "clip.mp4")
+    row = {
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "tags": [], "category": "Broll", "summary": "s",
+    }
+    monkeypatch.setattr(
+        service,
+        "sync_metadata_to_xmp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    service.settings["processing"]["auto_sync_xmp_after_analysis"] = True
+    failures = []
+    assert service._persist_analysis_success(row, xmp_failure_sink=failures) == 1
+    assert failures == [{"path": source, "reason": "disk full"}]
+
+
+def test_rename_missing_physical_file_is_reported_as_failure(service, tmp_path):
+    source = str(tmp_path / "missing.mp4")
+    service.db.upsert_video({
+        "path": source, "filename": "missing.mp4", "status": "analyzed",
+        "tags": [], "category": "Broll", "summary": "",
+    })
+    service.batch_rename(
+        dry_run=False,
+        selected_paths=[source],
+        custom_pattern="renamed-{original_name}",
+        date_value="20261017",
+    )
+    assert service._last_rename_result["failed_count"] == 1
+    assert "未找到物理文件" in service._last_rename_result["failed_items"][0]["reason"]
+
+
+def test_rename_database_failure_restores_physical_source(service, tmp_path, monkeypatch):
+    source = _touch(tmp_path / "clip.mp4")
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "tags": [], "category": "Broll", "summary": "",
+    })
+    monkeypatch.setattr(
+        service.db,
+        "add_rename_record",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+    service.batch_rename(
+        dry_run=False,
+        selected_paths=[source],
+        custom_pattern="renamed-{original_name}",
+        date_value="20261017",
+    )
+    assert Path(source).exists()
+    assert not Path(source).with_name("renamed-clip.mp4").exists()
+    assert service._last_rename_result["failed_count"] == 1
+    assert service.db.get_video_by_path(source) is not None
