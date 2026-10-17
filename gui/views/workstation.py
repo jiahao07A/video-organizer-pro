@@ -73,9 +73,8 @@ class PhysicalMigrationPreviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("模拟预览 — 物理整理")
         self.resize(1150, 640)
-        self._raw_plan = list(plan or [])
         self._plan = OrganizationPlan.from_migration_plan(
-            self._raw_plan,
+            plan,
             target_paths=target_paths,
             work_scope_paths=work_scope_paths,
             action_type=PHYSICAL_MIGRATION,
@@ -152,13 +151,10 @@ class PhysicalMigrationPreviewDialog(QDialog):
                     step.status, step.status or "未知"
                 ),
                 step.source_path,
-                "",
+                step.requested_target_path,
                 step.target_path,
                 risks,
             )
-            # 物理整理的完整请求目标路径由原始方案字段提供，便于确认实际改名。
-            raw = (self._raw_plan or [])[row_index] if row_index < len(self._raw_plan) else {}
-            values = (values[0], values[1], raw.get("requested_target_path", ""), values[3], values[4])
             for column, value in enumerate(values, 1):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(value))

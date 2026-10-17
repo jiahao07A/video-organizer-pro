@@ -26,6 +26,7 @@ class PlanItem:
 
     source_path: str
     target_path: str
+    requested_target_path: str = ""
     action_type: str = PHYSICAL_MIGRATION
     status: str = "planned"
     risk_flags: Tuple[str, ...] = ()
@@ -44,6 +45,12 @@ class PlanItem:
         return cls(
             source_path=str(value.get("source_path") or value.get("old_path") or ""),
             target_path=str(value.get("target_path") or value.get("new_path") or ""),
+            requested_target_path=str(
+                value.get("requested_target_path")
+                or value.get("target_path")
+                or value.get("new_path")
+                or ""
+            ),
             action_type=str(value.get("action_type") or action_type),
             status=str(value.get("status") or "planned"),
             risk_flags=tuple(str(flag) for flag in (value.get("risk_flags") or ())),

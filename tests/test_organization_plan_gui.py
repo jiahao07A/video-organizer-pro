@@ -54,6 +54,13 @@ def test_preview_shows_target_scope_and_filtered_summary(qt_app):
     assert "工作范围素材 1 条" in dialog.summary_label.text()
     assert "操作目标集 2 条" in dialog.summary_label.text()
     assert "筛选状态：分类=B-Roll" in dialog.summary_label.text()
+    rows_by_source = {
+        dialog.table.item(row, 2).text(): row
+        for row in range(dialog.table.rowCount())
+    }
+    row_b = rows_by_source["C:/clips/b.mp4"]
+    assert dialog.table.item(row_b, 3).text() == "D:/organized/B/b.mp4"
+    assert dialog.table.item(row_b, 4).text() == "D:/organized/B/b_1.mp4"
     assert set(dialog.execution_paths()) == {"C:/clips/a.mp4", "C:/clips/b.mp4"}
     dialog.close()
 
@@ -93,8 +100,14 @@ def test_preview_sort_keeps_checkbox_and_source_path_together(qt_app):
         target_paths=["C:/clips/a.mp4", "C:/clips/b.mp4"],
     )
     dialog.table.sortItems(2, Qt.AscendingOrder)
-    dialog.table.item(0, 0).setCheckState(Qt.Unchecked)
+    row_b = next(
+        row for row in range(dialog.table.rowCount())
+        if dialog.table.item(row, 2).text() == "C:/clips/b.mp4"
+    )
+    assert dialog.table.item(row_b, 3).text() == "D:/organized/B/b.mp4"
+    assert dialog.table.item(row_b, 4).text() == "D:/organized/B/b_1.mp4"
+    dialog.table.item(row_b, 0).setCheckState(Qt.Unchecked)
 
-    assert dialog.execution_paths() == ["C:/clips/b.mp4"]
+    assert dialog.execution_paths() == ["C:/clips/a.mp4"]
     assert "当前选择 1 条" in dialog.summary_label.text()
     dialog.close()

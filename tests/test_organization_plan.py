@@ -13,7 +13,8 @@ def _plan():
             },
             {
                 "source_path": "C:/clips/b.mp4",
-                "target_path": "D:/organized/B/b.mp4",
+                "requested_target_path": "D:/organized/B/b.mp4",
+                "target_path": "D:/organized/B/b_1.mp4",
                 "status": "review",
                 "risk_flags": ["目标已存在"],
             },
@@ -87,4 +88,7 @@ def test_plan_summary_preserves_risk_without_claiming_execution():
     assert plan.summary()["target_count"] == 3
     assert plan.summary()["filter_summary"] == "分类=B-Roll"
     assert plan.items[1].status == "review"
+    assert plan.items[1].requested_target_path == "D:/organized/B/b.mp4"
+    assert plan.items[1].target_path == "D:/organized/B/b_1.mp4"
+    assert plan.items[0].requested_target_path == plan.items[0].target_path
     assert plan.items[1].risk_flags == ("目标已存在",)
