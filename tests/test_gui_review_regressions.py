@@ -2,6 +2,7 @@
 """GUI 评审回归：合成数据库与 Qt 离屏控件，不访问真实配置或素材。"""
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -10,7 +11,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from core.video_organizer_service import SettingsManager, VideoOrganizerService
 from gui.main_window import MainWindow
@@ -18,6 +19,7 @@ from gui.models.video_table import COL_FILENAME, COL_LIBRARY_ID
 from gui.views.material_library import MaterialLibraryView
 from gui.views.settings import SettingsView
 from gui.views.workstation import WorkstationView
+from gui.widgets.rename_dialog import BatchRenameDialog
 
 
 @pytest.fixture(scope="module")
@@ -403,3 +405,158 @@ def test_manual_xmp_sync_requires_confirmation_before_writing(service, tmp_path,
     assert "同名 .xmp 侧车" in prompt
     assert "若同名侧车已存在，将被覆盖" in prompt
     assert jobs == []
+
+
+def test_rename_preview_shows_full_paths_conflicts_and_keeps_exclusions_after_sort(
+    service, tmp_path, views
+):
+    source_b = tmp_path / "b.mp4"
+    source_a = tmp_path / "a.mp4"
+    source_b.write_bytes(b"b")
+    source_a.write_bytes(b"a")
+    videos = [
+        {"path": str(source_b), "filename": source_b.name, "category": "B", "tags": [], "summary": ""},
+        {"path": str(source_a), "filename": source_a.name, "category": "A", "tags": [], "summary": ""},
+    ]
+    dialog = BatchRenameDialog(service, videos)
+    views.append(dialog)
+    dialog._preview_date = "20261017"
+    dialog.pattern_input.setText("{date}-{category}-{original_name}")
+
+    expected_a = str(tmp_path / "20261017-A-a.mp4")
+    assert expected_a in [
+        dialog.preview_table.item(row, 2).text()
+        for row in range(dialog.preview_table.rowCount())
+    ]
+
+    Path(expected_a).write_bytes(b"existing target")
+    dialog.update_preview()
+    row_a = next(
+        row for row in range(dialog.preview_table.rowCount())
+        if dialog.preview_table.item(row, 1).text() == str(source_a)
+    )
+    assert "目标已存在" in dialog.preview_table.item(row_a, 3).text()
+    assert dialog.active_conflict_count == 1
+
+    dialog.preview_table.sortItems(1, Qt.AscendingOrder)
+    row_a = next(
+        row for row in range(dialog.preview_table.rowCount())
+        if dialog.preview_table.item(row, 1).text() == str(source_a)
+    )
+    dialog.preview_table.item(row_a, 0).setCheckState(Qt.Unchecked)
+    assert dialog.selected_source_paths() == [str(source_b)]
+    assert dialog.excluded_count == 1
+
+    dialog.search_input.setText("b.mp4")
+    assert all(
+        dialog.preview_table.isRowHidden(row)
+        == ("b.mp4" not in dialog.preview_table.item(row, 1).text())
+        for row in range(dialog.preview_table.rowCount())
+    )
+    assert dialog.selected_source_paths() == [str(source_b)]
+    dialog.close()
+
+
+def test_rename_preview_date_is_used_by_service_dry_run(service, tmp_path):
+    source = Path(_insert(service, tmp_path / "clip.mp4", category="A", tags=[], summary=""))
+    source.write_bytes(b"clip")
+
+    preview = service.batch_rename(
+        dry_run=True,
+        selected_paths=[str(source)],
+        custom_pattern="{date}-{original_name}",
+        date_value="20261017",
+    )
+
+    assert preview == [{
+        "old": "clip.mp4",
+        "new": "20261017-clip.mp4",
+        "path": str(source),
+    }]
+    assert source.exists()
+    assert not (source.parent / "20261017-clip.mp4").exists()
+
+
+def test_rename_confirmation_and_worker_use_preview_exclusion_snapshot(
+    service, tmp_path, views, monkeypatch
+):
+    first = str(tmp_path / "first.mp4")
+    second = str(tmp_path / "second.mp4")
+    for path in (first, second):
+        Path(path).write_bytes(b"clip")
+    service.set_work_scope_paths([first, second], scan=False)
+
+    class _FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class _FakeDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.Accepted
+
+        def get_final_config(self):
+            return {
+                "pattern": "{date}-{original_name}",
+                "find_regex": "",
+                "replace_str": "",
+                "preview_date": "20261017",
+            }
+
+        def selected_source_paths(self):
+            return [first]
+
+        @property
+        def active_conflict_count(self):
+            return 1
+
+        @property
+        def excluded_count(self):
+            return 1
+
+    workers = []
+
+    class _FakeWorker:
+        def __init__(self, *_args, **kwargs):
+            self.kwargs = kwargs
+            self.progress_updated = _FakeSignal()
+            self.task_finished = _FakeSignal()
+            workers.append(self)
+
+        def start(self):
+            pass
+
+    from types import SimpleNamespace
+
+    view = WorkstationView(service)
+    views.append(view)
+    view._resolve_batch_snapshot = lambda: SimpleNamespace(
+        target_paths=(first, second), scope_paths=(first, second)
+    )
+    monkeypatch.setattr(
+        service,
+        "get_videos_for_operation",
+        lambda *_args, **_kwargs: [
+            {"path": first, "filename": "first.mp4"},
+            {"path": second, "filename": "second.mp4"},
+        ],
+    )
+    confirmations = []
+    monkeypatch.setattr("gui.views.workstation.BatchRenameDialog", _FakeDialog)
+    monkeypatch.setattr("gui.views.workstation.RenameWorker", _FakeWorker)
+    monkeypatch.setattr(
+        "gui.views.workstation.QMessageBox.question",
+        lambda *args, **_kwargs: confirmations.append(args) or QMessageBox.Yes,
+    )
+
+    view.start_rename(dry_run=False)
+
+    assert len(workers) == 1
+    assert workers[0].kwargs["selected_paths"] == [first]
+    assert workers[0].kwargs["rename_date"] == "20261017"
+    assert len(confirmations) == 1
+    assert "实际处理 1 条" in confirmations[0][2]
+    assert "本次从预览中排除 1 条" in confirmations[0][2]
+    assert "执行时可能改用冲突路径" in confirmations[0][2]
