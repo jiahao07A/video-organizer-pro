@@ -5047,7 +5047,7 @@ class VideoOrganizerService:
             except Exception as e:
                 failed_items.append({"path": video_path, "reason": str(e) or e.__class__.__name__})
                 self.log(f"生成 XMP 失败 {video_path}: {e}")
-                
+
         self.log(f"元数据同步完成，生成了 {success_count} 个 XMP 文件。", ui=False)
         if return_details:
             return {
