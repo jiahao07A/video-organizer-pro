@@ -2193,8 +2193,9 @@ class VideoOrganizerService:
         *,
         db_path: Optional[str] = None,
         results_json: Optional[str] = None,
+        include_import_report: bool = True,
     ):
-        """服务层启动前检查；需要确认时不创建数据库。"""
+        """服务层启动前检查；可选择仅做无需全量读取的启动探测。"""
         coordinator = StartupUpgradeCoordinator(
             database_path=db_path if db_path is not None else DB_FILE,
             json_path=results_json if results_json is not None else RESULTS_FILE_JSON,
@@ -2202,7 +2203,7 @@ class VideoOrganizerService:
             settings_path=get_settings_file_path(),
             tag_config_path=TAG_CONFIG_FILE,
         )
-        return coordinator.inspect()
+        return coordinator.inspect(include_import_report=include_import_report)
 
     @staticmethod
     def run_startup_upgrade(

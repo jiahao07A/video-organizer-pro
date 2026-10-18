@@ -281,3 +281,70 @@ def test_service_startup_gate_exposes_confirmation_and_blocks_cancel(
 
     service = VideoOrganizerService(**kwargs, startup_upgrade_confirmed=True)
     assert service.db.get_video_by_path(str(tmp_path / "clip.mp4")) is not None
+
+
+def test_import_report_has_bounded_issue_details(tmp_path: Path):
+    duplicate = tmp_path / "duplicate.mp4"
+    rows = [_legacy_row(duplicate)]
+    rows.extend(_legacy_row(duplicate) for _ in range(250))
+    rows.extend({"filename": f"missing-{index}"} for index in range(250))
+    source = tmp_path / "video_analysis_results.json"
+    source.write_text(json.dumps(rows), encoding="utf-8")
+
+    result = _coordinator(tmp_path).inspect()
+
+    assert result.status is UpgradeStatus.NEEDS_CONFIRMATION
+    assert result.report["duplicate_row_count"] == 250
+    assert result.report["invalid_row_count"] == 250
+    assert len(result.report["duplicate_rows"]) == 100
+    assert len(result.report["invalid_rows"]) == 100
+    assert result.report["report_truncated"] is True
+
+
+def test_lightweight_database_inspection_skips_full_integrity_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "library.db"
+    DatabaseManager(str(db_path))
+    real_connect = upgrade_module.sqlite3.connect
+    queries = []
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, query, params=()):
+            queries.append(query)
+            return self.connection.execute(query, params)
+
+        def close(self):
+            self.connection.close()
+
+    def tracking_connect(*args, **kwargs):
+        return TrackingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(upgrade_module.sqlite3, "connect", tracking_connect)
+    inspection = inspect_database_file(str(db_path))
+
+    assert inspection.exists is True
+    assert not any("quick_check" in query.lower() for query in queries)
+
+
+def test_source_change_after_confirmation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "video_analysis_results.json"
+    source.write_text(json.dumps([_legacy_row(tmp_path / "original.mp4")]), encoding="utf-8")
+    coordinator = _coordinator(tmp_path)
+    original_snapshot = coordinator._create_source_snapshot
+
+    def change_source(expected_sha256):
+        source.write_text(json.dumps([_legacy_row(tmp_path / "changed.mp4")]), encoding="utf-8")
+        return original_snapshot(expected_sha256)
+
+    monkeypatch.setattr(coordinator, "_create_source_snapshot", change_source)
+    result = coordinator.execute(confirmed=True)
+
+    assert result.status is UpgradeStatus.FAILED
+    assert "旧 JSON 发生变化" in result.error
+    assert not (tmp_path / "library.db").exists()
