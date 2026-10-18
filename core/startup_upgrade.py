@@ -5,8 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -21,6 +24,7 @@ logger = logging.getLogger("VideoOrganizer.startup")
 CURRENT_DATABASE_VERSION = 1
 COMPLETION_METADATA_KEY = "legacy_json_import"
 DEFAULT_BATCH_SIZE = 200
+MAX_REPORT_ITEMS = 100
 UPGRADE_JOURNAL_NAME = ".startup-upgrade.json"
 
 
@@ -87,11 +91,13 @@ class _ImportPlan:
     total_rows: int
     invalid_rows: List[Dict[str, Any]]
     duplicate_rows: List[Dict[str, Any]]
+    invalid_row_count: int
+    duplicate_row_count: int
     source_sha256: str
 
     @property
     def skipped_rows(self) -> int:
-        return len(self.invalid_rows) + len(self.duplicate_rows)
+        return self.invalid_row_count + self.duplicate_row_count
 
     def report(self) -> Dict[str, Any]:
         return {
@@ -101,6 +107,12 @@ class _ImportPlan:
             "skipped_rows": self.skipped_rows,
             "invalid_rows": list(self.invalid_rows),
             "duplicate_rows": list(self.duplicate_rows),
+            "invalid_row_count": self.invalid_row_count,
+            "duplicate_row_count": self.duplicate_row_count,
+            "report_truncated": (
+                len(self.invalid_rows) < self.invalid_row_count
+                or len(self.duplicate_rows) < self.duplicate_row_count
+            ),
             "source_sha256": self.source_sha256,
         }
 
@@ -121,8 +133,12 @@ def _read_database_version(connection: sqlite3.Connection) -> int:
         raise DatabaseValidationError("数据库版本标记无效") from exc
 
 
-def inspect_database_file(path: str) -> DatabaseInspection:
-    """只读检查数据库，不创建文件、不建表、不把损坏库当成新库。"""
+def inspect_database_file(
+    path: str,
+    *,
+    verify_integrity: bool = False,
+) -> DatabaseInspection:
+    """检查数据库版本和核心结构；完整性扫描只在显式验证阶段执行。"""
     database_path = _database_path(path)
     if not os.path.exists(database_path):
         return DatabaseInspection(exists=False)
@@ -139,11 +155,12 @@ def inspect_database_file(path: str) -> DatabaseInspection:
             raise UnsupportedDatabaseVersion(
                 f"数据库版本 {version} 高于当前程序支持的版本 {CURRENT_DATABASE_VERSION}"
             )
-        check = connection.execute("PRAGMA quick_check").fetchone()
-        if not check or check[0] != "ok":
-            raise DatabaseValidationError(
-                f"SQLite 完整性检查失败: {database_path}"
-            )
+        if verify_integrity:
+            check = connection.execute("PRAGMA quick_check").fetchone()
+            if not check or check[0] != "ok":
+                raise DatabaseValidationError(
+                    f"SQLite 完整性检查失败: {database_path}"
+                )
         tables = {
             row[0]
             for row in connection.execute(
@@ -224,8 +241,8 @@ class StartupUpgradeCoordinator:
             tag_config_payload={},
         )
 
-    def inspect(self) -> UpgradeResult:
-        """执行轻量数据库检查；只在无数据库时读取旧 JSON。"""
+    def inspect(self, *, include_import_report: bool = True) -> UpgradeResult:
+        """检查数据库版本和核心结构；仅升级预检时读取旧 JSON。"""
         journal = self._read_upgrade_journal()
         if journal is not None:
             if journal.get("status") == "complete":
@@ -255,6 +272,14 @@ class StartupUpgradeCoordinator:
                 database_path=self.database_path,
                 json_path=self.json_path,
                 message="没有旧数据库或旧 JSON，无需迁移。",
+            )
+
+        if not include_import_report:
+            return UpgradeResult(
+                status=UpgradeStatus.NEEDS_CONFIRMATION,
+                database_path=self.database_path,
+                json_path=self.json_path,
+                message="检测到仅有旧 JSON，需要确认后才会首次导入。",
             )
 
         try:
@@ -313,10 +338,12 @@ class StartupUpgradeCoordinator:
         if latest.report.get("source_sha256") != plan.source_sha256:
             return self._failure("用户确认后旧 JSON 发生变化，已停止导入，请重新确认。")
 
+        source_snapshot = ""
         database_created = False
         backup_path = ""
         manager = None
         try:
+            source_snapshot = self._create_source_snapshot(plan.source_sha256)
             self._write_upgrade_journal(
                 {
                     "status": "in_progress",
@@ -338,7 +365,7 @@ class StartupUpgradeCoordinator:
             self._notify_progress(on_progress, 0, total)
             imported = 0
             batch: List[Dict[str, Any]] = []
-            for row in self._iter_valid_import_rows():
+            for row in self._iter_valid_import_rows(source_snapshot):
                 batch.append(row)
                 if len(batch) < self.batch_size:
                     continue
@@ -352,7 +379,7 @@ class StartupUpgradeCoordinator:
                 self._notify_progress(on_progress, imported, total)
 
             # 只有数据写入、完整性检查和完成记录都成功，才算启用迁移结果。
-            inspect_database_file(self.database_path)
+            inspect_database_file(self.database_path, verify_integrity=True)
             completion = {
                 "status": "complete",
                 "source_sha256": plan.source_sha256,
@@ -362,7 +389,7 @@ class StartupUpgradeCoordinator:
                 "completion_id": uuid.uuid4().hex,
             }
             database.set_storage_metadata(COMPLETION_METADATA_KEY, completion)
-            inspect_database_file(self.database_path)
+            inspect_database_file(self.database_path, verify_integrity=True)
             self._write_upgrade_journal(
                 {
                     "status": "complete",
@@ -393,6 +420,12 @@ class StartupUpgradeCoordinator:
             result = self._failure(message)
             result.backup_path = backup_path
             return result
+        finally:
+            if source_snapshot:
+                try:
+                    os.remove(source_snapshot)
+                except OSError:
+                    logger.warning("无法清理旧 JSON 导入临时快照: %s", source_snapshot)
 
     def _load_import_plan(self) -> _ImportPlan:
         source_sha256 = self._sha256_file(self.json_path)
@@ -400,50 +433,85 @@ class StartupUpgradeCoordinator:
         valid_rows = 0
         invalid_rows: List[Dict[str, Any]] = []
         duplicate_rows: List[Dict[str, Any]] = []
-        seen_paths = set()
-        for row_number, item in enumerate(self._iter_json_array_items(), start=1):
-            total_rows += 1
-            if not isinstance(item, dict):
-                invalid_rows.append({"row": row_number, "reason": "row_not_object"})
-                continue
-            raw_path = item.get("path")
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                invalid_rows.append({"row": row_number, "reason": "missing_path"})
-                continue
-            path_key = _normalized_path(raw_path.strip())
-            if path_key in seen_paths:
-                duplicate_rows.append({"row": row_number, "reason": "duplicate_path"})
-                continue
-            seen_paths.add(path_key)
-            valid_rows += 1
+        invalid_row_count = 0
+        duplicate_row_count = 0
+        with self._path_index() as path_index:
+            for row_number, item in enumerate(self._iter_json_array_items(), start=1):
+                total_rows += 1
+                if not isinstance(item, dict):
+                    invalid_row_count += 1
+                    if len(invalid_rows) < MAX_REPORT_ITEMS:
+                        invalid_rows.append({"row": row_number, "reason": "row_not_object"})
+                    continue
+                raw_path = item.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    invalid_row_count += 1
+                    if len(invalid_rows) < MAX_REPORT_ITEMS:
+                        invalid_rows.append({"row": row_number, "reason": "missing_path"})
+                    continue
+                path_key = _normalized_path(raw_path.strip())
+                try:
+                    path_index.execute(
+                        "INSERT INTO seen_paths(path) VALUES (?)", (path_key,)
+                    )
+                except sqlite3.IntegrityError:
+                    duplicate_row_count += 1
+                    if len(duplicate_rows) < MAX_REPORT_ITEMS:
+                        duplicate_rows.append({"row": row_number, "reason": "duplicate_path"})
+                    continue
+                valid_rows += 1
         return _ImportPlan(
             valid_rows=valid_rows,
             total_rows=total_rows,
             invalid_rows=invalid_rows,
             duplicate_rows=duplicate_rows,
+            invalid_row_count=invalid_row_count,
+            duplicate_row_count=duplicate_row_count,
             source_sha256=source_sha256,
         )
 
-    def _iter_valid_import_rows(self) -> Iterator[Dict[str, Any]]:
-        """第二次流式读取，仅产生有效且去重后的行，保持内存有界。"""
-        seen_paths = set()
-        for item in self._iter_json_array_items():
-            if not isinstance(item, dict):
-                continue
-            raw_path = item.get("path")
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                continue
-            path_key = _normalized_path(raw_path.strip())
-            if path_key in seen_paths:
-                continue
-            seen_paths.add(path_key)
-            yield dict(item)
+    @contextmanager
+    def _path_index(self) -> Iterator[sqlite3.Connection]:
+        """使用磁盘临时 SQLite 索引保存去重键，避免按记录数增长的 Python 集合。"""
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="video-organizer-import-", suffix=".sqlite", delete=False
+        )
+        temp_path = temp_file.name
+        temp_file.close()
+        connection = sqlite3.connect(temp_path)
+        try:
+            connection.execute("CREATE TABLE seen_paths (path TEXT PRIMARY KEY)")
+            yield connection
+        finally:
+            connection.close()
+            try:
+                os.remove(temp_path)
+            except OSError:
+                logger.warning("无法清理导入去重索引: %s", temp_path)
 
-    def _iter_json_array_items(self) -> Iterator[Any]:
-        """以固定大小缓冲流式解析旧 JSON 数组，不把整个文件载入内存。"""
+    def _iter_valid_import_rows(self, source_path: str) -> Iterator[Dict[str, Any]]:
+        """第二次流式读取，仅产生有效且去重后的行；去重索引落在磁盘。"""
+        with self._path_index() as path_index:
+            for item in self._iter_json_array_items(source_path):
+                if not isinstance(item, dict):
+                    continue
+                raw_path = item.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                path_key = _normalized_path(raw_path.strip())
+                try:
+                    path_index.execute(
+                        "INSERT INTO seen_paths(path) VALUES (?)", (path_key,)
+                    )
+                except sqlite3.IntegrityError:
+                    continue
+                yield dict(item)
+
+    def _iter_json_array_items(self, source_path: Optional[str] = None) -> Iterator[Any]:
+        """以固定大小缓冲流式解析 JSON 数组，不把整个文件载入内存。"""
         decoder = json.JSONDecoder()
         chunk_size = 64 * 1024
-        with open(self.json_path, "r", encoding="utf-8") as handle:
+        with open(source_path or self.json_path, "r", encoding="utf-8") as handle:
             buffer = ""
             position = 0
             end_of_file = False
@@ -514,6 +582,27 @@ class StartupUpgradeCoordinator:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    def _create_source_snapshot(self, expected_sha256: str) -> str:
+        """确认后创建临时源快照，并只从摘要一致的快照导入。"""
+        os.makedirs(self.backup_dir, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            prefix=".legacy-json-", suffix=".snapshot", dir=self.backup_dir, delete=False
+        )
+        snapshot_path = handle.name
+        handle.close()
+        try:
+            shutil.copy2(self.json_path, snapshot_path)
+            actual_sha256 = self._sha256_file(snapshot_path)
+            if actual_sha256 != expected_sha256:
+                raise ValueError("确认后旧 JSON 发生变化，已停止导入，请重新确认。")
+            return snapshot_path
+        except Exception:
+            try:
+                os.remove(snapshot_path)
+            except OSError:
+                pass
+            raise
 
     def _upgrade_journal_path(self) -> str:
         return os.path.join(self.backup_dir, UPGRADE_JOURNAL_NAME)
