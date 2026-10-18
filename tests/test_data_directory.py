@@ -73,7 +73,9 @@ def test_legacy_layout_is_reported_before_unlocated_default_data(tmp_path: Path)
     assert "video_organizer.db" in inspection.legacy_items
 
 
-
+def test_legacy_migration_copies_database_config_and_thumbnail_without_moving_source(
+    tmp_path: Path,
+):
     source = tmp_path / "app"
     source.mkdir()
     (source / "settings.json").write_text('{"marker": "safe"}', encoding="utf-8")
