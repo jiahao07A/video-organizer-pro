@@ -10,6 +10,7 @@ Blocked by: 01（[#8](https://github.com/jiahao07A/video-organizer-pro/issues/8)
 
 Spec: [父规格](../spec.md)
 Branch: `feat/9-gated-one-time-upgrade`
+PR: [#30](https://github.com/jiahao07A/video-organizer-pro/pull/30)
 
 ## 要交付的行为
 
@@ -52,3 +53,7 @@ Branch: `feat/9-gated-one-time-upgrade`
 - 新增 `tests/test_startup_upgrade.py`，覆盖正常导入、取消、有效数据库优先、损坏 JSON/数据库、未知版本、重复/无效行、流式大行、备份/写入失败、重启恢复与幂等启动。
 - 验证：`python -m pytest -q` 为 360 passed；`python -m compileall -q core gui tests` 和 `git diff --check` 通过。GUI 确认/进度门禁仍不在本切片范围内。
 - 当前分支：`feat/9-gated-one-time-upgrade`；PR 创建后补充链接。
+
+### 2026-10-18 PR 创建
+
+已推送 commit `4809d22` 并创建 PR [#30](https://github.com/jiahao07A/video-organizer-pro/pull/30)。PR 当前开放审阅；合并前保留 GUI 确认/进度门禁未完成的限制，Issue 不在本切片提前关闭。
