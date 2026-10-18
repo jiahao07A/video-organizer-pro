@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Signal, Qt
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
-from core.data_directory import DataDirectoryError, DataDirectoryState
+from core.data_directory import DataDirectoryError
 from core.model_providers import (
     MAX_PROVIDERS,
     ProviderLimitError,
