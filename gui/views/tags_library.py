@@ -412,6 +412,7 @@ class PendingReviewView(QWidget):
         count = len(self.list_widget.selectedItems())
         self.selection_count_label.setText(f"已选 {count} 条")
 
+    def reload(self):
         """刷新待审列表、筛选器、标准词选择器与组下拉。"""
         self.refresh_group_combo()
         self.refresh_group_filter()

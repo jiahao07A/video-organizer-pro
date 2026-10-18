@@ -179,6 +179,7 @@ def test_settings_effective_config_summary_hides_credentials(service, views):
         api_key="secret-test-key",
         base_url="https://provider.example/v1",
     )
+    service.settings.setdefault("processing", {})["auto_sync_xmp_after_analysis"] = False
     view = SettingsView(service)
     views.append(view)
 
