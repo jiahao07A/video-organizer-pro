@@ -50,3 +50,7 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 已完成并提交 `2916a7a`，创建 PR [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)。显式传入数据库/结果路径的服务实例使用调用方目录下的设置、标签配置、备份、缩略图和结果路径；无参数默认应用路径仍保留程序旁旧布局门禁。普通目录定位使用轻量数据库版本/核心结构检查，复制验证阶段执行完整性检查。设置页已接入目录查看、显式打开已有目录和受控搬迁入口。
 
 验证：`python -m pytest -q` 为 373 passed；`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py` 通过；`git diff --check` 通过。工作区既有未跟踪资料未纳入提交，源旧布局未删除或覆盖。
+
+### 2026-10-18 补充回归
+
+补充独立的旧布局迁移测试，并清理设置页未使用导入，提交 `8629fe4` 已推送到 PR #32。最终全量验证为 `python -m pytest -q`：374 passed；编译检查和 `git diff --check` 仍通过。
