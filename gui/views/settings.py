@@ -3,10 +3,11 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, 
     QFrame, QFormLayout, QGroupBox, QLineEdit, QSpinBox, 
     QCheckBox, QPushButton, QMessageBox, QTabWidget, QPlainTextEdit,
-    QComboBox, QListWidget, QListWidgetItem, QAbstractItemView
+    QComboBox, QListWidget, QListWidgetItem, QAbstractItemView, QFileDialog
 )
 from PySide6.QtCore import Signal, Qt
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
+from core.data_directory import DataDirectoryError, DataDirectoryState
 from core.model_providers import (
     MAX_PROVIDERS,
     ProviderLimitError,
@@ -443,6 +444,55 @@ class SettingsView(QWidget):
                 results.setCurrentItem(item)
                 break
 
+    def _data_directory_text(self) -> str:
+        try:
+            inspection = self.service.data_directory_inspection()
+            return f"当前目录：{inspection.active_root}\n状态：{inspection.message}"
+        except Exception as exc:
+            return f"当前目录不可用：{exc}"
+
+    def _choose_data_directory(self) -> None:
+        target = QFileDialog.getExistingDirectory(self, "选择管理数据目录")
+        if not target:
+            return
+        try:
+            from core.data_directory import DataDirectoryManager
+
+            manager = DataDirectoryManager()
+            if manager.has_management_data(target):
+                answer = QMessageBox.question(
+                    self,
+                    "打开已有数据目录",
+                    "目标目录已有管理数据。是否打开该目录？\n不会与当前目录合并。重启应用后生效。",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+                manager.open_existing(target)
+            else:
+                answer = QMessageBox.question(
+                    self,
+                    "确认搬迁管理数据",
+                    "将当前管理数据复制到目标目录，验证成功后切换；原目录会保留。\n"
+                    "原始视频不会移动。是否继续？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+                self.service.migrate_data_directory(target)
+            self.data_directory_label.setText(
+                f"已选择：{target}\n请重启应用后使用新目录。"
+            )
+            QMessageBox.information(
+                self,
+                "目录已准备",
+                "目录已验证并记录。请重启应用后使切换生效；当前窗口继续使用原目录。",
+            )
+        except DataDirectoryError as exc:
+            QMessageBox.critical(self, "数据目录操作失败", str(exc))
+
     # —— 页签 ——
 
     def create_general_tab(self):
@@ -457,6 +507,27 @@ class SettingsView(QWidget):
         form = QFormLayout(container)
         form.setSpacing(15)
         
+        # 管理数据目录：路径选择只改变下次启动的活动目录，不移动原始视频。
+        data_group = QGroupBox("管理数据目录")
+        data_layout = QVBoxLayout(data_group)
+        data_row = QHBoxLayout()
+        self.data_directory_label = QLabel()
+        self.data_directory_label.setWordWrap(True)
+        self.data_directory_label.setText(self._data_directory_text())
+        data_row.addWidget(self.data_directory_label, 1)
+        self.data_directory_btn = QPushButton("选择或搬迁目录")
+        self.data_directory_btn.clicked.connect(self._choose_data_directory)
+        data_row.addWidget(self.data_directory_btn)
+        data_layout.addLayout(data_row)
+        data_hint = QLabel(
+            "管理数据包括数据库、设置、标签配置、备份和缩略图；原始视频路径不会因目录搬迁改变。"
+            "目标已有数据时只能显式打开，不会自动合并。"
+        )
+        data_hint.setWordWrap(True)
+        data_hint.setStyleSheet("color: #888; font-size: 12px;")
+        data_layout.addWidget(data_hint)
+        form.addRow(data_group)
+
         # 处理配置
         proc_group = QGroupBox("处理配置")
         proc_form = QFormLayout(proc_group)

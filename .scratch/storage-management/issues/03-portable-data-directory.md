@@ -1,6 +1,6 @@
 # 03：统一便携数据目录
 
-Status: ready-for-agent
+Status: claimed
 
 GitHub Issue: [#10](https://github.com/jiahao07A/video-organizer-pro/issues/10)
 
@@ -9,6 +9,7 @@ Parent: [#7](https://github.com/jiahao07A/video-organizer-pro/issues/7)
 Blocked by: 02（[#9](https://github.com/jiahao07A/video-organizer-pro/issues/9)，一次性升级迁移）
 
 Spec: [父规格](../spec.md)
+Branch: `feat/10-portable-data-directory`
 
 ## 要交付的行为
 
@@ -39,6 +40,6 @@ Spec: [父规格](../spec.md)
 
 ## Comments
 
-### 2026-10-11 任务发布
+### 2026-10-18 任务启动
 
-用户确认依赖 02。本次未实施，须等待前置验收和集成后在独立实现分支推进。
+#9 已通过 PR [#30](https://github.com/jiahao07A/video-organizer-pro/pull/30) 合入 `main`（合并提交 `b93031d614adb99ab8de07efd2ad830bf3f50a93`），本任务从最新主干创建 `feat/10-portable-data-directory`。本轮先交付核心路径定位、默认/自选目录、显式目标冲突和可恢复搬迁协议；GUI 设置入口与人工 Windows 走查随核心协议一并接入，统一数据目录以外的性能验收不纳入本任务。

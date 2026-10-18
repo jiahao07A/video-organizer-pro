@@ -37,6 +37,13 @@ from core.startup_upgrade import (
     StartupUpgradeError,
     UpgradeStatus,
 )
+from core.data_directory import (
+    DataDirectoryManager,
+    DataDirectoryInspection,
+    DataDirectoryState,
+    DataPaths,
+    LegacyLayoutDetected,
+)
 from core.video_catalog import VideoCatalog, VideoQuery
 from core.physical_migration import (
     build_physical_migration_plan,
@@ -80,31 +87,155 @@ _CORE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_CORE_DIR)
 
 
+def _service_data_manager() -> DataDirectoryManager:
+    if getattr(sys, "frozen", False):
+        application_directory = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        application_directory = _PROJECT_ROOT
+    return DataDirectoryManager(application_directory=application_directory)
+
+
 def get_settings_file_path() -> str:
-    """可写配置路径：开发环境固定在项目根；打包后放可执行文件旁。"""
-    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
-        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath(".")
-        return os.path.join(base, "settings.json")
-    return os.path.join(_PROJECT_ROOT, "settings.json")
+    """兼容入口：返回当前活动数据目录中的设置文件。"""
+    return get_data_paths().settings
 
 
 def get_tag_config_file_path() -> str:
-    """可写标签配置路径；打包后放在可执行文件旁，避免改动 PyInstaller 资源目录。"""
-    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
-        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath(".")
-        return os.path.join(base, "tag_config.json")
+    """兼容入口：返回当前活动数据目录中的标签配置文件。"""
+    return get_data_paths().tag_config
+
+
+def get_data_paths() -> DataPaths:
+    """按程序位置解析当前管理数据目录，不依赖进程工作目录。"""
+    manager = _service_data_manager()
+    inspection = manager.inspect()
+    if inspection.state is DataDirectoryState.LEGACY:
+        raise LegacyLayoutDetected(inspection)
+    return manager.resolve_active_paths(allow_legacy=False)
+
+
+def get_application_directory() -> str:
+    return _service_data_manager().application_directory
+
+
+def _legacy_settings_path() -> str:
+    return os.path.join(_PROJECT_ROOT, "settings.json")
+
+
+def _legacy_tag_config_path() -> str:
     return os.path.join(_PROJECT_ROOT, "tag_config.json")
 
 
-SETTINGS_FILE = get_settings_file_path()
-RESULTS_FILE_JSON = "video_analysis_results.json"
-RESULTS_FILE_CSV = "video_analysis_results.csv"
-BACKUP_DIR = "backups"
-THUMBNAILS_DIR = ".thumbnails"
-DB_FILE = "video_organizer.db"
+_INITIAL_DATA_PATHS = _service_data_manager().default_paths()
+SETTINGS_FILE = _INITIAL_DATA_PATHS.settings
+RESULTS_FILE_JSON = _INITIAL_DATA_PATHS.results_json
+RESULTS_FILE_CSV = _INITIAL_DATA_PATHS.results_csv
+BACKUP_DIR = _INITIAL_DATA_PATHS.backups
+THUMBNAILS_DIR = _INITIAL_DATA_PATHS.thumbnails
+DB_FILE = _INITIAL_DATA_PATHS.database
 ENV_FILE = get_resource_path(".env")
 DICTIONARY_FILE = os.path.join(_PROJECT_ROOT, "词.txt")
-TAG_CONFIG_FILE = get_tag_config_file_path()
+TAG_CONFIG_FILE = _INITIAL_DATA_PATHS.tag_config
+
+
+def _uses_initial_path(current: str, initial: str) -> bool:
+    return os.path.normcase(os.path.abspath(current)) == os.path.normcase(os.path.abspath(initial))
+
+
+def get_active_tag_config_file_path() -> str:
+    if _uses_initial_path(TAG_CONFIG_FILE, _INITIAL_DATA_PATHS.tag_config):
+        return get_data_paths().tag_config
+    return TAG_CONFIG_FILE
+
+
+def get_active_backup_dir() -> str:
+    if _uses_initial_path(BACKUP_DIR, _INITIAL_DATA_PATHS.backups):
+        return get_data_paths().backups
+    return BACKUP_DIR
+
+
+def get_data_directory_inspection():
+    return _service_data_manager().inspect()
+
+
+def migrate_data_directory(target_root: str) -> DataPaths:
+    return _service_data_manager().migrate_active(target_root)
+
+
+def get_active_results_json_path() -> str:
+    if _uses_initial_path(RESULTS_FILE_JSON, _INITIAL_DATA_PATHS.results_json):
+        return get_data_paths().results_json
+    return RESULTS_FILE_JSON
+
+
+def get_active_results_csv_path() -> str:
+    if _uses_initial_path(RESULTS_FILE_CSV, _INITIAL_DATA_PATHS.results_csv):
+        return get_data_paths().results_csv
+    return RESULTS_FILE_CSV
+
+
+def get_active_thumbnails_dir() -> str:
+    if _uses_initial_path(THUMBNAILS_DIR, _INITIAL_DATA_PATHS.thumbnails):
+        return get_data_paths().thumbnails
+    return THUMBNAILS_DIR
+
+
+# 这些引用用于识别测试/嵌入式调用方显式注入的路径。默认应用路径仍必须
+# 经过 get_data_paths()，从而保留旧布局门禁。
+_DEFAULT_SETTINGS_PATH_RESOLVER = get_settings_file_path
+_DEFAULT_TAG_CONFIG_PATH_RESOLVER = get_active_tag_config_file_path
+_DEFAULT_BACKUP_PATH_RESOLVER = get_active_backup_dir
+
+
+def _resolve_storage_paths(
+    *,
+    db_path: Optional[str] = None,
+    results_json: Optional[str] = None,
+    results_csv: Optional[str] = None,
+) -> tuple[DataPaths, str, str, str]:
+    """解析服务实例使用的管理数据路径。
+
+    未显式传入路径时走默认应用路径，旧布局仍会被严格阻止。只要调用方
+    显式提供任一存储路径，就把该调用视为临时/嵌入式服务路径，以数据库
+    （或结果文件）所在目录作为管理数据根，不触发项目根旧布局门禁。
+    """
+    if db_path is None and results_json is None and results_csv is None:
+        paths = get_data_paths()
+        return paths, paths.settings, paths.tag_config, paths.backups
+
+    anchor = db_path or results_json or results_csv
+    assert anchor is not None
+    custom_root = os.path.dirname(os.path.abspath(os.fspath(anchor)))
+    paths = DataPaths.from_root(custom_root)
+
+    # 保留既有测试/嵌入式调用的显式注入点；未注入时使用自定义根目录。
+    settings_path = paths.settings
+    if get_settings_file_path is not _DEFAULT_SETTINGS_PATH_RESOLVER:
+        try:
+            settings_path = os.path.abspath(get_settings_file_path())
+        except Exception:
+            settings_path = paths.settings
+
+    tag_config_path = paths.tag_config
+    if get_active_tag_config_file_path is not _DEFAULT_TAG_CONFIG_PATH_RESOLVER:
+        try:
+            tag_config_path = os.path.abspath(get_active_tag_config_file_path())
+        except Exception:
+            tag_config_path = paths.tag_config
+    elif not _uses_initial_path(TAG_CONFIG_FILE, _INITIAL_DATA_PATHS.tag_config):
+        tag_config_path = os.path.abspath(TAG_CONFIG_FILE)
+
+    backup_dir = paths.backups
+    if get_active_backup_dir is not _DEFAULT_BACKUP_PATH_RESOLVER:
+        try:
+            backup_dir = os.path.abspath(get_active_backup_dir())
+        except Exception:
+            backup_dir = paths.backups
+    elif not _uses_initial_path(BACKUP_DIR, _INITIAL_DATA_PATHS.backups):
+        backup_dir = os.path.abspath(BACKUP_DIR)
+
+    return paths, settings_path, tag_config_path, backup_dir
+
 
 DEFAULT_SETTINGS = {
     "api": {
@@ -591,6 +722,13 @@ class DatabaseManager:
                 )
                 conn.commit()
 
+    def _resolve_thumbnail_reference(self, reference: Optional[str]) -> Optional[str]:
+        if not reference:
+            return reference
+        if os.path.isabs(str(reference)):
+            return str(reference)
+        return os.path.abspath(os.path.join(os.path.dirname(self.db_path), str(reference)))
+
     def get_video_by_path(self, path: str) -> Optional[Dict]:
         """按路径取单条视频记录；不存在则返回 None。"""
         rows = self.execute_query("SELECT * FROM videos WHERE path = ?", (path,))
@@ -663,7 +801,7 @@ class DatabaseManager:
         d["quality_score"] = None
         d["is_proxy_needed"] = 0
         d["tag_weights"] = {}
-        d["thumbnail_path"] = d["thumbnail"]
+        d["thumbnail_path"] = self._resolve_thumbnail_reference(d["thumbnail"])
         # 入库编号：使用表主键 id（稳定、首次入库分配）
         if d.get("id") is not None:
             d["library_id"] = d["id"]
@@ -787,7 +925,7 @@ class DatabaseManager:
             d["is_proxy_needed"] = 0
             d["tag_weights"] = {}
                 
-            d["thumbnail_path"] = d["thumbnail"]
+            d["thumbnail_path"] = self._resolve_thumbnail_reference(d["thumbnail"])
             if d.get("id") is not None:
                 d["library_id"] = d["id"]
             else:
@@ -1061,17 +1199,33 @@ class SettingsManager:
         val[keys[-1]] = value
 
     @staticmethod
-    def load_settings(db: Optional[DatabaseManager] = None) -> Dict:
+    def _settings_path(db: Optional[DatabaseManager] = None, settings_path: Optional[str] = None) -> str:
+        if settings_path is not None:
+            return os.path.abspath(os.fspath(settings_path))
+        # 显式数据库服务的配置跟随数据库目录；无数据库时仍使用默认应用目录
+        # 解析，以保留默认启动的旧布局门禁。
+        if db is not None and getattr(db, "db_path", None):
+            return os.path.join(
+                os.path.dirname(os.path.abspath(db.db_path)),
+                os.path.basename(SETTINGS_FILE),
+            )
+        return get_settings_file_path()
+
+    @staticmethod
+    def load_settings(
+        db: Optional[DatabaseManager] = None,
+        settings_path: Optional[str] = None,
+    ) -> Dict:
         """
         加载配置：默认值深拷贝 → settings.json → 数据库整包备份（settings_blob）。
         """
         settings = SettingsManager.deep_copy_defaults()
-        settings_path = get_settings_file_path()
+        resolved_settings_path = SettingsManager._settings_path(db, settings_path)
 
         # 1. 文件
-        if os.path.exists(settings_path):
+        if os.path.exists(resolved_settings_path):
             try:
-                with open(settings_path, "r", encoding="utf-8") as f:
+                with open(resolved_settings_path, "r", encoding="utf-8") as f:
                     file_settings = json.load(f)
                 if isinstance(file_settings, dict):
                     SettingsManager.deep_update(settings, file_settings)
@@ -1099,10 +1253,14 @@ class SettingsManager:
         return settings
 
     @staticmethod
-    def save_settings(settings: Dict, db: Optional[DatabaseManager] = None):
+    def save_settings(
+        settings: Dict,
+        db: Optional[DatabaseManager] = None,
+        settings_path: Optional[str] = None,
+    ):
         """保存完整嵌套配置到 settings.json，并写入数据库 settings_blob。"""
         import copy
-        settings_path = get_settings_file_path()
+        resolved_settings_path = SettingsManager._settings_path(db, settings_path)
         if settings is not None:
             try:
                 from core.model_providers import ensure_providers
@@ -1119,7 +1277,7 @@ class SettingsManager:
 
         # 原子写入，避免半截 JSON；与管理数据快照共享进程内边界。
         with STORAGE_IO_LOCK:
-            write_json_atomic(settings_path, payload)
+            write_json_atomic(resolved_settings_path, payload)
 
             if db:
                 # 数据库写入失败必须向调用方传播：文件已落盘但数据库未同步时，界面不能显示“已保存”。
@@ -1132,6 +1290,9 @@ class SettingsManager:
 
 class VideoProcessor:
     """处理视频文件：抽帧、压缩、场景检测、哈希计算"""
+
+    def __init__(self, thumbnails_dir: Optional[str] = None):
+        self.thumbnails_dir = thumbnails_dir or THUMBNAILS_DIR
     
     @staticmethod
     def get_file_hash(file_path: str) -> str:
@@ -1184,7 +1345,8 @@ class VideoProcessor:
 
     @classmethod
     def extract_frames(cls, video_path: str, max_frames: int = 10, target_size: int = 512,
-                       save_thumbnail: bool = False, use_scene_detection: bool = True) -> Dict[str, Any]:
+                       save_thumbnail: bool = False, use_scene_detection: bool = True,
+                       thumbnails_dir: Optional[str] = None) -> Dict[str, Any]:
         logger.debug(f"开始抽取视频帧: {video_path} (最大帧数: {max_frames})")
         if not os.path.exists(video_path):
             logger.warning(f"文件不存在: {video_path}")
@@ -1228,17 +1390,18 @@ class VideoProcessor:
                         phash = cls.calculate_phash(frame)
                         
                         if save_thumbnail:
-                            if not os.path.exists(THUMBNAILS_DIR):
-                                os.makedirs(THUMBNAILS_DIR)
+                            thumbnail_root = thumbnails_dir or THUMBNAILS_DIR
+                            if not os.path.exists(thumbnail_root):
+                                os.makedirs(thumbnail_root)
                             file_hash = hashlib.md5(video_path.encode()).hexdigest()
                             # V4.0: 使用 WebP 进行极致压缩 (三级缓存之磁盘缩略图)
-                            thumbnail_path = os.path.join(THUMBNAILS_DIR, f"{file_hash}.webp")
+                            thumbnail_path = os.path.join(thumbnail_root, f"{file_hash}.webp")
                             try:
                                 # 尝试使用 WebP，如果不支持则退回到 JPEG
                                 # frame 为 BGR，与 cv2.imwrite 一致，色相正确
                                 cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_WEBP_QUALITY), 80])
                             except Exception:
-                                thumbnail_path = os.path.join(THUMBNAILS_DIR, f"{file_hash}.jpg")
+                                thumbnail_path = os.path.join(thumbnails_dir or THUMBNAILS_DIR, f"{file_hash}.jpg")
                                 cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
                     # 保持 BGR：cv2.imencode 按 BGR 写 JPEG；切勿先转 RGB 再 encode
@@ -2188,6 +2351,22 @@ def dedupe_scope_paths(paths: List[str]) -> List[str]:
 class VideoOrganizerService:
     """Core Service Layer: 处理所有业务逻辑"""
 
+    def data_directory_inspection(self):
+        if not self._uses_explicit_storage_paths:
+            return get_data_directory_inspection()
+        return DataDirectoryInspection(
+            state=DataDirectoryState.ACTIVE,
+            application_directory=os.path.dirname(self._data_paths.root),
+            default_root=self._data_paths.root,
+            active_root=self._data_paths.root,
+            locator_path="",
+            message="当前服务使用调用方显式指定的数据目录。",
+        )
+
+    @staticmethod
+    def migrate_data_directory(target_root: str) -> DataPaths:
+        return migrate_data_directory(target_root)
+
     @staticmethod
     def inspect_startup_upgrade(
         *,
@@ -2196,12 +2375,18 @@ class VideoOrganizerService:
         include_import_report: bool = True,
     ):
         """服务层启动前检查；可选择仅做无需全量读取的启动探测。"""
+        active_paths, settings_path, tag_config_path, backup_dir = _resolve_storage_paths(
+            db_path=db_path,
+            results_json=results_json,
+        )
+        database_path = db_path if db_path is not None else active_paths.database
+        json_path = results_json if results_json is not None else active_paths.results_json
         coordinator = StartupUpgradeCoordinator(
-            database_path=db_path if db_path is not None else DB_FILE,
-            json_path=results_json if results_json is not None else RESULTS_FILE_JSON,
-            backup_dir=BACKUP_DIR,
-            settings_path=get_settings_file_path(),
-            tag_config_path=TAG_CONFIG_FILE,
+            database_path=database_path,
+            json_path=json_path,
+            backup_dir=backup_dir,
+            settings_path=settings_path,
+            tag_config_path=tag_config_path,
         )
         return coordinator.inspect(include_import_report=include_import_report)
 
@@ -2214,12 +2399,18 @@ class VideoOrganizerService:
         on_progress: Optional[Callable[[int, int], None]] = None,
     ):
         """服务层显式执行一次旧 JSON 首次导入。"""
+        active_paths, settings_path, tag_config_path, backup_dir = _resolve_storage_paths(
+            db_path=db_path,
+            results_json=results_json,
+        )
+        database_path = db_path if db_path is not None else active_paths.database
+        json_path = results_json if results_json is not None else active_paths.results_json
         coordinator = StartupUpgradeCoordinator(
-            database_path=db_path if db_path is not None else DB_FILE,
-            json_path=results_json if results_json is not None else RESULTS_FILE_JSON,
-            backup_dir=BACKUP_DIR,
-            settings_path=get_settings_file_path(),
-            tag_config_path=TAG_CONFIG_FILE,
+            database_path=database_path,
+            json_path=json_path,
+            backup_dir=backup_dir,
+            settings_path=settings_path,
+            tag_config_path=tag_config_path,
         )
         return coordinator.execute(confirmed=confirmed, on_progress=on_progress)
     
@@ -2233,13 +2424,28 @@ class VideoOrganizerService:
         results_csv: Optional[str] = None,
         startup_upgrade_confirmed: Optional[bool] = None,
     ):
-        effective_db_path = db_path if db_path is not None else DB_FILE
-        effective_json_path = results_json if results_json is not None else RESULTS_FILE_JSON
+        (
+            storage_paths,
+            settings_path,
+            tag_config_path,
+            backup_dir,
+        ) = _resolve_storage_paths(
+            db_path=db_path,
+            results_json=results_json,
+            results_csv=results_csv,
+        )
+        effective_db_path = db_path if db_path is not None else storage_paths.database
+        effective_json_path = (
+            results_json if results_json is not None else storage_paths.results_json
+        )
+        effective_csv_path = (
+            results_csv if results_csv is not None else storage_paths.results_csv
+        )
         recovery_manager = StorageBackupManager(
             database_path=effective_db_path,
-            settings_path=get_settings_file_path(),
-            tag_config_path=TAG_CONFIG_FILE,
-            backup_dir=BACKUP_DIR,
+            settings_path=settings_path,
+            tag_config_path=tag_config_path,
+            backup_dir=backup_dir,
         )
         try:
             recovery_manager.recover_pending_restore()
@@ -2250,9 +2456,9 @@ class VideoOrganizerService:
         startup_upgrade = StartupUpgradeCoordinator(
             database_path=effective_db_path,
             json_path=effective_json_path,
-            backup_dir=BACKUP_DIR,
-            settings_path=get_settings_file_path(),
-            tag_config_path=TAG_CONFIG_FILE,
+            backup_dir=backup_dir,
+            settings_path=settings_path,
+            tag_config_path=tag_config_path,
         )
         upgrade_result = startup_upgrade.inspect()
         if upgrade_result.status == UpgradeStatus.NEEDS_CONFIRMATION:
@@ -2269,9 +2475,26 @@ class VideoOrganizerService:
             raise StartupUpgradeError(upgrade_result)
 
         self._database_path = effective_db_path
+        self._settings_path = settings_path
+        self._tag_config_path = tag_config_path
+        self._backup_dir = backup_dir
+        self._results_json_path = effective_json_path
+        self._results_csv_path = effective_csv_path
+        self._data_paths = storage_paths
+        self._uses_explicit_storage_paths = any(
+            value is not None for value in (db_path, results_json, results_csv)
+        )
+        self._thumbnail_dir = storage_paths.thumbnails
         self.db = DatabaseManager(effective_db_path)
         self.catalog = VideoCatalog(self.db)
-        self.settings = settings or SettingsManager.load_settings(self.db)
+        self.settings = (
+            settings
+            if settings is not None
+            else SettingsManager.load_settings(
+                self.db,
+                settings_path=self._settings_path,
+            )
+        )
         self.tag_config = self.load_tag_config()
         self.on_log = on_log or (lambda m: print(m))
         self.on_progress = on_progress or (lambda c, t: None)
@@ -2299,13 +2522,11 @@ class VideoOrganizerService:
         self._last_rollback_result = None
         # 测试可注入：跳过真实 sleep
         self._retry_sleeper: Optional[Callable[[float], None]] = None
-        self.processor = VideoProcessor()
+        self.processor = VideoProcessor(self._thumbnail_dir)
         self.ai = AIHandler(self.settings, self.db, self.tag_config)
         self.ai.analysis_cancel_event = self._analysis_cancel
         self.tag_processor = TagProcessor(self.settings, self.db)
-        json_path = effective_json_path
-        csv_path = results_csv if results_csv is not None else RESULTS_FILE_CSV
-        self.file_manager = FileManager(self.db, json_path, csv_path)
+        self.file_manager = FileManager(self.db, effective_json_path, effective_csv_path)
         
         # V4.0: L1 内存缓存 (三级缓存架构之一)
         # 仅在「完整全库加载」后可直接返回；分析过程中禁止用零散写入冒充全库
@@ -2618,6 +2839,7 @@ class VideoOrganizerService:
                         max_frames=1,
                         target_size=target_size,
                         save_thumbnail=True,
+                        thumbnails_dir=self._thumbnail_dir,
                         use_scene_detection=False,
                     )
                     thumb = proc.get("thumbnail")
@@ -3120,9 +3342,9 @@ class VideoOrganizerService:
         """按当前活动路径创建管理数据快照服务。"""
         return StorageBackupManager(
             database_path=self.db.db_path,
-            settings_path=get_settings_file_path(),
-            tag_config_path=TAG_CONFIG_FILE,
-            backup_dir=BACKUP_DIR,
+            settings_path=self._settings_path,
+            tag_config_path=self._tag_config_path,
+            backup_dir=self._backup_dir,
             database_lock=self.db.lock,
             settings_payload=self.settings,
             tag_config_payload=self.tag_config,
@@ -3305,12 +3527,12 @@ class VideoOrganizerService:
             "tag_groups": []
         }
 
-        if not os.path.exists(TAG_CONFIG_FILE):
+        if not os.path.exists(self._tag_config_path):
             from core.tag_vocab import ensure_canonical_tag_groups
             return ensure_canonical_tag_groups(default_v6)
 
         try:
-            with open(TAG_CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(self._tag_config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
             
             # 检查版本并执行迁移
@@ -3380,7 +3602,7 @@ class VideoOrganizerService:
         self.tag_config = config
         try:
             with STORAGE_IO_LOCK:
-                write_json_atomic(TAG_CONFIG_FILE, config)
+                write_json_atomic(self._tag_config_path, config)
             # 更新 AI Handler 中的配置
             if hasattr(self, "ai"):
                 self.ai.tag_config = config
@@ -3869,7 +4091,7 @@ class VideoOrganizerService:
         """V4.0: 三级缓存 - 磁盘持久化 JSON 备份"""
         try:
             videos = self.get_all_videos()
-            with open(RESULTS_FILE_JSON, 'w', encoding='utf-8') as f:
+            with open(self._results_json_path, 'w', encoding='utf-8') as f:
                 json.dump(videos, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -4481,6 +4703,7 @@ class VideoOrganizerService:
                             self.settings, "processing.target_size", 512
                         ),
                         save_thumbnail=True,
+                        thumbnails_dir=self._thumbnail_dir,
                         use_scene_detection=SettingsManager.get_setting(
                             self.settings, "processing.enable_scene_detection", True
                         ),
