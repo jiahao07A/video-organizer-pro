@@ -1,6 +1,6 @@
 # 02：一次性升级迁移与启动门禁
 
-Status: claimed
+Status: resolved
 
 GitHub Issue: [#9](https://github.com/jiahao07A/video-organizer-pro/issues/9)
 
@@ -66,3 +66,7 @@ PR: [#30](https://github.com/jiahao07A/video-organizer-pro/pull/30)
 - 确认后先复制并校验源 JSON 临时快照，后续只从摘要一致的快照导入，避免确认后的源文件变更造成导入内容和完成记录不一致。
 - 新增 3 项核心回归和 1 项 GUI 回归，覆盖报告上限、轻量检查、源文件变更拒绝、GUI 确认与进度。
 - 验证：`python -m pytest -q` 为 `364 passed`；`python -m compileall -q core gui tests video_organizer_app.py` 通过；`git diff --check` 通过。
+
+### 2026-10-18 合并收尾
+
+PR [#30](https://github.com/jiahao07A/video-organizer-pro/pull/30) 已通过 Rebase and merge 合入 `main`，合并提交为 `b93031d614adb99ab8de07efd2ad830bf3f50a93`。Issue #9 已关闭。本议题的 GUI 门禁、轻量启动检查、有界导入、源快照一致性、失败重试和回归验证均已完成；50,000/200,000 条进程级性能验收继续由后续性能任务处理。
