@@ -7,9 +7,11 @@ import json
 from core.video_organizer_service import (
     DEFAULT_SETTINGS,
     SettingsManager,
+    VideoOrganizerService,
     get_settings_file_path,
     get_tag_config_file_path,
 )
+from core.data_directory import LegacyLayoutDetected
 
 
 def test_deep_copy_defaults_not_shared():
@@ -56,22 +58,20 @@ def test_frozen_tag_config_path_is_next_to_executable(tmp_path: Path, monkeypatc
     monkeypatch.setattr(service_module.sys, "frozen", True, raising=False)
     monkeypatch.setattr(service_module.sys, "executable", str(executable))
 
-    assert get_tag_config_file_path() == str(tmp_path / "tag_config.json")
+    assert get_tag_config_file_path() == str(tmp_path / "data" / "tag_config.json")
 
 
-def test_development_tag_config_path_uses_project_root(tmp_path: Path, monkeypatch):
+def test_development_tag_config_path_uses_application_data_root(tmp_path: Path, monkeypatch):
     import core.video_organizer_service as service_module
 
     monkeypatch.setattr(service_module, "_PROJECT_ROOT", str(tmp_path))
     monkeypatch.delattr(service_module.sys, "frozen", raising=False)
     monkeypatch.delattr(service_module.sys, "_MEIPASS", raising=False)
 
-    assert get_tag_config_file_path() == str(tmp_path / "tag_config.json")
+    assert get_tag_config_file_path() == str(tmp_path / "data" / "tag_config.json")
 
 
 def test_reload_ai_client_uses_new_key(tmp_path: Path):
-    from core.video_organizer_service import VideoOrganizerService
-
     svc = VideoOrganizerService(
         settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
@@ -84,3 +84,57 @@ def test_reload_ai_client_uses_new_key(tmp_path: Path):
     svc.reload_ai_from_settings()
     # openai client stores api_key
     assert getattr(svc.ai.client, "api_key", None) == "sk-new"
+
+
+def test_explicit_service_paths_are_isolated_from_default_legacy_layout(tmp_path: Path):
+    svc = VideoOrganizerService(
+        settings=SettingsManager.deep_copy_defaults(),
+        on_log=lambda _m: None,
+        db_path=str(tmp_path / "library.db"),
+        results_json=str(tmp_path / "results.json"),
+        results_csv=str(tmp_path / "results.csv"),
+    )
+
+    assert svc._settings_path == str(tmp_path / "settings.json")
+    assert svc._tag_config_path == str(tmp_path / "tag_config.json")
+    assert svc._backup_dir == str(tmp_path / "backups")
+    assert svc._thumbnail_dir == str(tmp_path / ".thumbnails")
+    assert svc.file_manager.json_path == str(tmp_path / "results.json")
+
+    SettingsManager.save_settings(svc.settings, svc.db)
+    svc.save_tag_config({"version": "6.0", "tag_groups": []})
+    backup_path = svc.backup_configuration()
+
+    assert (tmp_path / "settings.json").exists()
+    assert (tmp_path / "tag_config.json").exists()
+    assert Path(backup_path).parent == tmp_path / "backups"
+
+
+def test_default_service_path_still_blocks_legacy_layout(tmp_path: Path, monkeypatch):
+    import core.video_organizer_service as service_module
+
+    monkeypatch.setattr(service_module, "_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.delattr(service_module.sys, "frozen", raising=False)
+    (tmp_path / "video_organizer.db").write_bytes(b"legacy")
+
+    try:
+        VideoOrganizerService()
+    except LegacyLayoutDetected as exc:
+        assert "video_organizer.db" in str(exc)
+    else:
+        raise AssertionError("默认服务路径未阻止程序旁旧布局")
+
+
+def test_explicit_service_reports_its_data_directory(tmp_path: Path):
+    svc = VideoOrganizerService(
+        settings=SettingsManager.deep_copy_defaults(),
+        on_log=lambda _m: None,
+        db_path=str(tmp_path / "library.db"),
+        results_json=str(tmp_path / "results.json"),
+        results_csv=str(tmp_path / "results.csv"),
+    )
+
+    inspection = svc.data_directory_inspection()
+
+    assert inspection.state.value == "active"
+    assert inspection.active_root == str(tmp_path)
