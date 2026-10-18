@@ -20,6 +20,7 @@ import sys
 import numpy as np
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from xml.sax.saxutils import escape
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,11 @@ from core.storage_backup import (
     StorageBackupError,
     StorageBackupManager,
     write_json_atomic,
+)
+from core.startup_upgrade import (
+    StartupUpgradeCoordinator,
+    StartupUpgradeError,
+    UpgradeStatus,
 )
 from core.video_catalog import VideoCatalog, VideoQuery
 from core.physical_migration import (
@@ -176,6 +182,11 @@ class DatabaseManager:
     def __init__(self, db_path: str = DB_FILE):
         self.db_path = db_path
         self.lock = threading.RLock()
+        if os.path.exists(self.db_path):
+            # 现有文件必须先通过只读完整性/版本检查；不能让
+            # CREATE TABLE 或 ALTER TABLE 把损坏库伪装成新库。
+            from core.startup_upgrade import inspect_database_file
+            inspect_database_file(self.db_path)
         self._init_db()
 
     def _get_connection(self):
@@ -183,10 +194,20 @@ class DatabaseManager:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _managed_connection(self):
+        """让 SQLite 连接在事务上下文退出时明确关闭（Windows 也可安全搬迁/回滚）。"""
+        conn = self._get_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self):
         logger.debug(f"正在初始化数据库: {self.db_path}")
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL")
                 
@@ -339,6 +360,12 @@ class DatabaseManager:
                         value TEXT
                     )
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS storage_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                """)
                 # List pages must be able to order and narrow large libraries
                 # without scanning an unindexed timestamp column.
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_timestamp_id ON videos(timestamp DESC, id DESC)")
@@ -346,12 +373,15 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_category_timestamp ON videos(category, timestamp DESC, id DESC)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_file_hash ON videos(file_hash)")
+                # user_version is a SQLite primitive, so startup can reject a
+                # newer database before DatabaseManager attempts any writes.
+                cursor.execute("PRAGMA user_version = 1")
                 conn.commit()
 
     def execute_query(self, query: str, params: tuple = ()) -> List[Dict]:
         logger.debug(f"执行 SQL 查询: {query[:100]}... | 参数: {params}")
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(query, params)
                 rows = cursor.fetchall()
@@ -360,10 +390,100 @@ class DatabaseManager:
     def execute_non_query(self, query: str, params: tuple = ()):
         logger.debug(f"执行 SQL 修改: {query[:100]}... | 参数: {params}")
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(query, params)
                 conn.commit()
+
+    def set_storage_metadata(self, key: str, value: Dict[str, Any]) -> None:
+        """保存启动升级等管理协议的完成记录。"""
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        self.execute_non_query(
+            "INSERT INTO storage_metadata (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, payload),
+        )
+
+    def get_storage_metadata(self, key: str) -> Optional[Dict[str, Any]]:
+        rows = self.execute_query(
+            "SELECT value FROM storage_metadata WHERE key = ?", (key,)
+        )
+        if not rows:
+            return None
+        try:
+            value = json.loads(rows[0]["value"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _video_upsert_params(video_data: Dict) -> tuple:
+        tags = video_data.get("tags", [])
+        tags_str = json.dumps(tags, ensure_ascii=False) if isinstance(tags, list) else tags
+        metadata = video_data.get("raw_metadata", {})
+        metadata_str = json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else metadata
+        tag_groups = video_data.get("tag_groups", {})
+        tag_groups_str = json.dumps(tag_groups, ensure_ascii=False) if isinstance(tag_groups, dict) else tag_groups
+        return (
+            video_data.get("path"),
+            video_data.get("filename"),
+            video_data.get("file_hash"),
+            video_data.get("phash"),
+            video_data.get("category"),
+            video_data.get("summary"),
+            tags_str,
+            video_data.get("transcription"),
+            video_data.get("status"),
+            video_data.get("thumbnail_path") or video_data.get("thumbnail"),
+            1 if video_data.get("manual_override") else 0,
+            1 if video_data.get("metadata_injected") else 0,
+            metadata_str,
+            None,
+            None,
+            0,
+            None,
+            0,
+            video_data.get("proxy_path"),
+            json.dumps(video_data.get("face_clusters", []), ensure_ascii=False),
+            video_data.get("vector_id"),
+            tag_groups_str,
+            json.dumps({}, ensure_ascii=False),
+        )
+
+    def upsert_videos_batch(self, video_data: List[Dict]) -> int:
+        """在单个受控事务中写入一批视频，失败时整批回滚。"""
+        records = [row for row in (video_data or []) if isinstance(row, dict)]
+        if not records:
+            return 0
+        query = """
+            INSERT INTO videos (
+                path, filename, file_hash, phash, category, summary, tags,
+                transcription, status, thumbnail, manual_override, metadata_injected,
+                raw_metadata, emotion, composition, rating, quality_score,
+                is_proxy_needed, proxy_path, face_clusters, vector_id, tag_groups, tag_weights
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                filename=excluded.filename, file_hash=excluded.file_hash,
+                phash=excluded.phash, category=excluded.category,
+                summary=excluded.summary, tags=excluded.tags,
+                transcription=excluded.transcription, status=excluded.status,
+                thumbnail=excluded.thumbnail, manual_override=excluded.manual_override,
+                metadata_injected=excluded.metadata_injected, raw_metadata=excluded.raw_metadata,
+                emotion=excluded.emotion, composition=excluded.composition,
+                rating=excluded.rating, quality_score=excluded.quality_score,
+                is_proxy_needed=excluded.is_proxy_needed, proxy_path=excluded.proxy_path,
+                face_clusters=excluded.face_clusters, vector_id=excluded.vector_id,
+                tag_groups=excluded.tag_groups, tag_weights=excluded.tag_weights
+        """
+        with self.lock:
+            conn = self._get_connection()
+            try:
+                conn.executemany(query, [self._video_upsert_params(row) for row in records])
+                conn.commit()
+            finally:
+                conn.close()
+        return len(records)
 
     def upsert_video(self, video_data: Dict):
         tags = video_data.get("tags", [])
@@ -439,7 +559,7 @@ class DatabaseManager:
     def move_video_record(self, old_path: str, new_path: str, reason: str) -> None:
         """事务性更新素材路径并记录物理迁移历史。"""
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE videos SET path = ?, filename = ? WHERE path = ?",
@@ -456,7 +576,7 @@ class DatabaseManager:
     def restore_video_record_move(self, old_path: str, new_path: str) -> None:
         """撤销尚未完成文件删除的单条路径更新，并删除对应迁移历史。"""
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE videos SET path = ?, filename = ? WHERE path = ?",
@@ -619,7 +739,7 @@ class DatabaseManager:
             )
 
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 # SQLite defaults to a 999-variable limit on many installs;
                 # keep existence checks below that limit.
@@ -733,7 +853,7 @@ class DatabaseManager:
         if not tags: return
         query = "INSERT OR IGNORE INTO tags_library (dimension, tag_name, is_learned, parent_id, color) VALUES (?, ?, ?, ?, ?)"
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 cursor.executemany(query, tags)
                 conn.commit()
@@ -816,7 +936,7 @@ class DatabaseManager:
                 counts[t] = counts.get(t, 0) + 1
         
         with self.lock:
-            with self._get_connection() as conn:
+            with self._managed_connection() as conn:
                 cursor = conn.cursor()
                 # 重置所有频次
                 cursor.execute("UPDATE tags_library SET usage_count = 0")
@@ -1956,24 +2076,6 @@ class FileManager:
         self.json_path = json_path
         self.csv_path = csv_path
         self.lock = threading.Lock()
-        self.migrate_json_to_db()
-
-    def migrate_json_to_db(self):
-        if not os.path.exists(self.json_path):
-            return
-
-        try:
-            with open(self.json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if not isinstance(data, list):
-                    return
-                
-                logger.info(f"正在从 {self.json_path} 迁移 {len(data)} 条数据到数据库...")
-                for item in data:
-                    if "path" not in item: continue
-                    self.db.upsert_video(item)
-        except Exception as e:
-            logger.error(f"数据迁移失败: {e}")
 
     def scan_videos(self, path: str) -> List[str]:
         video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.flv', '.wmv')
@@ -2085,6 +2187,40 @@ def dedupe_scope_paths(paths: List[str]) -> List[str]:
 
 class VideoOrganizerService:
     """Core Service Layer: 处理所有业务逻辑"""
+
+    @staticmethod
+    def inspect_startup_upgrade(
+        *,
+        db_path: Optional[str] = None,
+        results_json: Optional[str] = None,
+    ):
+        """服务层启动前检查；需要确认时不创建数据库。"""
+        coordinator = StartupUpgradeCoordinator(
+            database_path=db_path if db_path is not None else DB_FILE,
+            json_path=results_json if results_json is not None else RESULTS_FILE_JSON,
+            backup_dir=BACKUP_DIR,
+            settings_path=get_settings_file_path(),
+            tag_config_path=TAG_CONFIG_FILE,
+        )
+        return coordinator.inspect()
+
+    @staticmethod
+    def run_startup_upgrade(
+        *,
+        confirmed: bool,
+        db_path: Optional[str] = None,
+        results_json: Optional[str] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ):
+        """服务层显式执行一次旧 JSON 首次导入。"""
+        coordinator = StartupUpgradeCoordinator(
+            database_path=db_path if db_path is not None else DB_FILE,
+            json_path=results_json if results_json is not None else RESULTS_FILE_JSON,
+            backup_dir=BACKUP_DIR,
+            settings_path=get_settings_file_path(),
+            tag_config_path=TAG_CONFIG_FILE,
+        )
+        return coordinator.execute(confirmed=confirmed, on_progress=on_progress)
     
     def __init__(
         self,
@@ -2094,8 +2230,10 @@ class VideoOrganizerService:
         db_path: Optional[str] = None,
         results_json: Optional[str] = None,
         results_csv: Optional[str] = None,
+        startup_upgrade_confirmed: Optional[bool] = None,
     ):
         effective_db_path = db_path if db_path is not None else DB_FILE
+        effective_json_path = results_json if results_json is not None else RESULTS_FILE_JSON
         recovery_manager = StorageBackupManager(
             database_path=effective_db_path,
             settings_path=get_settings_file_path(),
@@ -2107,6 +2245,27 @@ class VideoOrganizerService:
         except StorageBackupError:
             logger.exception("检测到未完成的管理数据恢复，无法安全启动。")
             raise
+
+        startup_upgrade = StartupUpgradeCoordinator(
+            database_path=effective_db_path,
+            json_path=effective_json_path,
+            backup_dir=BACKUP_DIR,
+            settings_path=get_settings_file_path(),
+            tag_config_path=TAG_CONFIG_FILE,
+        )
+        upgrade_result = startup_upgrade.inspect()
+        if upgrade_result.status == UpgradeStatus.NEEDS_CONFIRMATION:
+            if startup_upgrade_confirmed is None:
+                raise StartupUpgradeError(upgrade_result)
+            upgrade_result = startup_upgrade.execute(
+                confirmed=startup_upgrade_confirmed,
+                on_progress=on_progress,
+            )
+        if upgrade_result.status in {
+            UpgradeStatus.FAILED,
+            UpgradeStatus.CANCELLED,
+        }:
+            raise StartupUpgradeError(upgrade_result)
 
         self._database_path = effective_db_path
         self.db = DatabaseManager(effective_db_path)
@@ -2143,7 +2302,7 @@ class VideoOrganizerService:
         self.ai = AIHandler(self.settings, self.db, self.tag_config)
         self.ai.analysis_cancel_event = self._analysis_cancel
         self.tag_processor = TagProcessor(self.settings, self.db)
-        json_path = results_json if results_json is not None else RESULTS_FILE_JSON
+        json_path = effective_json_path
         csv_path = results_csv if results_csv is not None else RESULTS_FILE_CSV
         self.file_manager = FileManager(self.db, json_path, csv_path)
         
