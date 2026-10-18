@@ -23,6 +23,7 @@ from gui.models.tag_work_views import (
     build_pending_suggestion_rows,
     build_standard_word_rows,
     filter_pending_rows,
+    sort_pending_rows,
     filter_standard_word_rows,
     pending_suggestion_action_label,
     selected_suggestions,
@@ -60,7 +61,16 @@ def test_filter_pending_by_query_and_group():
     assert filter_pending_rows(rows, query="男", group_id="mood") == []
 
 
-def test_pending_suggestion_rows_default_unchecked_and_action_label():
+def test_sort_pending_rows_is_deterministic():
+    rows = [
+        {"id": 1, "raw_text": "beta", "group_id": "mood", "created_at": "2026-01-02"},
+        {"id": 2, "raw_text": "alpha", "group_id": "subject", "created_at": "2026-01-03"},
+        {"id": 3, "raw_text": "alpha", "group_id": "mood", "created_at": "2026-01-01"},
+    ]
+    assert [r["id"] for r in sort_pending_rows(rows, sort_key="raw_text", descending=False)] == [2, 3, 1]
+    assert [r["id"] for r in sort_pending_rows(rows, sort_key="created_at", descending=True)] == [2, 1, 3]
+
+
     sug = PendingTagSuggestion(
         pending_id=1,
         raw_text="男",
