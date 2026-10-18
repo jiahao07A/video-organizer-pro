@@ -33,6 +33,7 @@ from ..workers.rename_worker import RenameWorker
 from ..workers.io_worker import run_io_job
 from ..widgets.rename_dialog import BatchRenameDialog
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
+from core.organization_plan import OrganizationPlan, PHYSICAL_MIGRATION
 from gui.styles import normalize_theme
 from ..workers.catalog_worker import run_catalog_query
 
@@ -59,18 +60,45 @@ class PhysicalMigrationPreviewDialog(QDialog):
 
     _COLUMNS = ("执行", "状态", "源路径", "请求目标路径", "实际目标路径", "风险")
 
-    def __init__(self, plan, target_root: str, parent=None):
+    def __init__(
+        self,
+        plan,
+        target_root: str,
+        parent=None,
+        *,
+        target_paths=(),
+        work_scope_paths=(),
+        target_summary: str = "",
+        filter_summary: str = "未筛选",
+    ):
         super().__init__(parent)
         self.setWindowTitle("模拟预览 — 物理整理")
-        self.resize(1150, 620)
-        self._plan = [dict(step) for step in (plan or [])]
+        self.resize(1150, 640)
+        self._migration_steps = [dict(step) for step in (plan or [])]
+        self._plan = OrganizationPlan.from_migration_plan(
+            self._migration_steps,
+            target_paths=target_paths,
+            work_scope_paths=work_scope_paths,
+            action_type=PHYSICAL_MIGRATION,
+            filter_summary=filter_summary,
+        )
         self._target_root = target_root
-        self._excluded_paths = set()
+        self._target_summary = target_summary
 
         layout = QVBoxLayout(self)
-        self.summary = QLabel()
-        self.summary.setWordWrap(True)
-        layout.addWidget(self.summary)
+        self.target_summary_label = QLabel(self._target_summary)
+        self.target_summary_label.setWordWrap(True)
+        if self._target_summary:
+            layout.addWidget(self.target_summary_label)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary = self.summary_label
+        layout.addWidget(self.summary_label)
+
+        self.operation_checkbox = QCheckBox("执行物理整理（取消后本批次不执行此类操作）")
+        self.operation_checkbox.setChecked(True)
+        self.operation_checkbox.stateChanged.connect(self._refresh_summary)
+        layout.addWidget(self.operation_checkbox)
 
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText("搜索源路径、目标路径、分类或风险…")
@@ -107,49 +135,78 @@ class PhysicalMigrationPreviewDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self._buttons = buttons
         layout.addWidget(buttons)
-        self._refresh_summary(target_root)
+        self._refresh_summary()
 
     @staticmethod
     def _path_key(path):
         return os.path.normcase(os.path.normpath(os.path.abspath(str(path or ""))))
 
+    def _checked_paths(self):
+        return [
+            self.table.item(row, 2).text()
+            for row in range(self.table.rowCount())
+            if self.table.item(row, 0).checkState() == Qt.Checked
+        ]
+
+    def _current_plan(self):
+        if not self.operation_checkbox.isChecked():
+            return self._plan.exclude_action_types([PHYSICAL_MIGRATION])
+        checked_paths = {self._path_key(path) for path in self._checked_paths()}
+        excluded_paths = {
+            item.source_path
+            for item in self._plan.items
+            if self._path_key(item.source_path) not in checked_paths
+        }
+        return self._plan.exclude_paths(excluded_paths)
+
+    def confirmed_plan(self):
+        return self._current_plan()
+
+    def execution_paths(self):
+        return list(self.confirmed_plan().active_source_paths)
+
     def selected_plan(self):
-        """返回用户确认执行的同一份预览快照，不重新规划路径。"""
+        """返回排除项之后的原始安全预览，保留执行校验所需字段。"""
+        active = {self._path_key(path) for path in self.execution_paths()}
         return [
             dict(step)
-            for step in self._plan
-            if self._path_key(step.get("source_path") or step.get("old_path")) not in self._excluded_paths
+            for step in self._migration_steps
+            if self._path_key(step.get("source_path") or step.get("old_path")) in active
         ]
 
     @property
     def excluded_count(self):
-        return len(self._excluded_paths)
+        return len(self.confirmed_plan().excluded_items)
 
-    def _refresh_summary(self, target_root):
-        selected = self.selected_plan()
-        conflicts = sum(1 for row in selected if row.get("target_conflict"))
+    def _refresh_summary(self, *_args):
+        current = self.confirmed_plan()
+        active = current.active_items
+        conflicts = sum(1 for item in active if item.target_conflict)
         xmp_conflicts = sum(
-            1 for row in selected
-            if row.get("source_xmp_exists") and row.get("target_xmp_exists_before")
+            1
+            for step in self.selected_plan()
+            if step.get("source_xmp_exists") and step.get("target_xmp_exists_before")
         )
-        blocked = sum(1 for row in selected if row.get("status") == "blocked")
-        self.summary.setText(
-            f"预览 {len(self._plan)} 条，当前执行 {len(selected)} 条，已排除 {self.excluded_count} 条；"
-            f"目标根目录：{target_root}\n"
-            f"视频目标冲突：{conflicts} 条；XMP 侧车冲突：{xmp_conflicts} 条。"
-            "视频目标冲突会选择不覆盖路径；XMP 侧车冲突会保留原侧车，不覆盖目标侧车。"
+        blocked = sum(1 for item in active if item.status == "blocked")
+        summary = current.summary()
+        self.summary_label.setText(
+            f"整理方案（尚未执行）：工作范围素材 {summary['work_scope_count']} 条；"
+            f"操作目标集 {summary['target_count']} 条；筛选状态：{summary['filter_summary']}；"
+            f"方案条目 {summary['total_items']} 条；当前选择 {len(active)} 条；"
+            f"已排除 {summary['excluded_items']} 条；目标冲突 {conflicts} 条；"
+            f"XMP 侧车冲突 {xmp_conflicts} 条。"
         )
         self.note.setText(
-            "勾选“执行”后才会纳入本次操作；可以逐项排除。执行前会再次检查当前文件状态。"
+            "预览尚未执行。执行前会再次检查当前文件状态。视频目标冲突会使用不覆盖路径；"
+            "XMP 冲突不覆盖目标侧车。当前入口不承诺原始视频或 XMP 侧车的完整恢复。"
             + (f" 当前有 {blocked} 条被阻止，不能执行。" if blocked else "")
-            + " 本轮不提供对原始素材的全部恢复承诺。"
         )
-        self.confirm_button.setEnabled(bool(selected) and blocked == 0)
+        self.confirm_button.setEnabled(bool(active) and blocked == 0)
 
     def _populate_rows(self):
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self._plan))
-        for row_index, step in enumerate(self._plan):
+        self.table.setRowCount(len(self._migration_steps))
+        for row_index, step in enumerate(self._migration_steps):
             source_path = step.get("source_path") or step.get("old_path") or ""
             risks = "；".join(step.get("risk_flags") or []) or "无"
             values = (
@@ -173,14 +230,8 @@ class PhysicalMigrationPreviewDialog(QDialog):
         self.table.setSortingEnabled(True)
 
     def _on_item_changed(self, item):
-        if item.column() != 0:
-            return
-        key = self._path_key(item.data(Qt.UserRole))
-        if item.checkState() == Qt.Checked:
-            self._excluded_paths.discard(key)
-        else:
-            self._excluded_paths.add(key)
-        self._refresh_summary(self._target_root)
+        if item.column() == 0:
+            self._refresh_summary()
 
     def _filter_rows(self, text: str):
         query = text.strip().casefold()
@@ -1660,7 +1711,15 @@ class WorkstationView(QWidget):
             QMessageBox.information(self, "无需整理", "没有需要移动的文件（可能已在目标位置或路径无效）。")
             return
 
-        preview_dialog = PhysicalMigrationPreviewDialog(plan, target_root, self)
+        preview_dialog = PhysicalMigrationPreviewDialog(
+            plan,
+            target_root,
+            self,
+            target_paths=selected_paths,
+            work_scope_paths=snapshot.scope_paths or (),
+            target_summary=self._format_operation_target_snapshot(snapshot),
+            filter_summary=self._filter_summary_text(),
+        )
         if preview_dialog.exec() != QDialog.Accepted:
             return
         selected_plan = preview_dialog.selected_plan()
