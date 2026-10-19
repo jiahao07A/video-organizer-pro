@@ -38,6 +38,7 @@ from core.startup_upgrade import (
     UpgradeStatus,
 )
 from core.data_directory import (
+    DataDirectoryError,
     DataDirectoryManager,
     DataDirectoryInspection,
     DataDirectoryState,
@@ -547,8 +548,7 @@ class DatabaseManager:
             return None
         return value if isinstance(value, dict) else None
 
-    @staticmethod
-    def _video_upsert_params(video_data: Dict) -> tuple:
+    def _video_upsert_params(self, video_data: Dict) -> tuple:
         tags = video_data.get("tags", [])
         tags_str = json.dumps(tags, ensure_ascii=False) if isinstance(tags, list) else tags
         metadata = video_data.get("raw_metadata", {})
@@ -565,7 +565,9 @@ class DatabaseManager:
             tags_str,
             video_data.get("transcription"),
             video_data.get("status"),
-            video_data.get("thumbnail_path") or video_data.get("thumbnail"),
+            self._thumbnail_storage_reference(
+                video_data.get("thumbnail_path") or video_data.get("thumbnail")
+            ),
             1 if video_data.get("manual_override") else 0,
             1 if video_data.get("metadata_injected") else 0,
             metadata_str,
@@ -617,13 +619,6 @@ class DatabaseManager:
         return len(records)
 
     def upsert_video(self, video_data: Dict):
-        tags = video_data.get("tags", [])
-        tags_str = json.dumps(tags, ensure_ascii=False) if isinstance(tags, list) else tags
-        metadata = video_data.get("raw_metadata", {})
-        metadata_str = json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else metadata
-        tag_groups = video_data.get("tag_groups", {})
-        tag_groups_str = json.dumps(tag_groups, ensure_ascii=False) if isinstance(tag_groups, dict) else tag_groups
-        
         # 已删字段硬清：写入空值，避免旧数据残留被读出
         query = """
             INSERT INTO videos (
@@ -657,32 +652,7 @@ class DatabaseManager:
                 tag_groups=excluded.tag_groups,
                 tag_weights=excluded.tag_weights
         """
-        params = (
-            video_data.get("path"),
-            video_data.get("filename"),
-            video_data.get("file_hash"),
-            video_data.get("phash"),
-            video_data.get("category"),
-            video_data.get("summary"),
-            tags_str,
-            video_data.get("transcription"),
-            video_data.get("status"),
-            video_data.get("thumbnail_path") or video_data.get("thumbnail"),
-            1 if video_data.get("manual_override") else 0,
-            1 if video_data.get("metadata_injected") else 0,
-            metadata_str,
-            None,  # emotion 硬删（ADR-0003 并入氛围标签）
-            None,  # composition 硬删
-            0,  # rating
-            None,  # quality_score
-            0,  # is_proxy_needed
-            video_data.get("proxy_path"),
-            json.dumps(video_data.get("face_clusters", []), ensure_ascii=False),
-            video_data.get("vector_id"),
-            tag_groups_str,
-            json.dumps({}, ensure_ascii=False),  # tag_weights 硬删
-        )
-        self.execute_non_query(query, params)
+        self.execute_non_query(query, self._video_upsert_params(video_data))
 
     def delete_video(self, path: str):
         self.execute_non_query("DELETE FROM videos WHERE path = ?", (path,))
@@ -721,6 +691,32 @@ class DatabaseManager:
                     (old_path, new_path, old_path, new_path),
                 )
                 conn.commit()
+
+    def _thumbnail_storage_reference(self, reference: Optional[str]) -> Optional[str]:
+        """将数据目录内缩略图保存为相对数据根的引用。"""
+        if not reference:
+            return reference
+        raw_reference = os.fspath(reference)
+        data_root = os.path.dirname(os.path.abspath(self.db_path))
+        thumbnail_root = os.path.realpath(
+            os.path.join(data_root, ".thumbnails")
+        )
+        candidate = (
+            raw_reference
+            if os.path.isabs(raw_reference)
+            else os.path.join(data_root, raw_reference)
+        )
+        candidate_real = os.path.realpath(candidate)
+        try:
+            inside_thumbnail_root = os.path.normcase(
+                os.path.commonpath((thumbnail_root, candidate_real))
+            ) == os.path.normcase(thumbnail_root)
+        except ValueError:
+            inside_thumbnail_root = False
+        if not inside_thumbnail_root:
+            return raw_reference
+        relative = os.path.relpath(candidate_real, data_root)
+        return relative.replace(os.sep, "/")
 
     def _resolve_thumbnail_reference(self, reference: Optional[str]) -> Optional[str]:
         if not reference:
@@ -860,7 +856,9 @@ class DatabaseManager:
                 json.dumps(tags, ensure_ascii=False) if isinstance(tags, list) else tags,
                 row.get("transcription"),
                 row.get("status"),
-                row.get("thumbnail_path") or row.get("thumbnail"),
+                self._thumbnail_storage_reference(
+                    row.get("thumbnail_path") or row.get("thumbnail")
+                ),
                 1 if row.get("manual_override") else 0,
                 1 if row.get("metadata_injected") else 0,
                 json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else metadata,
@@ -2363,9 +2361,30 @@ class VideoOrganizerService:
             message="当前服务使用调用方显式指定的数据目录。",
         )
 
-    @staticmethod
-    def migrate_data_directory(target_root: str) -> DataPaths:
-        return migrate_data_directory(target_root)
+    def migrate_data_directory(self, target_root: str) -> DataPaths:
+        """暂停当前服务的数据库写入后搬迁管理数据。"""
+        with STORAGE_IO_LOCK:
+            with self.db.lock:
+                if self._uses_explicit_storage_paths:
+                    source_paths = DataPaths(
+                        root=self._data_paths.root,
+                        database=self.db.db_path,
+                        settings=self._settings_path,
+                        tag_config=self._tag_config_path,
+                        backups=self._backup_dir,
+                        thumbnails=self._thumbnail_dir,
+                        results_json=self._results_json_path,
+                        results_csv=self._results_csv_path,
+                    )
+                    manager = DataDirectoryManager(
+                        application_directory=os.path.dirname(source_paths.root)
+                    )
+                    return manager.migrate_root(
+                        source_root=source_paths.root,
+                        target_root=target_root,
+                        source_paths=source_paths,
+                    )
+                return migrate_data_directory(target_root)
 
     @staticmethod
     def inspect_startup_upgrade(

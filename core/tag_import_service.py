@@ -31,8 +31,9 @@ def _tag_groups_from_config(config: Optional[Dict[str, Any]]) -> List[Dict[str, 
 class TagImportService:
     """服务类，用于处理标签导入与 AI 分类"""
 
-    def __init__(self, ai_handler: AIHandler):
+    def __init__(self, ai_handler: AIHandler, tag_config_path: Optional[str] = None):
         self.ai = ai_handler
+        self.tag_config_path = tag_config_path or TAG_CONFIG_FILE
 
     def read_tags_from_file(self, file_path: str) -> List[str]:
         """从 .txt 文件读取标签，每行一个"""
@@ -183,7 +184,7 @@ class TagImportService:
         config["tag_groups"] = target_groups
         try:
             with STORAGE_IO_LOCK:
-                write_json_atomic(TAG_CONFIG_FILE, config)
+                write_json_atomic(self.tag_config_path, config)
             logger.info("已成功保存分类后的标签到配置")
             return True, ""
         except Exception as e:

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, 
+    QWidget, QApplication, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
     QFrame, QFormLayout, QGroupBox, QLineEdit, QSpinBox, 
     QCheckBox, QPushButton, QMessageBox, QTabWidget, QPlainTextEdit,
-    QComboBox, QListWidget, QListWidgetItem, QAbstractItemView, QFileDialog
+    QComboBox, QListWidget, QListWidgetItem, QAbstractItemView, QFileDialog,
+    QProgressDialog,
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import QObject, QThread, QThreadPool, Signal, Qt
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from core.data_directory import DataDirectoryError
 from core.model_providers import (
@@ -33,6 +34,41 @@ from gui.models.settings_catalog import (
 )
 from gui.services.settings_controller import SettingsController
 from ..workers.io_worker import run_io_job
+
+
+def _window_has_active_background_work(window) -> bool:
+    widgets = [window, *window.findChildren(QWidget)]
+    if any(thread.isRunning() for thread in window.findChildren(QThread)):
+        return True
+    if QThreadPool.globalInstance().activeThreadCount() > 0:
+        return True
+    for widget in widgets:
+        for value in vars(widget).values():
+            if isinstance(value, QThread) and value.isRunning():
+                return True
+            if isinstance(value, QThreadPool) and value.activeThreadCount() > 0:
+                return True
+            if isinstance(value, QObject):
+                try:
+                    nested_values = vars(value).values()
+                except TypeError:
+                    continue
+                if any(
+                    isinstance(nested, QThread) and nested.isRunning()
+                    for nested in nested_values
+                ):
+                    return True
+                try:
+                    nested_values = vars(value).values()
+                except TypeError:
+                    continue
+                if any(
+                    isinstance(nested, QThreadPool)
+                    and nested.activeThreadCount() > 0
+                    for nested in nested_values
+                ):
+                    return True
+    return False
 
 
 class SettingsView(QWidget):
@@ -451,9 +487,63 @@ class SettingsView(QWidget):
         except Exception as exc:
             return f"当前目录不可用：{exc}"
 
+    def _has_running_background_work(self) -> bool:
+        return _window_has_active_background_work(self.window())
+
+    def _finish_data_directory_switch(self, target: str) -> None:
+        self.data_directory_label.setText(
+            f"已选择：{target}\n请重启应用后使用新目录。"
+        )
+        QMessageBox.information(
+            self,
+            "目录已准备",
+            "目录已验证并记录。应用将退出，请重新启动以使用新目录。",
+        )
+        application = QApplication.instance()
+        if application is None:
+            return
+        application.quit()
+
+    def _run_existing_directory_open(
+        self,
+        manager,
+        target: str,
+        progress: QProgressDialog,
+    ) -> None:
+        def on_ok(_result):
+            progress.close()
+            self._finish_data_directory_switch(target)
+
+        def on_fail(message: str):
+            progress.close()
+            QMessageBox.critical(self, "打开数据目录失败", str(message))
+
+        run_io_job(
+            self,
+            fn=lambda: manager.open_existing(target),
+            on_ok=on_ok,
+            on_fail=on_fail,
+            on_start=progress.show,
+            busy_message="",
+        )
+
     def _choose_data_directory(self) -> None:
         target = QFileDialog.getExistingDirectory(self, "选择管理数据目录")
         if not target:
+            return
+        if self._has_running_background_work():
+            QMessageBox.warning(
+                self,
+                "无法切换数据目录",
+                "当前仍有后台任务运行。请等待任务结束后再切换数据目录。",
+            )
+            return
+        if not self.prefs_controller.flush():
+            QMessageBox.warning(
+                self,
+                "无法切换数据目录",
+                "尚未保存的界面偏好保存失败。请先解决保存错误后再切换。",
+            )
             return
         try:
             from core.data_directory import DataDirectoryManager
@@ -469,26 +559,60 @@ class SettingsView(QWidget):
                 )
                 if answer != QMessageBox.Yes:
                     return
-                manager.open_existing(target)
-            else:
-                answer = QMessageBox.question(
-                    self,
-                    "确认搬迁管理数据",
-                    "将当前管理数据复制到目标目录，验证成功后切换；原目录会保留。\n"
-                    "原始视频不会移动。是否继续？",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
+                progress = QProgressDialog(
+                    "正在校验并打开已有管理数据目录…",
+                    "",
+                    0,
+                    0,
+                    self.window(),
                 )
-                if answer != QMessageBox.Yes:
-                    return
-                self.service.migrate_data_directory(target)
-            self.data_directory_label.setText(
-                f"已选择：{target}\n请重启应用后使用新目录。"
-            )
-            QMessageBox.information(
+                progress.setWindowTitle("打开管理数据目录")
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setCancelButton(None)
+                progress.setMinimumDuration(0)
+                self._data_directory_progress = progress
+                self._run_existing_directory_open(manager, target, progress)
+                return
+
+            answer = QMessageBox.question(
                 self,
-                "目录已准备",
-                "目录已验证并记录。请重启应用后使切换生效；当前窗口继续使用原目录。",
+                "确认搬迁管理数据",
+                "将当前管理数据备份并复制到目标目录，验证成功后切换；原目录会保留。\n"
+                "原始视频不会移动。是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+            progress = QProgressDialog(
+                "正在备份、复制并验证管理数据…",
+                "",
+                0,
+                0,
+                self.window(),
+            )
+            progress.setWindowTitle("搬迁管理数据")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setCancelButton(None)
+            progress.setMinimumDuration(0)
+            self._data_directory_progress = progress
+
+            def on_ok(_result):
+                progress.close()
+                self._finish_data_directory_switch(target)
+
+            def on_fail(message: str):
+                progress.close()
+                QMessageBox.critical(self, "数据目录搬迁失败", str(message))
+
+            run_io_job(
+                self,
+                fn=lambda: self.service.migrate_data_directory(target),
+                on_ok=on_ok,
+                on_fail=on_fail,
+                on_start=progress.show,
+                busy_message="",
             )
         except DataDirectoryError as exc:
             QMessageBox.critical(self, "数据目录操作失败", str(exc))

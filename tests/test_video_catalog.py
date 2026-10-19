@@ -46,7 +46,35 @@ def test_catalog_page_projects_list_columns_and_orders(tmp_path):
     assert page.has_more
 
 
-def test_catalog_filters_text_status_tags_and_summary(tmp_path):
+def test_catalog_resolves_relative_thumbnail_against_database_directory(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    thumbnail = tmp_path / ".thumbnails" / "thumb.webp"
+    thumbnail.parent.mkdir()
+    thumbnail.write_bytes(b"thumbnail")
+    _insert(service, tmp_path / "clip.mp4")
+    service.db.upsert_video(
+        {
+            "path": str(tmp_path / "clip.mp4"),
+            "filename": "clip.mp4",
+            "thumbnail": ".thumbnails/thumb.webp",
+        }
+    )
+    other_cwd = tmp_path / "other-working-directory"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    row = VideoCatalog(service.db).list_page(VideoQuery()).rows[0]
+
+    assert row["thumbnail"] == ".thumbnails/thumb.webp"
+    assert row["thumbnail_path"] == str(thumbnail.resolve())
+    detail = VideoCatalog(service.db).get_detail(str(tmp_path / "clip.mp4"))
+    assert detail["thumbnail"] == ".thumbnails/thumb.webp"
+    assert detail["thumbnail_path"] == str(thumbnail.resolve())
+
+
+
     service = _service(tmp_path)
     _insert(
         service,

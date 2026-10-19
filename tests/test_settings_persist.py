@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """AI / 嵌套配置持久化。"""
-from pathlib import Path
-
 import json
+import sqlite3
+from pathlib import Path
 
 from core.video_organizer_service import (
     DEFAULT_SETTINGS,
@@ -110,7 +110,56 @@ def test_explicit_service_paths_are_isolated_from_default_legacy_layout(tmp_path
     assert Path(backup_path).parent == tmp_path / "backups"
 
 
-def test_default_service_path_still_blocks_legacy_layout(tmp_path: Path, monkeypatch):
+def test_explicit_service_migrates_its_custom_database_and_thumbnail_paths(
+    tmp_path: Path,
+):
+    from core.data_directory import DataDirectoryManager
+
+    source = tmp_path / "custom-store"
+    source.mkdir()
+    thumbnail = source / ".thumbnails" / "thumb.webp"
+    thumbnail.parent.mkdir()
+    thumbnail.write_bytes(b"thumbnail")
+    service = VideoOrganizerService(
+        settings=SettingsManager.deep_copy_defaults(),
+        on_log=lambda _message: None,
+        db_path=str(source / "library.sqlite"),
+        results_json=str(source / "custom-results.json"),
+        results_csv=str(source / "custom-results.csv"),
+    )
+    service.db.upsert_video(
+        {
+            "path": str(tmp_path / "clip.mp4"),
+            "filename": "clip.mp4",
+            "status": "pending",
+            "thumbnail": str(thumbnail),
+        }
+    )
+    stored = service.db.get_video_by_path(str(tmp_path / "clip.mp4"))
+    assert stored["thumbnail"] == ".thumbnails/thumb.webp"
+
+    target = tmp_path / "migrated-store"
+    paths = service.migrate_data_directory(str(target))
+
+    assert Path(paths.database).exists()
+    assert Path(paths.thumbnails, "thumb.webp").read_bytes() == b"thumbnail"
+    connection = sqlite3.connect(paths.database)
+    try:
+        assert connection.execute(
+            "SELECT path, thumbnail FROM videos"
+        ).fetchone() == (str(tmp_path / "clip.mp4"), ".thumbnails/thumb.webp")
+    finally:
+        connection.close()
+    assert Path(source, "library.sqlite").exists()
+    assert list(Path(paths.backups).glob("backup_*"))
+    assert DataDirectoryManager(application_directory=str(tmp_path)).read_locator() == str(
+        target.resolve()
+    )
+
+
+def test_default_service_path_still_blocks_legacy_layout(
+    tmp_path: Path, monkeypatch
+):
     import core.video_organizer_service as service_module
 
     monkeypatch.setattr(service_module, "_PROJECT_ROOT", str(tmp_path))

@@ -27,7 +27,7 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 - [ ] 自选位置持久保存、设置可见；定位记录不复制业务设置或密钥。
 - [ ] 数据库、设置、标签配置、缩略图和备份统一目录边界。
 - [ ] 搬迁经确认、备份与验证才激活，源数据保留；目标已有库时区分打开已有目录与搬迁，禁止隐式合并/覆盖。
-- [ ] 搬迁后内部缩略图可用，入库编号、分析结果、配置不变；原始视频不移动，缺失不自动取消入库。
+- [x] 搬迁后内部缩略图引用位于目标 `.thumbnails` 内且可解析，入库编号/分析结果/配置不变；原始视频不移动，缺失不自动取消入库。
 
 ## 验证计划
 
@@ -53,4 +53,10 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 
 ### 2026-10-18 补充回归
 
-补充独立的旧布局迁移测试，并清理设置页未使用导入，提交 `8629fe4` 已推送到 PR #32。最终全量验证为 `python -m pytest -q`：374 passed；编译检查和 `git diff --check` 仍通过。
+补充独立的旧布局迁移测试，并清理设置页未使用导入，提交 `8629fe4` 已推送到 PR #32。该次全量验证为 `python -m pytest -q`：374 passed；编译检查和 `git diff --check` 通过。
+
+### 2026-10-19 评审修复与最终验证
+
+独立 Standards / Spec 评审后修复三项边界：目录迁移内部获取 `STORAGE_IO_LOCK`，与服务入口既有 `STORAGE_IO_LOCK → db.lock` 顺序一致；显式路径服务使用实例自己的数据库、配置、备份及缩略图路径搬迁；无 SQLite 数据库的旧布局先形成带 SHA-256 清单的源快照。数据库写入缩略图时归一成数据目录内 `.thumbnails/...` 相对引用，分页列表与详情读取则按数据库位置解析为绝对显示路径，避免受进程工作目录影响。
+
+最终验证：`python -m pytest -q`：395 passed；`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py` 通过；`git diff --check` 通过。定向验证 `python -m pytest -q tests/test_video_catalog.py tests/test_data_directory.py tests/test_settings_persist.py tests/test_data_directory_gui.py`：41 passed。PR #32 当前仍为 OPEN，尚无非作者批准，也没有自动状态检查；GUI 人工走查/截图证据尚未完成，合并前需要补齐。
