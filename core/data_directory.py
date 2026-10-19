@@ -1,6 +1,7 @@
 """统一管理数据目录、启动定位记录和可恢复目录搬迁。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -11,9 +12,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from core.storage_backup import write_json_atomic
+from core.storage_backup import (
+    STORAGE_IO_LOCK,
+    StorageBackupError,
+    StorageBackupManager,
+    write_json_atomic,
+)
 
 
 DATA_DIRECTORY_FORMAT = "video-organizer-data-root"
@@ -113,6 +119,22 @@ class DataDirectoryManager:
             if locator_path is not None
             else os.path.join(self.application_directory, LOCATOR_FILE_NAME)
         )
+        config_root = (
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("XDG_CONFIG_HOME")
+            or os.path.join(str(Path.home()), ".config")
+        )
+        app_key = hashlib.sha256(
+            os.path.normcase(self.application_directory).encode("utf-8")
+        ).hexdigest()[:16]
+        self.fallback_locator_path = os.path.abspath(
+            os.path.join(
+                config_root,
+                "VideoOrganizerPro",
+                app_key,
+                LOCATOR_FILE_NAME,
+            )
+        )
 
     @staticmethod
     def _default_application_directory() -> str:
@@ -127,22 +149,31 @@ class DataDirectoryManager:
         return self.paths_for(self.default_root)
 
     def read_locator(self) -> Optional[str]:
-        if not os.path.exists(self.locator_path):
+        candidates = [
+            path
+            for path in (self.locator_path, self.fallback_locator_path)
+            if os.path.exists(path)
+        ]
+        valid_payloads = []
+        for candidate in candidates:
+            try:
+                with open(candidate, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except Exception as exc:
+                raise DataDirectoryError(f"数据目录定位记录无法读取: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise DataDirectoryError("数据目录定位记录格式无效")
+            if payload.get("format") != DATA_DIRECTORY_FORMAT:
+                raise DataDirectoryError("数据目录定位记录格式不受支持")
+            if payload.get("version") != DATA_DIRECTORY_VERSION:
+                raise DataDirectoryError("数据目录定位记录版本不受支持")
+            root = payload.get("data_root")
+            if not isinstance(root, str) or not root.strip():
+                raise DataDirectoryError("数据目录定位记录缺少有效路径")
+            valid_payloads.append((payload.get("updated_at", ""), root))
+        if not valid_payloads:
             return None
-        try:
-            with open(self.locator_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except Exception as exc:
-            raise DataDirectoryError(f"数据目录定位记录无法读取: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise DataDirectoryError("数据目录定位记录格式无效")
-        if payload.get("format") != DATA_DIRECTORY_FORMAT:
-            raise DataDirectoryError("数据目录定位记录格式不受支持")
-        if payload.get("version") != DATA_DIRECTORY_VERSION:
-            raise DataDirectoryError("数据目录定位记录版本不受支持")
-        root = payload.get("data_root")
-        if not isinstance(root, str) or not root.strip():
-            raise DataDirectoryError("数据目录定位记录缺少有效路径")
+        _, root = max(valid_payloads, key=lambda item: item[0])
         return os.path.abspath(root)
 
     def write_locator(self, root: str) -> None:
@@ -153,7 +184,20 @@ class DataDirectoryManager:
             "data_root": root_path,
             "updated_at": datetime.now().astimezone().isoformat(),
         }
-        write_json_atomic(self.locator_path, payload)
+        try:
+            write_json_atomic(self.locator_path, payload)
+        except OSError as primary_error:
+            if os.path.normcase(self.fallback_locator_path) == os.path.normcase(self.locator_path):
+                raise DataDirectoryError(
+                    f"无法写入数据目录定位记录: {primary_error}"
+                ) from primary_error
+            try:
+                write_json_atomic(self.fallback_locator_path, payload)
+            except OSError as fallback_error:
+                raise DataDirectoryError(
+                    "程序目录和用户配置目录均无法写入数据目录定位记录: "
+                    f"{primary_error}; {fallback_error}"
+                ) from fallback_error
 
     def inspect(self) -> DataDirectoryInspection:
         selected = self.read_locator()
@@ -264,6 +308,19 @@ class DataDirectoryManager:
     def has_management_data(self, root: str) -> bool:
         return self._has_management_data(self.paths_for(root))
 
+    def activate_empty(self, root: str) -> DataPaths:
+        """选择一个空目录作为活动目录，不隐式覆盖已有管理数据。"""
+        paths = self.paths_for(root)
+        if os.path.exists(paths.root) and not os.path.isdir(paths.root):
+            raise DataDirectoryError(f"数据目录路径不是文件夹: {paths.root}")
+        if os.path.isdir(paths.root) and os.listdir(paths.root):
+            raise DataDirectoryConflictError("目标目录非空，不能按空目录激活")
+        if self._has_management_data(paths):
+            raise DataDirectoryConflictError("目标目录已有管理数据，不能按空目录激活")
+        self.ensure_writable(paths.root, create=True)
+        self.write_locator(paths.root)
+        return paths
+
     def activate_existing(self, root: str) -> DataPaths:
         """打开已有目录，不合并、不覆盖当前或目标数据。"""
         paths = self.paths_for(root)
@@ -296,37 +353,193 @@ class DataDirectoryManager:
             raise DataDirectoryError("当前数据目录没有可搬迁的管理数据")
         return self._copy_and_activate(source_root=source_root, target_root=target_root)
 
-    def _copy_and_activate(self, *, source_root: str, target_root: str) -> DataPaths:
+    def migrate_root(
+        self,
+        source_root: str,
+        target_root: str,
+        *,
+        source_paths: Optional[DataPaths] = None,
+    ) -> DataPaths:
+        """搬迁显式指定的数据根目录，验证成功后才激活目标。"""
+        source_paths = source_paths or self.paths_for(source_root)
+        if os.path.normcase(os.path.realpath(source_paths.root)) != os.path.normcase(
+            os.path.realpath(source_root)
+        ):
+            raise DataDirectoryError("数据目录源路径与管理数据路径不一致")
+        if not self._has_management_data(source_paths):
+            raise DataDirectoryError("数据目录源没有可搬迁的管理数据")
+        return self._copy_and_activate(
+            source_root=source_paths.root,
+            target_root=target_root,
+            source_paths=source_paths,
+        )
+
+    def _copy_and_activate(
+        self,
+        *,
+        source_root: str,
+        target_root: str,
+        source_paths: Optional[DataPaths] = None,
+    ) -> DataPaths:
+        with STORAGE_IO_LOCK:
+            return self._copy_and_activate_locked(
+                source_root=source_root,
+                target_root=target_root,
+                source_paths=source_paths,
+            )
+
+    def _copy_and_activate_locked(
+        self,
+        *,
+        source_root: str,
+        target_root: str,
+        source_paths: Optional[DataPaths] = None,
+    ) -> DataPaths:
         source_root = os.path.abspath(os.fspath(source_root))
         target_root = os.path.abspath(os.fspath(target_root))
-        if os.path.normcase(source_root) == os.path.normcase(target_root):
+        source_real = os.path.realpath(source_root)
+        target_real = os.path.realpath(target_root)
+        source_paths = source_paths or self.paths_for(source_root)
+        if os.path.normcase(source_real) == os.path.normcase(target_real):
             raise DataDirectoryError("数据目录源和目标不能相同")
-        if os.path.exists(target_root) and os.listdir(target_root):
+        for managed_dir in (source_paths.backups, source_paths.thumbnails):
+            managed_real = os.path.realpath(managed_dir)
+            try:
+                target_inside_managed = os.path.normcase(
+                    os.path.commonpath((managed_real, target_real))
+                ) == os.path.normcase(managed_real)
+            except ValueError:
+                target_inside_managed = False
+            if target_inside_managed:
+                raise DataDirectoryError("数据目录目标不能位于源备份或缩略图目录内部")
+        if os.path.exists(target_root) and not os.path.isdir(target_root):
+            raise DataDirectoryError(f"数据目录路径不是文件夹: {target_root}")
+        if os.path.isdir(target_root) and os.listdir(target_root):
             raise DataDirectoryConflictError(
                 "目标数据目录已有内容，必须明确选择打开已有目录或清空后重试；未执行合并。"
             )
         parent = os.path.dirname(target_root) or "."
         os.makedirs(parent, exist_ok=True)
+        target_was_empty_directory = os.path.isdir(target_root)
         stage = tempfile.mkdtemp(prefix=".data-migration-", dir=parent)
+        backup_stage = None
+        activated = False
         try:
+            backup_stage = tempfile.mkdtemp(prefix=".data-backup-", dir=parent)
             stage_paths = self.paths_for(stage)
             final_paths = self.paths_for(target_root)
-            self._copy_layout(self.paths_for(source_root), stage_paths, final_paths)
+            migration_backup = self._create_migration_backup(source_paths, backup_stage)
+            self._copy_layout(source_paths, stage_paths)
+            os.makedirs(stage_paths.backups, exist_ok=True)
+            shutil.copytree(
+                migration_backup,
+                os.path.join(stage_paths.backups, os.path.basename(migration_backup)),
+            )
             self._validate_copied_layout(stage_paths)
             if os.path.exists(target_root):
                 os.rmdir(target_root)
             os.replace(stage, target_root)
+            activated = True
             self.write_locator(target_root)
             return final_paths
         except Exception:
+            if activated and os.path.isdir(target_root):
+                shutil.rmtree(target_root, ignore_errors=True)
+                if target_was_empty_directory:
+                    os.makedirs(target_root, exist_ok=True)
             if os.path.exists(stage):
                 shutil.rmtree(stage, ignore_errors=True)
             raise
+        finally:
+            if os.path.exists(backup_stage):
+                shutil.rmtree(backup_stage, ignore_errors=True)
+
+    def _create_migration_backup(
+        self,
+        source_paths: DataPaths,
+        backup_dir: str,
+    ) -> str:
+        """在复制前创建源数据库与配置的一致性快照。"""
+        if not os.path.isfile(source_paths.database):
+            # 首次 JSON 导入前没有 SQLite 快照可用；将旧布局中的配置、结果
+            # 与缩略图复制到独立快照，并校验清单后再继续迁移。
+            snapshot_path = os.path.join(backup_dir, "legacy-source-snapshot")
+            try:
+                os.makedirs(snapshot_path, exist_ok=False)
+                for source, name in (
+                    (source_paths.settings, SETTINGS_NAME),
+                    (source_paths.tag_config, TAG_CONFIG_NAME),
+                    (source_paths.results_json, RESULTS_JSON_NAME),
+                    (source_paths.results_csv, RESULTS_CSV_NAME),
+                ):
+                    if os.path.isfile(source):
+                        shutil.copy2(source, os.path.join(snapshot_path, name))
+                if os.path.isdir(source_paths.thumbnails):
+                    shutil.copytree(
+                        source_paths.thumbnails,
+                        os.path.join(snapshot_path, THUMBNAILS_DIRECTORY_NAME),
+                    )
+                files = []
+                for directory, _, filenames in os.walk(snapshot_path):
+                    for filename in filenames:
+                        path = os.path.join(directory, filename)
+                        relative = os.path.relpath(path, snapshot_path).replace(
+                            os.sep, "/"
+                        )
+                        digest = hashlib.sha256()
+                        with open(path, "rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        files.append(
+                            {
+                                "path": relative,
+                                "size": os.path.getsize(path),
+                                "sha256": digest.hexdigest(),
+                            }
+                        )
+                manifest = {
+                    "format": "video-organizer-migration-source-snapshot",
+                    "version": 1,
+                    "status": "complete",
+                    "files": files,
+                }
+                write_json_atomic(os.path.join(snapshot_path, "manifest.json"), manifest)
+                for item in files:
+                    path = os.path.join(snapshot_path, *item["path"].split("/"))
+                    digest = hashlib.sha256()
+                    with open(path, "rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if (
+                        os.path.getsize(path) != item["size"]
+                        or digest.hexdigest() != item["sha256"]
+                    ):
+                        raise DataDirectoryError(
+                            f"旧布局快照校验失败: {item['path']}"
+                        )
+                return snapshot_path
+            except Exception as exc:
+                if isinstance(exc, DataDirectoryError):
+                    raise
+                raise DataDirectoryError(f"迁移前备份失败: {exc}") from exc
+        try:
+            manager = StorageBackupManager(
+                database_path=source_paths.database,
+                settings_path=source_paths.settings,
+                tag_config_path=source_paths.tag_config,
+                backup_dir=backup_dir,
+                settings_payload={},
+                tag_config_payload={},
+            )
+            backup_path = manager.create_backup()
+            manager.validate_backup(backup_path)
+            return backup_path
+        except StorageBackupError as exc:
+            raise DataDirectoryError(f"迁移前备份失败: {exc}") from exc
 
     def open_existing(self, root: str) -> DataPaths:
         """显式打开目标已有目录；不与当前目录合并。"""
         return self.activate_existing(root)
-
 
     def _legacy_items(self) -> list[str]:
         candidates = (
@@ -360,7 +573,11 @@ class DataDirectoryManager:
         )
 
     @staticmethod
-    def _validate_existing_database(path: str) -> None:
+    def _validate_existing_database(
+        path: str,
+        *,
+        verify_integrity: bool = False,
+    ) -> None:
         if not os.path.exists(path):
             return
         try:
@@ -368,7 +585,7 @@ class DataDirectoryManager:
             # 搬迁/复制验证，避免每次启动都扫描大型数据库。
             from core.startup_upgrade import inspect_database_file
 
-            inspect_database_file(path, verify_integrity=False)
+            inspect_database_file(path, verify_integrity=verify_integrity)
         except Exception as exc:
             if isinstance(exc, DataDirectoryError):
                 raise
@@ -378,7 +595,6 @@ class DataDirectoryManager:
         self,
         source_paths: DataPaths,
         stage_paths: DataPaths,
-        final_paths: DataPaths,
     ) -> None:
         os.makedirs(stage_paths.root, exist_ok=True)
         if os.path.isfile(source_paths.database):
@@ -400,7 +616,6 @@ class DataDirectoryManager:
         self._relocate_thumbnail_references(
             stage_paths.database,
             source_paths,
-            final_paths,
         )
 
     @staticmethod
@@ -424,7 +639,6 @@ class DataDirectoryManager:
     def _relocate_thumbnail_references(
         database_path: str,
         source_paths: DataPaths,
-        final_paths: DataPaths,
     ) -> None:
         if not os.path.isfile(database_path):
             return
@@ -446,7 +660,9 @@ class DataDirectoryManager:
                 )
                 candidate_real = os.path.realpath(candidate)
                 try:
-                    inside = os.path.commonpath((source_thumbnails, candidate_real)) == source_thumbnails
+                    inside = os.path.normcase(
+                        os.path.commonpath((source_thumbnails, candidate_real))
+                    ) == os.path.normcase(source_thumbnails)
                 except ValueError:
                     inside = False
                 if not inside:
@@ -463,8 +679,58 @@ class DataDirectoryManager:
             connection.close()
 
     @staticmethod
-    def _validate_copied_layout(paths: DataPaths) -> None:
-        DataDirectoryManager._validate_existing_database(paths.database)
+    def _validate_thumbnail_references(
+        paths: DataPaths,
+    ) -> None:
+        if not os.path.isfile(paths.database):
+            return
+        target_thumbnails = os.path.realpath(paths.thumbnails)
+        connection = sqlite3.connect(paths.database)
+        try:
+            rows = connection.execute(
+                "SELECT id, thumbnail FROM videos WHERE thumbnail IS NOT NULL"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            connection.close()
+            raise DataDirectoryError(f"缩略图引用无法读取: {exc}") from exc
+        try:
+            for row_id, raw_reference in rows:
+                if not raw_reference:
+                    continue
+                reference = os.fspath(raw_reference)
+                candidate = (
+                    reference
+                    if os.path.isabs(reference)
+                    else os.path.join(paths.root, reference)
+                )
+                candidate_real = os.path.realpath(candidate)
+                try:
+                    inside_target_thumbnails = os.path.normcase(
+                        os.path.commonpath((target_thumbnails, candidate_real))
+                    ) == os.path.normcase(target_thumbnails)
+                except ValueError:
+                    inside_target_thumbnails = False
+                if os.path.isabs(reference) or not inside_target_thumbnails:
+                    raise DataDirectoryError(
+                        "缩略图引用未使用目标数据目录内的相对路径 "
+                        f"（视频 {row_id}）: {reference}"
+                    )
+                if not os.path.isfile(candidate):
+                    raise DataDirectoryError(
+                        f"缩略图引用无效（视频 {row_id}）: {reference}"
+                    )
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _validate_copied_layout(
+        paths: DataPaths,
+    ) -> None:
+        DataDirectoryManager._validate_existing_database(
+            paths.database,
+            verify_integrity=True,
+        )
+        DataDirectoryManager._validate_thumbnail_references(paths)
         for path, label in (
             (paths.settings, "settings.json"),
             (paths.tag_config, "tag_config.json"),

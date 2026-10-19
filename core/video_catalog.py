@@ -102,11 +102,25 @@ def _decode_json(value: Any, fallback: Any) -> Any:
     return parsed if isinstance(parsed, type(fallback)) else fallback
 
 
-def _row_to_list_video(row: Mapping[str, Any]) -> Dict[str, Any]:
+def _resolve_thumbnail_path(
+    reference: Any,
+    data_root: Optional[str],
+) -> Any:
+    if reference and not os.path.isabs(str(reference)) and data_root:
+        return os.path.abspath(os.path.join(data_root, str(reference)))
+    return reference
+
+
+def _row_to_list_video(
+    row: Mapping[str, Any],
+    data_root: Optional[str] = None,
+) -> Dict[str, Any]:
     d = dict(row)
     d["tags"] = _decode_json(d.get("tags"), [])
     d["tag_groups"] = _decode_json(d.get("tag_groups"), {})
-    d["thumbnail_path"] = d.get("thumbnail")
+    d["thumbnail_path"] = _resolve_thumbnail_path(
+        d.get("thumbnail"), data_root
+    )
     d["library_id"] = d.get("id")
     # Keep the same public hard-delete semantics as DatabaseManager.
     d["emotion"] = None
@@ -193,6 +207,12 @@ class VideoCatalog:
 
     def __init__(self, db: Any):
         self.db = db
+        database_path = getattr(db, "db_path", None)
+        self.data_root = (
+            os.path.dirname(os.path.abspath(os.fspath(database_path)))
+            if database_path
+            else None
+        )
 
     def _where(self, query: VideoQuery) -> Tuple[str, List[Any]]:
         clauses: List[str] = []
@@ -343,7 +363,7 @@ class VideoCatalog:
         for row in rows:
             data = dict(row)
             data.pop("_total_count", None)
-            projected_rows.append(_row_to_list_video(data))
+            projected_rows.append(_row_to_list_video(data, self.data_root))
         return VideoPage(
             rows=projected_rows,
             total_count=total_count,
@@ -369,7 +389,9 @@ class VideoCatalog:
         row["raw_metadata"] = _decode_json(row.get("raw_metadata"), {})
         row["face_clusters"] = _decode_json(row.get("face_clusters"), [])
         row["tag_groups"] = _decode_json(row.get("tag_groups"), {})
-        row["thumbnail_path"] = row.get("thumbnail")
+        row["thumbnail_path"] = _resolve_thumbnail_path(
+            row.get("thumbnail"), self.data_root
+        )
         row["library_id"] = row.get("id")
         row["emotion"] = None
         row["composition"] = None

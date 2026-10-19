@@ -692,7 +692,10 @@ class TagsView(QWidget):
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
         self.service = service
-        self.import_service = TagImportService(service.ai)
+        self.import_service = TagImportService(
+            service.ai,
+            tag_config_path=getattr(service, "_tag_config_path", None),
+        )
         self.ui_colors = self._resolve_colors()
         
         # 初始化模型
