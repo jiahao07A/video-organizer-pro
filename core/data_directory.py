@@ -204,7 +204,11 @@ class DataDirectoryManager:
         if selected is not None:
             try:
                 self.ensure_writable(selected, create=False)
-                self._validate_existing_database(self.paths_for(selected).database)
+                self._validate_existing_database(
+                    self.paths_for(selected).database,
+                    require=True,
+                )
+                self._validate_existing_data_writable(self.paths_for(selected))
             except DataDirectoryError as exc:
                 return DataDirectoryInspection(
                     state=DataDirectoryState.INVALID,
@@ -239,7 +243,8 @@ class DataDirectoryManager:
         if self._has_management_data(default_paths):
             try:
                 self.ensure_writable(default_paths.root, create=False)
-                self._validate_existing_database(default_paths.database)
+                self._validate_existing_database(default_paths.database, require=True)
+                self._validate_existing_data_writable(default_paths)
             except DataDirectoryError as exc:
                 return DataDirectoryInspection(
                     state=DataDirectoryState.INVALID,
@@ -308,6 +313,34 @@ class DataDirectoryManager:
     def has_management_data(self, root: str) -> bool:
         return self._has_management_data(self.paths_for(root))
 
+    def _validate_existing_data_writable(self, paths: DataPaths) -> None:
+        """验证已有管理文件可被当前应用继续写入。"""
+        self.ensure_writable(paths.root, create=False)
+        for path, label in (
+            (paths.database, "数据库"),
+            (paths.settings, "设置文件"),
+            (paths.tag_config, "标签配置"),
+        ):
+            if os.path.exists(path) and not os.access(path, os.W_OK):
+                raise DataDirectoryError(f"{label}不可写，请选择其他数据目录: {path}")
+        for directory, label in (
+            (paths.backups, "备份目录"),
+            (paths.thumbnails, "缩略图目录"),
+        ):
+            if os.path.isdir(directory) and not os.access(directory, os.W_OK):
+                raise DataDirectoryError(f"{label}不可写，请选择其他数据目录: {directory}")
+
+    def has_openable_management_data(self, root: str) -> bool:
+        """目标目录包含可安全打开的有效数据库。"""
+        paths = self.paths_for(root)
+        if not os.path.isfile(paths.database):
+            return False
+        try:
+            self._validate_existing_database(paths.database, require=True)
+            return True
+        except DataDirectoryError:
+            return False
+
     def activate_empty(self, root: str) -> DataPaths:
         """选择一个空目录作为活动目录，不隐式覆盖已有管理数据。"""
         paths = self.paths_for(root)
@@ -324,10 +357,10 @@ class DataDirectoryManager:
     def activate_existing(self, root: str) -> DataPaths:
         """打开已有目录，不合并、不覆盖当前或目标数据。"""
         paths = self.paths_for(root)
-        if not self._has_management_data(paths):
+        if not self._has_management_data(paths) or not os.path.isfile(paths.database):
             raise DataDirectoryError("目标目录没有可打开的管理数据")
-        self.ensure_writable(paths.root, create=False)
-        self._validate_existing_database(paths.database)
+        self._validate_existing_data_writable(paths)
+        self._validate_existing_database(paths.database, require=True)
         self.write_locator(paths.root)
         return paths
 
@@ -577,9 +610,14 @@ class DataDirectoryManager:
         path: str,
         *,
         verify_integrity: bool = False,
+        require: bool = False,
     ) -> None:
         if not os.path.exists(path):
+            if require:
+                raise DataDirectoryError(f"数据库不存在: {path}")
             return
+        if not os.path.isfile(path):
+            raise DataDirectoryError(f"数据库路径不是文件: {path}")
         try:
             # 普通目录定位只检查版本和核心结构；完整 quick_check 留给显式
             # 搬迁/复制验证，避免每次启动都扫描大型数据库。

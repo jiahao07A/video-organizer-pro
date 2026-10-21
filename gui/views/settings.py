@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
 )
 from PySide6.QtCore import QObject, QThread, QThreadPool, Signal, Qt
+import threading
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from core.data_directory import DataDirectoryError
 from core.model_providers import (
@@ -40,10 +41,10 @@ def _window_has_active_background_work(window) -> bool:
     widgets = [window, *window.findChildren(QWidget)]
     if any(thread.isRunning() for thread in window.findChildren(QThread)):
         return True
-    if QThreadPool.globalInstance().activeThreadCount() > 0:
-        return True
     for widget in widgets:
         for value in vars(widget).values():
+            if isinstance(value, threading.Thread) and value.is_alive():
+                return True
             if isinstance(value, QThread) and value.isRunning():
                 return True
             if isinstance(value, QThreadPool) and value.activeThreadCount() > 0:

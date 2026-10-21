@@ -152,7 +152,47 @@ def test_existing_target_is_not_implicitly_merged_or_overwritten(tmp_path: Path)
     assert not (source / ".video-organizer-data.json").exists()
 
 
-def test_target_inside_source_thumbnail_directory_is_rejected(tmp_path: Path):
+def test_partial_management_directory_is_not_openable(tmp_path: Path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "settings.json").write_text("{}", encoding="utf-8")
+    manager = DataDirectoryManager(application_directory=str(tmp_path / "app"))
+
+    assert manager.has_management_data(str(selected)) is True
+    assert manager.has_openable_management_data(str(selected)) is False
+    with pytest.raises(DataDirectoryError, match="没有可打开"):
+        manager.open_existing(str(selected))
+
+
+def test_existing_management_file_permission_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import core.data_directory as data_directory_module
+
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    _make_database(selected / "video_organizer.db")
+    settings = selected / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    manager = DataDirectoryManager(application_directory=str(tmp_path / "app"))
+    original_access = data_directory_module.os.access
+
+    def deny_settings(path, mode):
+        if os.path.abspath(path) == os.path.abspath(settings) and mode == os.W_OK:
+            return False
+        return original_access(path, mode)
+
+    monkeypatch.setattr(data_directory_module.os, "access", deny_settings)
+
+    inspection = manager.__class__(application_directory=str(tmp_path / "app"))
+    inspection.write_locator(str(selected))
+    result = inspection.inspect()
+
+    assert result.state is DataDirectoryState.INVALID
+    assert "设置文件不可写" in result.message
+
+
+
     source = tmp_path / "source"
     source.mkdir()
     (source / "video_organizer.db").write_bytes(b"legacy")
