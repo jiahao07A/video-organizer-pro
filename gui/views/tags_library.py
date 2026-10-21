@@ -1173,11 +1173,15 @@ class TagsView(QWidget):
         """异步刷新统计数据以提高性能"""
         import threading
         def run():
-            self.service.db.refresh_tag_usage_counts()
-            from PySide6.QtCore import QMetaObject, Qt
-            QMetaObject.invokeMethod(self, "load_data_silent", Qt.QueuedConnection)
+            try:
+                self.service.db.refresh_tag_usage_counts()
+                from PySide6.QtCore import QMetaObject, Qt
+                QMetaObject.invokeMethod(self, "load_data_silent", Qt.QueuedConnection)
+            finally:
+                self._usage_refresh_thread = None
             
-        threading.Thread(target=run, daemon=True).start()
+        self._usage_refresh_thread = threading.Thread(target=run, daemon=True)
+        self._usage_refresh_thread.start()
 
     @Slot()
     def load_data_silent(self):

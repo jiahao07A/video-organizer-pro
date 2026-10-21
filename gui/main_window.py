@@ -6,11 +6,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer
 from .views.workstation import WorkstationView
+
 from .views.material_library import MaterialLibraryView
 from .views.tags_library import TagsView
 from .views.settings import SettingsView
 from .styles import get_main_style, normalize_theme
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
+
 
 class MainWindow(QMainWindow):
     def __init__(self, service: VideoOrganizerService):
@@ -47,7 +49,7 @@ class MainWindow(QMainWindow):
         theme = normalize_theme(raw_theme)
         if raw_theme != theme:
             SettingsManager.update_setting(self.settings, "ui_preferences.theme", theme)
-            SettingsManager.save_settings(self.settings)
+            SettingsManager.save_settings(self.settings, self.service.db)
         self.setStyleSheet(get_main_style(font_size, theme))
         self._propagate_theme(theme)
         self.apply_sidebar_width()
@@ -153,6 +155,7 @@ class MainWindow(QMainWindow):
 
         # 只创建默认页；其余页面在首次进入时创建并缓存。
         self._ensure_page(0)
+        self.content_stack.setCurrentWidget(self.workstation_page)
         self.workstation_page.load_data()
         expanded = SettingsManager.get_setting(
             self.settings, "ui_preferences.detail_panel_expanded", True
@@ -293,7 +296,7 @@ class MainWindow(QMainWindow):
         )
         new_theme = "light" if current_theme == "dark" else "dark"
         SettingsManager.update_setting(self.settings, "ui_preferences.theme", new_theme)
-        SettingsManager.save_settings(self.settings)
+        SettingsManager.save_settings(self.settings, self.service.db)
         self.refresh_style()
 
     def run_backup(self):

@@ -52,6 +52,23 @@ def test_data_directory_switch_detects_unparented_analysis_worker():
         app.processEvents()
 
 
+def test_data_directory_switch_detects_python_thread_on_child_widget():
+    app = QApplication.instance() or QApplication([])
+    window = QWidget()
+    child = QWidget(window)
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, args=(3,), daemon=True)
+    child.worker = worker
+    worker.start()
+    try:
+        assert _window_has_active_background_work(window) is True
+    finally:
+        release.set()
+        worker.join(3)
+        window.close()
+        app.processEvents()
+
+
 def test_data_directory_switch_detects_thumbnail_model_thread_pool():
     app = QApplication.instance() or QApplication([])
     window = QWidget()
