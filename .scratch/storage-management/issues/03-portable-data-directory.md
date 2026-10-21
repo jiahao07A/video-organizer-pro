@@ -60,3 +60,11 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 独立 Standards / Spec 评审后修复三项边界：目录迁移内部获取 `STORAGE_IO_LOCK`，与服务入口既有 `STORAGE_IO_LOCK → db.lock` 顺序一致；显式路径服务使用实例自己的数据库、配置、备份及缩略图路径搬迁；无 SQLite 数据库的旧布局先形成带 SHA-256 清单的源快照。数据库写入缩略图时归一成数据目录内 `.thumbnails/...` 相对引用，分页列表与详情读取则按数据库位置解析为绝对显示路径，避免受进程工作目录影响。
 
 最终验证：`python -m pytest -q`：395 passed；`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py` 通过；`git diff --check` 通过。定向验证 `python -m pytest -q tests/test_video_catalog.py tests/test_data_directory.py tests/test_settings_persist.py tests/test_data_directory_gui.py`：41 passed。PR #32 当前仍为 OPEN，尚无非作者批准，也没有自动状态检查；GUI 人工走查/截图证据尚未完成，合并前需要补齐。
+
+### 2026-10-21 数据目录复核与安全人工测试工具
+
+补充现有目录边界：打开已有管理数据目录前验证数据库有效性及数据库/设置/标签配置/备份/缩略图目录的可写性；无有效数据库或管理文件不可写时拒绝打开。设置页目录切换检查所有子控件关联的 Python 后台线程，标签统计刷新在结束时清除线程引用。主题保存显式使用当前服务数据库。
+
+为支持 #10 的脱敏 GUI 走查，增加隔离的临时人工测试环境：临时数据库、设置、标签配置和合成素材位于系统临时根；诊断日志及清理报告独立保留在 `logs/manual-tests/`。`python tools/manual_gui_test.py --records 2 --offscreen` 验证启动与清理，清理报告显示 `temp_data_removed: true`、`errors: []`。此检查不能替代可见窗口的 Windows 人工走查，截图/录屏尚未完成。
+
+验证：`python -m pytest tests/test_data_directory.py tests/test_data_directory_gui.py tests/test_manual_test_environment.py -q`（31 passed）；`python -m compileall -q core gui tests tools` 通过；`git diff --check` 通过。全量测试需在本分支提交后补充运行结果。
