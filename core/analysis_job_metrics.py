@@ -247,6 +247,10 @@ def new_job_metrics(
 
 
 def default_log_dir() -> str:
+    """返回分析诊断目录，支持人工测试会话覆盖默认位置。"""
+    configured = os.environ.get("VIDEO_ORGANIZER_ANALYSIS_LOG_DIR")
+    if configured:
+        return os.path.abspath(configured)
     base = os.path.abspath(".")
     return os.path.join(base, "logs", "analysis_jobs")
 

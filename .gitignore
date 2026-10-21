@@ -33,4 +33,7 @@ __pycache__/
 .vscode/
 .idea/
 *.log
-logs/
+logs/*
+!logs/manual-tests/
+logs/manual-tests/*
+!logs/manual-tests/.gitkeep
