@@ -154,23 +154,23 @@ SETTINGS_ENTRIES: Tuple[SettingsEntry, ...] = (
     # —— AI 页签（敏感 / 路由，明确保存区）——
     SettingsEntry(
         "api.key", "api_key", "API Key",
-        "ai", ("key", "密钥", "api", "供应商"),
-        MANUAL, "当前供应商的 Key；保存后重建 AI 客户端对新请求生效。", 1,
+        "ai", ("key", "密钥", "api", "供应商", "凭据"),
+        MANUAL, "所选供应商档案的 API Key；保存 AI 设置后对新请求生效。", 1,
     ),
     SettingsEntry(
         "api.base_url", "api_url", "API Base URL",
-        "ai", ("base", "url", "地址", "接口"),
-        MANUAL, "当前供应商的服务地址；保存后重建 AI 客户端对新请求生效。", 1,
+        "ai", ("base", "url", "地址", "接口", "端点"),
+        MANUAL, "所选供应商档案的服务地址；保存 AI 设置后对新请求生效。", 1,
     ),
     SettingsEntry(
-        "model_providers", "provider_list", "模型供应商",
-        "ai", ("供应商", "档案", "provider"),
-        MANUAL, "最多五个连接档案，保存后落盘。", 1,
+        "model_providers", "provider_list", "模型供应商档案",
+        "ai", ("供应商", "档案", "provider", "当前供应商"),
+        MANUAL, "最多五个连接档案；当前供应商是未指定任务的默认回退。", 1,
     ),
     SettingsEntry(
         "task_model_routing", "task_routing", "任务模型路由",
-        "ai", ("路由", "模型", "routing", "分类", "标签", "描述"),
-        MANUAL, "为每个 AI 功能指定供应商与模型，保存后对新请求生效。", 1,
+        "ai", ("路由", "模型", "routing", "分类", "标签", "描述", "连接测试"),
+        MANUAL, "为每项 AI 功能指定供应商与模型，并可按任务测试；保存 AI 设置后对新请求生效。", 1,
     ),
     # —— 提示词页签（明确保存区）——
     SettingsEntry(

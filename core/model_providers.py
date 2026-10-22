@@ -10,6 +10,19 @@ MAX_PROVIDERS = 5
 DEFAULT_DISPLAY_NAME = "默认"
 LEGACY_DEFAULT_BASE_URL = "https://vqnypowwewrv.ap-northeast-1.clawcloudrun.com/v1"
 DEFAULT_MODEL = "gemini-2.0-flash"
+API_PROTOCOL_CHAT_COMPLETIONS = "chat_completions"
+API_PROTOCOL_RESPONSES = "responses"
+API_PROTOCOLS = (
+    API_PROTOCOL_CHAT_COMPLETIONS,
+    API_PROTOCOL_RESPONSES,
+)
+
+
+def normalize_api_protocol(value: Any) -> str:
+    protocol = str(value or "").strip().lower()
+    if protocol in API_PROTOCOLS:
+        return protocol
+    return API_PROTOCOL_CHAT_COMPLETIONS
 
 MODEL_KEYS = (
     "video_classification",
@@ -76,12 +89,14 @@ def make_provider(
     api_key: str = "",
     base_url: str = "",
     models: Optional[Dict[str, str]] = None,
+    api_protocol: str = API_PROTOCOL_CHAT_COMPLETIONS,
 ) -> Dict[str, Any]:
     return {
         "id": provider_id or new_provider_id(),
         "display_name": (display_name or DEFAULT_DISPLAY_NAME).strip() or DEFAULT_DISPLAY_NAME,
         "api_key": api_key or "",
         "base_url": base_url or "",
+        "api_protocol": normalize_api_protocol(api_protocol),
         "models": _normalize_models(models),
     }
 
@@ -102,6 +117,7 @@ def list_providers(settings: Dict) -> List[Dict[str, Any]]:
                 api_key=str(item.get("api_key") or ""),
                 base_url=str(item.get("base_url") or ""),
                 models=item.get("models"),
+                api_protocol=str(item.get("api_protocol") or API_PROTOCOL_CHAT_COMPLETIONS),
             )
         )
     return out
@@ -295,6 +311,7 @@ def resolve_task_route(settings: Dict, task_key: str) -> Dict[str, Any]:
         "display_name": provider.get("display_name") or "",
         "api_key": provider.get("api_key") or "",
         "base_url": provider.get("base_url") or "",
+        "api_protocol": normalize_api_protocol(provider.get("api_protocol")),
         "model": model,
     }
 
@@ -398,6 +415,7 @@ def update_provider(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     models: Optional[Dict[str, str]] = None,
+    api_protocol: Optional[str] = None,
 ) -> Dict:
     ensure_providers(settings)
     providers = list_providers(settings)
@@ -413,6 +431,8 @@ def update_provider(
             p["base_url"] = base_url or ""
         if models is not None:
             p["models"] = _normalize_models(models)
+        if api_protocol is not None:
+            p["api_protocol"] = normalize_api_protocol(api_protocol)
         providers[i] = p
         found = True
         break
@@ -432,6 +452,7 @@ def add_provider(
     base_url: str = "",
     models: Optional[Dict[str, str]] = None,
     set_as_current: bool = False,
+    api_protocol: str = API_PROTOCOL_CHAT_COMPLETIONS,
 ) -> Tuple[Dict, Dict[str, Any]]:
     """新增档案；已满五个时抛 ProviderLimitError。"""
     ensure_providers(settings)
@@ -446,6 +467,7 @@ def add_provider(
         api_key=api_key if api_key is not None else "",
         base_url=base_url if base_url else (current.get("base_url") or ""),
         models=models if models is not None else current.get("models"),
+        api_protocol=api_protocol if api_protocol is not None else current.get("api_protocol"),
     )
     providers.append(provider)
     settings["model_providers"] = providers
@@ -490,6 +512,7 @@ def replace_providers(settings: Dict, providers: List[Dict[str, Any]], current_i
                 api_key=str(item.get("api_key") or ""),
                 base_url=str(item.get("base_url") or ""),
                 models=item.get("models"),
+                api_protocol=item.get("api_protocol", API_PROTOCOL_CHAT_COMPLETIONS),
             )
         )
         if len(cleaned) >= MAX_PROVIDERS:

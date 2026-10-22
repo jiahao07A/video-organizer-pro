@@ -22,7 +22,12 @@ from core.analysis_job_policy import (
     should_retry_call,
     sleep_backoff,
 )
-from core.model_providers import list_providers, resolve_current_provider, resolve_task_route
+from core.model_providers import (
+    list_providers,
+    normalize_api_protocol,
+    resolve_current_provider,
+    resolve_task_route,
+)
 
 
 logger = logging.getLogger("VideoOrganizer.AI")
@@ -188,6 +193,7 @@ class AiRequestGateway:
                 "display_name": "默认",
                 "api_key": api.get("key") or "",
                 "base_url": api.get("base_url") or "",
+                "api_protocol": "chat_completions",
             }
         return {
             "task_key": "_current_provider",
@@ -195,6 +201,7 @@ class AiRequestGateway:
             "display_name": provider.get("display_name") or "",
             "api_key": provider.get("api_key") or "",
             "base_url": provider.get("base_url") or "",
+            "api_protocol": normalize_api_protocol(provider.get("api_protocol")),
             "model": "",
         }
 
@@ -228,35 +235,153 @@ class AiRequestGateway:
             self._clients[fingerprint] = client
         return client, route
 
-    def test_connection(self, task_key: str = "video_classification") -> Dict[str, Any]:
-        """调用供应商模型列表接口验证路由连接，不返回凭据。"""
-        client, route = self.client_for_task(task_key)
+    def list_models(self, task_key: str = "video_classification") -> List[str]:
+        """获取所选任务最终解析供应商的模型 ID 列表，最多读取 20 页。"""
+        client, _route = self.client_for_task(task_key)
+        models_api = getattr(client, "models", None)
+        list_method = getattr(models_api, "list", None)
+        if not callable(list_method):
+            raise RuntimeError("当前服务不支持获取模型列表；请手动输入模型 ID")
         try:
-            models_api = getattr(client, "models", None)
-            list_models = getattr(models_api, "list", None)
-            if not callable(list_models):
-                raise RuntimeError("当前客户端不支持模型列表探测")
-            response = list_models()
+            page = list_method()
+            model_ids = set()
+            pages = 0
+            while page is not None and pages < 20:
+                pages += 1
+                for model in getattr(page, "data", None) or []:
+                    model_id = model.get("id") if isinstance(model, dict) else getattr(model, "id", None)
+                    if model_id:
+                        model_ids.add(str(model_id))
+                has_next = getattr(page, "has_next_page", None)
+                get_next = getattr(page, "get_next_page", None)
+                if not callable(has_next) or not has_next() or not callable(get_next):
+                    break
+                page = get_next()
+            return sorted(model_ids, key=str.casefold)
         except Exception as error:
-            code = _status_code(error)
-            if code in (401, 403):
-                raise RuntimeError("鉴权失败，请检查 API Key") from error
-            if code == 404:
-                raise RuntimeError("接口地址不存在，请检查 API Base URL") from error
-            text = _error_message(error)
-            lowered = text.lower()
-            if any(marker in lowered for marker in ("timeout", "timed out", "connection", "connect")):
-                raise RuntimeError("网络连接失败，请检查网络或 API Base URL") from error
-            raise RuntimeError(f"连接失败：{text}") from error
+            raise self._classify_connection_error(error) from error
 
-        data = getattr(response, "data", None)
-        count = len(data) if isinstance(data, (list, tuple)) else None
+    @staticmethod
+    def _classify_connection_error(error: BaseException) -> RuntimeError:
+        code = _status_code(error)
+        if code in (401, 403):
+            return RuntimeError("鉴权失败，请检查 API Key")
+        if code == 404:
+            return RuntimeError("接口地址不存在或当前协议不受支持，请检查 API Base URL 和协议")
+        text = _error_message(error)
+        lowered = text.lower()
+        if code in (400, 422) and any(marker in lowered for marker in ("model", "model_not_found", "does not exist")):
+            return RuntimeError(f"模型不可用或不支持所选协议：{text}")
+        if code in (400, 422) and any(marker in lowered for marker in ("responses", "unsupported", "not support", "unknown parameter")):
+            return RuntimeError(f"当前服务不支持所选 API 协议：{text}")
+        if any(marker in lowered for marker in ("timeout", "timed out", "connection", "connect")):
+            return RuntimeError("网络连接失败，请检查网络或 API Base URL")
+        return RuntimeError(f"连接失败：{text}")
+
+    @staticmethod
+    def _responses_output_text(response: Any) -> str:
+        text = getattr(response, "output_text", None)
+        if isinstance(text, str) and text.strip():
+            return text
+        outputs = getattr(response, "output", None) or []
+        parts = []
+        for output in outputs:
+            if isinstance(output, dict):
+                content = output.get("content") or []
+            else:
+                content = getattr(output, "content", None) or []
+            for item in content:
+                if isinstance(item, dict):
+                    kind = item.get("type")
+                    value = item.get("text")
+                else:
+                    kind = getattr(item, "type", None)
+                    value = getattr(item, "text", None)
+                if kind == "refusal":
+                    raise AiResponseError(f"模型拒绝返回内容: {_content_to_text(value)}")
+                if kind in ("output_text", "text") and value:
+                    parts.append(_content_to_text(value))
+        result = "".join(parts)
+        if not result.strip():
+            raise AiResponseError("empty body")
+        return result
+
+    @staticmethod
+    def _responses_input(content_parts: List[Any]) -> List[Dict[str, Any]]:
+        converted = []
+        for part in content_parts or []:
+            if not isinstance(part, dict):
+                converted.append({"type": "input_text", "text": str(part)})
+                continue
+            if part.get("type") == "text":
+                converted.append({"type": "input_text", "text": str(part.get("text") or "")})
+            elif part.get("type") == "image_url":
+                image = part.get("image_url") or {}
+                image_url = image.get("url") if isinstance(image, dict) else image
+                converted.append({"type": "input_image", "image_url": image_url})
+        return converted
+
+    @classmethod
+    def _create_response(
+        cls,
+        client: Any,
+        *,
+        model: str,
+        system_prompt: str,
+        content_parts: List[Any],
+        json_mode: bool = False,
+        max_output_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Any:
+        responses_api = getattr(client, "responses", None)
+        create = getattr(responses_api, "create", None)
+        if not callable(create):
+            raise RuntimeError("当前 OpenAI SDK 客户端不支持 Responses API")
+        kwargs = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": [{"role": "user", "content": cls._responses_input(content_parts)}],
+        }
+        if json_mode:
+            kwargs["text"] = {"format": {"type": "json_object"}}
+        if max_output_tokens is not None:
+            kwargs["max_output_tokens"] = max_output_tokens
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        return create(**kwargs)
+
+    def test_connection(self, task_key: str = "video_classification") -> Dict[str, Any]:
+        """用所选任务当前模型发送最小推理请求验证协议和连通性。"""
+        client, route = self.client_for_task(task_key)
+        protocol = normalize_api_protocol(route.get("api_protocol"))
+        try:
+            if protocol == "responses":
+                response = self._create_response(
+                    client,
+                    model=route["model"],
+                    system_prompt="Reply with OK.",
+                    content_parts=[{"type": "text", "text": "Reply with OK."}],
+                    max_output_tokens=8,
+                )
+                output = self._responses_output_text(response)
+            else:
+                response = client.chat.completions.create(
+                    model=route["model"],
+                    messages=[{"role": "user", "content": "Reply with OK."}],
+                    max_tokens=8,
+                    temperature=0,
+                )
+                output = _content_to_text(_message_content(response))
+        except Exception as error:
+            raise self._classify_connection_error(error) from error
+
         return {
             "task_key": task_key,
             "provider_id": route.get("provider_id") or "",
             "display_name": route.get("display_name") or "",
+            "api_protocol": protocol,
             "model": route.get("model") or "",
-            "model_count": count,
+            "response_preview": output[:80],
         }
 
     def reload(self) -> Any:
@@ -327,21 +452,23 @@ class AiRequestGateway:
         use_client = client
         use_model = model
         if task_key:
-            # 模型与连接来自同一份路由快照，避免设置切换时混用两次解析结果。
+            # 模型、连接和协议必须来自同一个解析快照。
             if use_client is None:
                 use_client, route = self.client_for_task(task_key)
             else:
                 route = self.resolve_route(task_key)
-            # 任务路由中的模型是唯一真相；显式 client 只用于测试或特殊适配器。
             use_model = str(route.get("model") or model or "gemini-2.0-flash")
+        else:
+            route = self._current_route()
         if use_client is None:
             use_client = self.default_client()
 
         cfg = retry_config or RetryConfig.from_settings(self.settings)
         self._set_failure(None)
         attempt = 0
-        compatibility_fallback_used = False
+        protocol = normalize_api_protocol(route.get("api_protocol"))
         include_response_format = bool(json_mode)
+        compatibility_fallback_used = False
 
         while True:
             if self._cancelled(cancel_event):
@@ -357,20 +484,30 @@ class AiRequestGateway:
                 json_mode,
                 attempt,
             )
-            kwargs: Dict[str, Any] = {
-                "model": use_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content_parts},
-                ],
-                "temperature": 0.2,
-            }
-            if include_response_format:
-                kwargs["response_format"] = {"type": "json_object"}
-
             try:
-                response = use_client.chat.completions.create(**kwargs)
-                content = _message_content(response)
+                if protocol == "responses":
+                    response = self._create_response(
+                        use_client,
+                        model=use_model,
+                        system_prompt=system_prompt,
+                        content_parts=content_parts,
+                        json_mode=bool(json_mode and include_response_format),
+                        temperature=0.2,
+                    )
+                    content = self._responses_output_text(response)
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "model": use_model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": content_parts},
+                        ],
+                        "temperature": 0.2,
+                    }
+                    if include_response_format:
+                        kwargs["response_format"] = {"type": "json_object"}
+                    response = use_client.chat.completions.create(**kwargs)
+                    content = _message_content(response)
                 result = _parse_json_content(content) if json_mode else content
                 self._set_failure(None)
                 self._record_metrics(

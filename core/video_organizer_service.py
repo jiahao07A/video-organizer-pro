@@ -2336,8 +2336,18 @@ class VideoOrganizerService:
         if hasattr(self, "tag_processor") and self.tag_processor is not None:
             self.tag_processor.settings = self.settings
 
-    def test_ai_connection(self, task_key: str = "video_classification") -> Dict:
-        """测试指定任务模型路由的连接，不保存设置或暴露凭据。"""
+    def list_ai_models(self, task_key: str = "video_classification", settings: Optional[Dict] = None) -> List[str]:
+        """读取指定草稿或活动路由的服务端模型目录，不修改设置。"""
+        if settings is not None:
+            return AiRequestGateway(settings).list_models(task_key)
+        self.gateway.settings = self.settings
+        return self.gateway.list_models(task_key)
+
+    def test_ai_connection(self, task_key: str = "video_classification", settings: Optional[Dict] = None) -> Dict:
+        """测试指定路由；可用隔离设置副本验证草稿而不触碰活动 AI 配置。"""
+        if settings is not None:
+            gateway = AiRequestGateway(settings)
+            return gateway.test_connection(task_key)
         if not hasattr(self, "ai") or self.ai is None:
             raise RuntimeError("AI 引擎尚未初始化")
         return self.ai.test_connection(task_key)

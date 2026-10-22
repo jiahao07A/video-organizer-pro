@@ -40,6 +40,33 @@ def _legacy_settings(**api_overrides):
     return s
 
 
+def test_legacy_provider_protocol_defaults_to_chat_completions_and_replace_preserves_responses():
+    from core.model_providers import replace_providers
+
+    settings = {
+        "model_providers": [
+            {"id": "legacy", "display_name": "Legacy", "api_key": "key", "models": {}}
+        ],
+        "current_provider_id": "legacy",
+    }
+    ensure_providers(settings)
+    assert list_providers(settings)[0]["api_protocol"] == "chat_completions"
+    providers = [dict(list_providers(settings)[0], api_protocol="responses")]
+    replace_providers(settings, providers, "legacy")
+    assert list_providers(settings)[0]["api_protocol"] == "responses"
+
+
+def test_resolve_task_route_includes_provider_protocol():
+    from core.model_providers import make_provider
+
+    settings = {
+        "model_providers": [make_provider(provider_id="p", api_protocol="responses")],
+        "current_provider_id": "p",
+    }
+    assert resolve_task_route(settings, "pending_tag_ai")["api_protocol"] == "responses"
+
+
+
 def test_migrate_legacy_api_to_default_provider():
     s = _legacy_settings()
     migrate_legacy_api_to_providers(s)

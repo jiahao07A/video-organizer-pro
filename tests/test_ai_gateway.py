@@ -399,7 +399,13 @@ def test_connection_probe_uses_selected_task_route_without_credentials(monkeypat
     }
     set_task_route(settings, "pending_tag_ai", provider_id="p1", model="cheap-model")
     client = SimpleNamespace(
-        models=SimpleNamespace(list=lambda: SimpleNamespace(data=["a", "b"]))
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_: SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))]
+                )
+            )
+        )
     )
     monkeypatch.setattr("core.ai_gateway.OpenAI", lambda **_: client)
     gateway = AiRequestGateway(settings)
@@ -410,10 +416,69 @@ def test_connection_probe_uses_selected_task_route_without_credentials(monkeypat
         "task_key": "pending_tag_ai",
         "provider_id": "p1",
         "display_name": "测试供应商",
+        "api_protocol": "chat_completions",
         "model": "cheap-model",
-        "model_count": 2,
+        "response_preview": "OK",
     }
     assert "secret-key" not in str(result)
+
+
+def test_responses_request_adapts_text_images_and_json(monkeypatch):
+    from core.model_providers import make_provider, set_task_route
+
+    calls = []
+
+    class Responses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text='{"ok": true}')
+
+    client = SimpleNamespace(responses=Responses())
+    monkeypatch.setattr("core.ai_gateway.OpenAI", lambda **_: client)
+    settings = {
+        "model_providers": [make_provider(provider_id="r", api_protocol="responses")],
+        "current_provider_id": "r",
+    }
+    set_task_route(settings, "pending_tag_ai", provider_id="r", model="response-model")
+    gateway = AiRequestGateway(settings)
+    result = gateway.request_chat(
+        model="ignored", system_prompt="system",
+        content_parts=[
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ], task_key="pending_tag_ai",
+    )
+
+    assert result == {"ok": True}
+    assert calls[0]["model"] == "response-model"
+    assert calls[0]["instructions"] == "system"
+    assert calls[0]["text"] == {"format": {"type": "json_object"}}
+    assert calls[0]["input"][0]["content"] == [
+        {"type": "input_text", "text": "describe"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+    ]
+
+
+def test_list_models_uses_resolved_route_and_pages(monkeypatch):
+    from core.model_providers import make_provider, set_task_route
+
+    class Page:
+        def __init__(self, data, next_page=None):
+            self.data = data
+            self.next_page = next_page
+
+        def has_next_page(self):
+            return self.next_page is not None
+
+        def get_next_page(self):
+            return self.next_page
+
+    second = Page([SimpleNamespace(id="model-b")])
+    client = SimpleNamespace(models=SimpleNamespace(list=lambda: Page([SimpleNamespace(id="model-a")], second)))
+    monkeypatch.setattr("core.ai_gateway.OpenAI", lambda **_: client)
+    settings = {"model_providers": [make_provider(provider_id="p")], "current_provider_id": "p"}
+    set_task_route(settings, "synonym_audit", provider_id="p", model="x")
+    assert AiRequestGateway(settings).list_models("synonym_audit") == ["model-a", "model-b"]
 
 
 def test_connection_probe_classifies_auth_failure(monkeypatch):
@@ -423,7 +488,9 @@ def test_connection_probe_classifies_auth_failure(monkeypatch):
         status_code = 401
 
     client = SimpleNamespace(
-        models=SimpleNamespace(list=lambda: (_ for _ in ()).throw(AuthError("unauthorized")))
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_: (_ for _ in ()).throw(AuthError("unauthorized")))
+        )
     )
     settings = {
         "model_providers": [make_provider(provider_id="p1", api_key="secret")],

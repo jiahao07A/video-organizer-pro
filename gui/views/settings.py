@@ -34,6 +34,15 @@ from gui.services.settings_controller import SettingsController
 from ..workers.io_worker import run_io_job
 
 
+CATEGORY_TAB_INDEX = {
+    "analysis": 0,
+    "ai": 1,
+    "prompts": 2,
+    "everyday": 3,
+    "naming": 4,
+}
+
+
 class SettingsView(QWidget):
     """设置视图 - 可搜索目录 + 按用户任务分类导航的高级设置系统"""
     settings_applied = Signal()
@@ -61,8 +70,8 @@ class SettingsView(QWidget):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(20)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
         
         title = QLabel("系统设置")
         title.setStyleSheet("font-size: 22px; font-weight: bold; color: #ce9178;")
@@ -88,6 +97,8 @@ class SettingsView(QWidget):
         
         # 5. 导出模板 (V6.0 MEGA UPDATE)
         self.tabs.addTab(self.create_export_tab(), "导出模板")
+        # 页面通过设置目录的任务分类切换，隐藏重复的传统页签导航。
+        self.tabs.tabBar().hide()
 
         # 所有页签建立后，为普通界面偏好绑定防抖自动保存
         self.register_autosave_widgets()
@@ -106,6 +117,9 @@ class SettingsView(QWidget):
         self.save_btn.setFixedHeight(40)
         self.save_btn.setFixedWidth(150)
         self.save_btn.clicked.connect(self.apply_settings)
+        self.tabs.currentChanged.connect(self._update_save_button_label)
+        self.tabs.currentChanged.connect(self._sync_category_navigation)
+        self._sync_category_navigation(self.tabs.currentIndex())
         
         self.reset_btn = QPushButton("恢复默认")
         self.reset_btn.setFixedHeight(40)
@@ -135,12 +149,15 @@ class SettingsView(QWidget):
         cat_row = QHBoxLayout()
         cat_row.setSpacing(6)
         cat_row.addWidget(QLabel("分类:"))
+        self._category_buttons = {}
         for cat in list_categories():
             btn = QPushButton(cat.title)
+            btn.setCheckable(True)
             btn.setToolTip(cat.description)
             btn.clicked.connect(
                 lambda _checked=False, cid=cat.id: self._on_category_jump(cid)
             )
+            self._category_buttons[cat.id] = btn
             cat_row.addWidget(btn)
         cat_row.addStretch()
         outer.addLayout(cat_row)
@@ -182,12 +199,23 @@ class SettingsView(QWidget):
             self.focus_setting(widget_key)
 
     def _on_category_jump(self, category_id: str) -> None:
-        matches = [m for m in search_entries("") if m.category.id == category_id]
-        if not matches:
+        tab_index = CATEGORY_TAB_INDEX.get(category_id)
+        if tab_index is None or tab_index >= self.tabs.count():
             return
-        first = matches[0]
-        self.tabs.setCurrentIndex(first.entry.tab_index)
-        self.focus_setting(first.entry.widget_key)
+        self.tabs.setCurrentIndex(tab_index)
+        self._sync_category_navigation(tab_index)
+
+    def _sync_category_navigation(self, tab_index: int) -> None:
+        active_category = next(
+            (
+                category_id
+                for category_id, mapped_index in CATEGORY_TAB_INDEX.items()
+                if mapped_index == tab_index
+            ),
+            None,
+        )
+        for category_id, button in getattr(self, "_category_buttons", {}).items():
+            button.setChecked(category_id == active_category)
 
     def register_setting_widget(self, widget_key: str, widget) -> None:
         """登记设置控件，供搜索定位与内联保存状态展示。"""
@@ -391,6 +419,10 @@ class SettingsView(QWidget):
             return None
         return None
 
+    def _update_save_button_label(self, index: int) -> None:
+        if hasattr(self, "save_btn"):
+            self.save_btn.setText("保存 AI 设置" if index == 1 else "保存所有设置")
+
     def _set_save_status(self, text: str, error: bool = False) -> None:
         if not hasattr(self, "save_status_label"):
             return
@@ -401,10 +433,7 @@ class SettingsView(QWidget):
         )
 
     def _on_rename_changed(self) -> None:
-        """重命名模式的唯一真实入口：同步到导出页签控件。"""
-        if hasattr(self, "filename_tmpl") and hasattr(self, "pattern_input"):
-            if self.filename_tmpl.text() != self.pattern_input.text():
-                self.filename_tmpl.setText(self.pattern_input.text())
+        """保留重命名模式草稿，等待用户显式保存。"""
         self.prefs_controller.schedule_save(
             lambda: SettingsManager.update_setting(
                 self.settings, "rename_pattern", self.pattern_input.text().strip()
@@ -568,18 +597,6 @@ class SettingsView(QWidget):
         retry_form.addRow(self.batch_rerun_cb)
         form.addRow(retry_group)
         
-        # 自动重命名规则：重命名模式的唯一真实入口（导出页签仅同步展示）
-        rename_group = QGroupBox("自动重命名规则")
-        rename_form = QFormLayout(rename_group)
-        
-        self.pattern_input = QLineEdit(SettingsManager.get_setting(self.settings, "rename_pattern", ""))
-        self.pattern_input.setPlaceholderText("{category}-{tags}-{summary}-{original_name}")
-        self.pattern_input.textChanged.connect(self._on_rename_changed)
-        
-        rename_form.addRow("命名模式:", self.pattern_input)
-        rename_form.addRow(QLabel("可用变量: {category}, {tags}, {summary}, {original_name}"))
-        form.addRow(rename_group)
-        
         scroll.setWidget(container)
         layout.addWidget(scroll)
 
@@ -596,251 +613,439 @@ class SettingsView(QWidget):
         self.register_setting_widget("call_extra", self.call_extra_spin)
         self.register_setting_widget("item_max", self.item_max_spin)
         self.register_setting_widget("batch_rerun", self.batch_rerun_cb)
-        self.register_setting_widget("rename_pattern", self.pattern_input)
         return tab
 
     def create_ai_tab(self):
         tab = QWidget()
         outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(12, 8, 12, 8)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        import copy
+        self._ai_draft_settings = copy.deepcopy(self.settings)
+        ensure_providers(self._ai_draft_settings)
+        self._ai_test_status = {}
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-
-        ensure_providers(self.settings)
-
-        # 敏感配置：保留明确保存区提示
-        hint = QLabel(
-            "以上均为敏感配置，修改后需点底部「保存所有设置」才会落盘并重建 AI 客户端。"
-            "供应商档案只保存显示名、API Key、Base URL（最多 5 个）。"
-            "「当前供应商」是未单独配置任务时的默认回退。"
-            "下方「任务模型路由」可为每个 AI 功能跨供应商选模型。"
-            "进行中的分析本轮不中断。"
+        intro = QLabel(
+            "为每项 AI 功能选择连接档案和模型。未指定档案的任务使用当前供应商；"
+            "编辑后点击底部「保存所有设置」，新请求使用新配置，进行中的分析不受影响。"
         )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 12px;")
-        layout.addWidget(hint)
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #888; font-size: 12px;")
+        outer_layout.addWidget(intro)
 
-        # —— 当前生效配置摘要（只读，不显示 Key）——
-        effective_group = QGroupBox("当前生效配置")
-        effective_layout = QVBoxLayout(effective_group)
+        self.ai_save_state_label = QLabel("设置已保存")
+        self.ai_save_state_label.setObjectName("ai_save_state")
         self.effective_config_label = QLabel()
         self.effective_config_label.setWordWrap(True)
         self.effective_config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.effective_config_label.setStyleSheet("color: #89d185; font-size: 12px;")
-        effective_layout.addWidget(self.effective_config_label)
-        test_row = QHBoxLayout()
-        self.connection_test_task_combo = QComboBox()
-        for key in TASK_ROUTE_KEYS:
-            self.connection_test_task_combo.addItem(TASK_ROUTE_LABELS.get(key, key), key)
-        self.connection_test_btn = QPushButton("测试连接")
-        self.connection_test_btn.clicked.connect(self._test_selected_connection)
-        self.connection_test_status_label = QLabel("")
-        self.connection_test_status_label.setStyleSheet("color: #888; font-size: 12px;")
-        test_row.addWidget(QLabel("测试任务:"))
-        test_row.addWidget(self.connection_test_task_combo, 1)
-        test_row.addWidget(self.connection_test_btn)
-        test_row.addWidget(self.connection_test_status_label, 2)
-        effective_layout.addLayout(test_row)
-        layout.addWidget(effective_group)
+        self.effective_config_label.setStyleSheet("font-size: 12px; color: #888;")
+        outer_layout.addWidget(self.ai_save_state_label)
+        outer_layout.addWidget(self.effective_config_label)
 
-        # —— 供应商列表 ——
-        list_group = QGroupBox("模型供应商（最多 5 个）")
-        list_layout = QVBoxLayout(list_group)
-
-        row = QHBoxLayout()
-        self.provider_list = QListWidget()
-        self.provider_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.provider_list.setMinimumHeight(120)
-        self.provider_list.currentItemChanged.connect(self._on_provider_selection_changed)
-        row.addWidget(self.provider_list, 1)
-
-        side = QVBoxLayout()
-        self.set_current_btn = QPushButton("设为当前")
-        self.set_current_btn.clicked.connect(self._on_set_current_provider)
-        self.add_provider_btn = QPushButton("新增")
-        self.add_provider_btn.clicked.connect(self._on_add_provider)
-        self.del_provider_btn = QPushButton("删除")
-        self.del_provider_btn.clicked.connect(self._on_delete_provider)
-        side.addWidget(self.set_current_btn)
-        side.addWidget(self.add_provider_btn)
-        side.addWidget(self.del_provider_btn)
-        side.addStretch()
-        row.addLayout(side)
-        list_layout.addLayout(row)
-
-        self.current_provider_label = QLabel("")
-        self.current_provider_label.setStyleSheet("color: #ce9178;")
-        list_layout.addWidget(self.current_provider_label)
-        layout.addWidget(list_group)
-
-        # —— 当前选中档案字段 ——
-        form_group = QGroupBox("档案字段")
-        form = QFormLayout(form_group)
-
-        self.provider_name_input = QLineEdit()
-        self.provider_name_input.setPlaceholderText("显示名，如「默认」「中转A」")
-        self.api_key_input = QLineEdit()
-        self.api_key_input.setEchoMode(QLineEdit.Password)
-        self.api_url_input = QLineEdit()
-
-        form.addRow("显示名:", self.provider_name_input)
-        form.addRow("API Key:", self.api_key_input)
-        form.addRow("API Base URL:", self.api_url_input)
-        layout.addWidget(form_group)
-
-        model_group = QGroupBox("档案默认模型名（可选，供路由回退）")
-        model_form = QFormLayout(model_group)
-
-        self.cls_model_input = QLineEdit()
-        self.tag_model_input = QLineEdit()
-        self.desc_model_input = QLineEdit()
-        self.cls_model_input.setPlaceholderText("如 gemini-2.0-flash")
-        self.tag_model_input.setPlaceholderText("如 gemini-2.0-flash")
-        self.desc_model_input.setPlaceholderText("如 gemini-2.0-flash")
-
-        model_form.addRow("分类默认:", self.cls_model_input)
-        model_form.addRow("标签默认:", self.tag_model_input)
-        model_form.addRow("描述默认:", self.desc_model_input)
-        layout.addWidget(model_group)
-
-        # —— 任务模型路由六槽 ——
-        route_group = QGroupBox("任务模型路由（跨供应商）")
-        route_layout = QVBoxLayout(route_group)
-        route_hint = QLabel(
-            "每个 AI 功能可指定供应商 + 模型名。供应商选「（默认回退）」则使用当前供应商。"
-        )
-        route_hint.setWordWrap(True)
-        route_hint.setStyleSheet("color: #888; font-size: 12px;")
-        route_layout.addWidget(route_hint)
-
-        self._route_widgets = {}
-        for key in TASK_ROUTE_KEYS:
-            row = QHBoxLayout()
-            label = QLabel(TASK_ROUTE_LABELS.get(key, key))
-            label.setMinimumWidth(100)
-            row.addWidget(label)
-            prov_combo = QComboBox()
-            prov_combo.setMinimumWidth(140)
-            model_edit = QLineEdit()
-            model_edit.setPlaceholderText("模型名")
-            row.addWidget(prov_combo, 1)
-            row.addWidget(model_edit, 1)
-            route_layout.addLayout(row)
-            prov_combo.currentIndexChanged.connect(self._on_route_widget_changed)
-            model_edit.textChanged.connect(self._on_route_widget_changed)
-            self._route_widgets[key] = {"provider": prov_combo, "model": model_edit}
-
-        layout.addWidget(route_group)
-        layout.addStretch()
-
-        scroll.setWidget(container)
-        outer_layout.addWidget(scroll)
+        self.ai_sections = QTabWidget()
+        self.ai_sections.setObjectName("ai_settings_sections")
+        self.ai_sections.addTab(self._build_provider_settings_page(), "供应商档案")
+        self.ai_sections.addTab(self._build_task_routing_page(), "任务模型路由")
+        outer_layout.addWidget(self.ai_sections, 1)
 
         self._provider_ui_ready = True
-        self._refresh_provider_list(select_id=self.settings.get("current_provider_id"))
+        self._refresh_provider_list(select_id=self._ai_draft_settings.get("current_provider_id"))
         self._load_task_routes_ui()
         self._refresh_effective_config_summary()
+        self._set_ai_dirty(False)
         self.register_setting_widget("api_key", self.api_key_input)
         self.register_setting_widget("api_url", self.api_url_input)
         self.register_setting_widget("provider_list", self.provider_list)
         return tab
 
+    def _build_provider_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 10, 8, 8)
+
+        list_group = QGroupBox("模型供应商（最多 5 个）")
+        list_layout = QVBoxLayout(list_group)
+        row = QHBoxLayout()
+        self.provider_list = QListWidget()
+        self.provider_list.setObjectName("provider_list")
+        self.provider_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.provider_list.setMinimumHeight(105)
+        self.provider_list.currentItemChanged.connect(self._on_provider_selection_changed)
+        row.addWidget(self.provider_list, 1)
+
+        actions = QVBoxLayout()
+        self.set_current_btn = QPushButton("设为当前")
+        self.set_current_btn.setToolTip("仅作为未单独指定供应商的任务的默认回退")
+        self.set_current_btn.clicked.connect(self._on_set_current_provider)
+        self.add_provider_btn = QPushButton("新增档案")
+        self.add_provider_btn.clicked.connect(self._on_add_provider)
+        self.del_provider_btn = QPushButton("删除档案")
+        self.del_provider_btn.clicked.connect(self._on_delete_provider)
+        for button in (self.set_current_btn, self.add_provider_btn, self.del_provider_btn):
+            actions.addWidget(button)
+        actions.addStretch()
+        row.addLayout(actions)
+        list_layout.addLayout(row)
+        layout.addWidget(list_group)
+
+        connection_group = QGroupBox("连接信息")
+        connection_form = QFormLayout(connection_group)
+        self.provider_name_input = QLineEdit()
+        self.provider_name_input.setPlaceholderText("例如：默认、OpenRouter、局域网模型")
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setObjectName("provider_api_key")
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        self.api_url_input = QLineEdit()
+        self.api_url_input.setPlaceholderText("例如：https://api.example.com/v1")
+        self.protocol_combo = QComboBox()
+        self.protocol_combo.addItem("Chat Completions", "chat_completions")
+        self.protocol_combo.addItem("Responses API", "responses")
+        self.api_key_reveal_btn = QPushButton("显示")
+        self.api_key_reveal_btn.setCheckable(True)
+        self.api_key_reveal_btn.setFixedWidth(72)
+        self.api_key_reveal_btn.toggled.connect(self._toggle_api_key_visibility)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.api_key_input, 1)
+        key_row.addWidget(self.api_key_reveal_btn)
+        connection_form.addRow("显示名:", self.provider_name_input)
+        connection_form.addRow("API Key:", key_row)
+        connection_form.addRow("API Base URL:", self.api_url_input)
+        connection_form.addRow("API 协议:", self.protocol_combo)
+        layout.addWidget(connection_group)
+
+        self.provider_default_model_group = QGroupBox("档案默认模型（高级回退，可选）")
+        model_group = self.provider_default_model_group
+        model_group.setCheckable(True)
+        model_group.setChecked(False)
+        model_layout = QVBoxLayout(model_group)
+        model_content = QWidget(model_group)
+        model_form = QFormLayout(model_content)
+        self.cls_model_input = QLineEdit()
+        self.tag_model_input = QLineEdit()
+        self.desc_model_input = QLineEdit()
+        self.cls_model_input.setPlaceholderText("留空时使用对应任务路由模型")
+        self.tag_model_input.setPlaceholderText("留空时使用对应任务路由模型")
+        self.desc_model_input.setPlaceholderText("留空时使用对应任务路由模型")
+        model_form.addRow("视频分类:", self.cls_model_input)
+        model_form.addRow("标签生成:", self.tag_model_input)
+        model_form.addRow("内容描述:", self.desc_model_input)
+        model_layout.addWidget(model_content)
+        model_content.setVisible(False)
+        model_group.toggled.connect(model_content.setVisible)
+        layout.addWidget(model_group)
+
+        hint = QLabel(
+            "档案保存连接凭据。普通任务请在“任务模型路由”中设置模型；此处默认模型仅作未填写任务模型时的回退。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 12px;")
+        layout.addWidget(hint)
+        layout.addStretch()
+
+        for widget in (
+            self.provider_name_input, self.api_key_input, self.api_url_input,
+            self.cls_model_input, self.tag_model_input, self.desc_model_input,
+        ):
+            widget.textChanged.connect(self._on_ai_settings_edited)
+        self.protocol_combo.currentIndexChanged.connect(self._on_ai_settings_edited)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(page)
+        return scroll
+
+    def _build_task_routing_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(8, 10, 8, 8)
+        hint = QLabel(
+            "每项功能可单独指定供应商和模型。选择「默认回退」时使用当前供应商；"
+            "模型留空时使用该供应商对应的默认模型。可在本行直接测试当前编辑配置。"
+            "测试会发送真实的极小推理请求，可能产生少量费用。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 12px;")
+        outer.addWidget(hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(8)
+
+        self._route_widgets = {}
+        for key in TASK_ROUTE_KEYS:
+            group = QGroupBox(TASK_ROUTE_LABELS.get(key, key))
+            group.setObjectName(f"route_{key}")
+            group_layout = QVBoxLayout(group)
+            fields = QHBoxLayout()
+            provider_combo = QComboBox()
+            provider_combo.setMinimumWidth(130)
+            provider_combo.setToolTip("选择此功能使用的供应商；默认回退使用当前供应商")
+            model_edit = QLineEdit()
+            model_edit.setPlaceholderText("模型名；留空使用供应商默认模型")
+            fetch_button = QPushButton("获取模型")
+            fetch_button.setToolTip("从此任务最终解析到的供应商获取模型目录")
+            test_button = QPushButton("测试此任务")
+            test_button.setMinimumWidth(100)
+            fields.addWidget(provider_combo, 1)
+            fields.addWidget(model_edit, 1)
+            fields.addWidget(fetch_button)
+            fields.addWidget(test_button)
+            group_layout.addLayout(fields)
+
+            resolved_label = QLabel()
+            resolved_label.setWordWrap(True)
+            resolved_label.setStyleSheet("color: #888; font-size: 12px;")
+            group_layout.addWidget(resolved_label)
+            status_label = QLabel("尚未测试")
+            status_label.setWordWrap(True)
+            status_label.setStyleSheet("color: #888; font-size: 12px;")
+            group_layout.addWidget(status_label)
+            layout.addWidget(group)
+
+            provider_combo.currentIndexChanged.connect(self._on_route_widget_changed)
+            model_edit.textChanged.connect(self._on_route_widget_changed)
+            fetch_button.clicked.connect(
+                lambda _checked=False, task=key: self._fetch_task_models(task)
+            )
+            test_button.clicked.connect(
+                lambda _checked=False, task=key: self._test_task_connection(task)
+            )
+            self._route_widgets[key] = {
+                "provider": provider_combo,
+                "model": model_edit,
+                "fetch": fetch_button,
+                "test": test_button,
+                "resolved": resolved_label,
+                "status": status_label,
+            }
+        layout.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        return page
+
+    def _toggle_api_key_visibility(self, visible: bool) -> None:
+        self.api_key_input.setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password)
+        self.api_key_reveal_btn.setText("隐藏" if visible else "显示")
+
+    def _set_ai_dirty(self, dirty: bool = True) -> None:
+        self._ai_config_dirty = bool(dirty)
+        label = getattr(self, "ai_save_state_label", None)
+        if label is None:
+            return
+        if dirty:
+            label.setText("有未保存的 AI 设置更改；连接测试不会写入配置文件。")
+            label.setStyleSheet("color: #d7ba7d; font-size: 12px;")
+        else:
+            label.setText("AI 设置已保存；新配置用于后续请求，进行中的分析不受影响。")
+            label.setStyleSheet("color: #89d185; font-size: 12px;")
+
+    def _on_ai_settings_edited(self, *_args) -> None:
+        if not getattr(self, "_provider_ui_ready", False) or self._suppress_provider_signals:
+            return
+        self._set_ai_dirty(True)
+        self._clear_ai_test_states()
+        self._flush_provider_form_to_settings()
+        self._refresh_effective_config_summary()
+
+    def _clear_ai_test_states(self) -> None:
+        for widgets in (getattr(self, "_route_widgets", {}) or {}).values():
+            status = widgets.get("status")
+            if status is not None:
+                status.setText("尚未测试（配置已更改）")
+                status.setStyleSheet("color: #888; font-size: 12px;")
+        self._ai_test_status = {}
+
     def _refresh_effective_config_summary(self) -> None:
-        """显示当前实际生效的路由和副作用开关，不显示凭据。"""
+        """Show effective provider and task routes without credentials."""
         if not hasattr(self, "effective_config_label"):
             return
         try:
-            current = resolve_current_provider(self.settings)
+            effective_settings = self._build_ai_draft_settings()
+            current = resolve_current_provider(effective_settings)
             current_name = current.get("display_name") or current.get("id") or "未命名"
-            key_state = "已配置" if str(current.get("api_key") or "").strip() else "未配置"
-            url_state = "已配置" if str(current.get("base_url") or "").strip() else "未配置"
-            lines = [
-                f"当前供应商：{current_name}（API Key {key_state}，Base URL {url_state}）",
-                "任务模型路由：",
-            ]
+            key_state = "已配置 API Key" if str(current.get("api_key") or "").strip() else "缺少 API Key"
+            url_state = "已配置 Base URL" if str(current.get("base_url") or "").strip() else "缺少 Base URL"
+            routing = get_task_model_routing(effective_settings)
+            explicit_count = sum(
+                1 for key in TASK_ROUTE_KEYS
+                if str((routing.get(key) or {}).get("provider_id") or "").strip()
+            )
+            self.effective_config_label.setText(
+                f"当前供应商：{current_name}（{key_state}，{url_state}）；"
+                f"已单独指定供应商的任务：{explicit_count}/{len(TASK_ROUTE_KEYS)}。"
+                "各任务实际使用的供应商和模型显示在对应路由项下。"
+            )
             for key in TASK_ROUTE_KEYS:
-                route = resolve_task_route(self.settings, key)
+                route = resolve_task_route(effective_settings, key)
                 provider = route.get("display_name") or route.get("provider_id") or "未命名"
-                model = route.get("model") or "未设置"
-                lines.append(f"  · {TASK_ROUTE_LABELS.get(key, key)}：{provider} / {model}")
-            auto_xmp = bool(SettingsManager.get_setting(
-                self.settings, "processing.auto_sync_xmp_after_analysis", False
-            ))
-            audio = bool(SettingsManager.get_setting(
-                self.settings, "processing.enable_audio_transcription", False
-            ))
-            rerun = bool(SettingsManager.get_setting(
-                self.settings, "processing.analysis_retry.batch_rerun_enabled", True
-            ))
-            lines.extend([
-                f"自动 XMP 侧车：{'开启' if auto_xmp else '关闭'}",
-                f"音频转录：{'开启' if audio else '关闭'}",
-                f"分析失败项批次补跑：{'开启' if rerun else '关闭'}",
-            ])
-            self.effective_config_label.setText("\n".join(lines))
+                model = route.get("model") or "未设置模型"
+                widgets = (getattr(self, "_route_widgets", {}) or {}).get(key)
+                if widgets:
+                    selected = str(widgets["provider"].currentData() or "")
+                    widgets["resolved"].setText(
+                        f"实际使用：{provider} / {model}"
+                        + ("（使用当前供应商回退）" if not selected else "")
+                    )
         except Exception as exc:
-            self.effective_config_label.setText(f"当前生效配置暂时无法读取：{exc}")
+            self.effective_config_label.setText(f"\u5f53\u524d\u914d\u7f6e\u6682\u65f6\u65e0\u6cd5\u8bfb\u53d6\uff1a{exc}")
 
-    def _test_selected_connection(self) -> None:
-        """在后台测试选中任务路由，结果只显示状态，不保存配置。"""
+    def _fetch_task_models(self, task_key: str) -> None:
+        """Fetch the resolved provider's model catalog; only update the draft field."""
+        if not getattr(self, "_provider_ui_ready", False):
+            return
         self._flush_provider_form_to_settings()
         self._flush_task_routes_to_settings()
-        task_key = str(self.connection_test_task_combo.currentData() or TASK_ROUTE_KEYS[0])
-        self.connection_test_btn.setEnabled(False)
-        self.connection_test_status_label.setText("测试中…")
+        draft_settings = self._build_ai_draft_settings()
+        route = resolve_task_route(draft_settings, task_key)
+        widgets = self._route_widgets[task_key]
+        widgets["fetch"].setEnabled(False)
 
-        def on_ok(result):
-            self.connection_test_btn.setEnabled(True)
-            name = result.get("display_name") or result.get("provider_id") or "未命名"
-            model = result.get("model") or "未设置"
-            count = result.get("model_count")
-            suffix = f"，服务端返回 {count} 个模型" if count is not None else ""
-            self.connection_test_status_label.setStyleSheet("color: #89d185; font-size: 12px;")
-            self.connection_test_status_label.setText(f"成功：{name} / {model}{suffix}")
-            self._refresh_effective_config_summary()
+        def on_ok(models):
+            widgets["fetch"].setEnabled(True)
+            if not models:
+                QMessageBox.information(self, "\u6a21\u578b\u5217\u8868", "\u670d\u52a1\u7aef\u672a\u8fd4\u56de\u6a21\u578b\uff1b\u4ecd\u53ef\u624b\u52a8\u8f93\u5165\u6a21\u578b ID\u3002")
+                return
+            from PySide6.QtWidgets import QInputDialog
+            selected, accepted = QInputDialog.getItem(
+                self, "\u9009\u62e9\u6a21\u578b",
+                f"{route.get('display_name') or 'Provider'} / {route.get('api_protocol') or 'chat_completions'}",
+                models, 0, True,
+            )
+            if accepted and selected.strip():
+                widgets["model"].setText(selected.strip())
 
         def on_fail(message):
-            self.connection_test_btn.setEnabled(True)
-            self.connection_test_status_label.setStyleSheet("color: #f48771; font-size: 12px;")
-            self.connection_test_status_label.setText(f"失败：{message}")
-            self._refresh_effective_config_summary()
+            widgets["fetch"].setEnabled(True)
+            safe_message = str(message)
+            for provider in list_providers(draft_settings):
+                key = str(provider.get("api_key") or "").strip()
+                if key:
+                    safe_message = safe_message.replace(key, "[\u5df2\u9690\u85cf]")
+            QMessageBox.warning(self, "\u83b7\u53d6\u6a21\u578b\u5931\u8d25", f"{safe_message}\\n\\n\u53ef\u7ee7\u7eed\u624b\u52a8\u8f93\u5165\u6a21\u578b ID\u3002")
 
         run_io_job(
             self,
-            fn=lambda: self.service.test_ai_connection(task_key),
+            fn=lambda: self.service.list_ai_models(task_key, draft_settings),
             on_ok=on_ok,
             on_fail=on_fail,
-            busy_message="正在测试 AI 连接…",
+            busy_message="Fetching model catalog…",
         )
+
+    def _test_task_connection(self, task_key: str) -> None:
+        """测试当前界面编辑的指定路由；只更新运行态，不落盘。"""
+        if not getattr(self, "_provider_ui_ready", False):
+            return
+        draft_settings = self._build_ai_draft_settings()
+        widgets = self._route_widgets[task_key]
+        widgets["test"].setEnabled(False)
+        widgets["status"].setText("测试中…")
+        widgets["status"].setStyleSheet("color: #888; font-size: 12px;")
+        tested_fingerprint = self._task_route_fingerprint(task_key, draft_settings)
+
+        def on_ok(result):
+            widgets["test"].setEnabled(True)
+            if tested_fingerprint != self._task_route_fingerprint(task_key, self._build_ai_draft_settings()):
+                widgets["status"].setText("测试结果已过期；配置有更改，请重新测试。")
+                widgets["status"].setStyleSheet("color: #d7ba7d; font-size: 12px;")
+                return
+            name = result.get("display_name") or result.get("provider_id") or "未命名"
+            model = result.get("model") or "未设置模型"
+            protocol = result.get("api_protocol") or "chat_completions"
+            widgets["status"].setText(f"连接成功：{name} / {protocol} / {model}；测试调用可能产生少量费用。")
+            widgets["status"].setStyleSheet("color: #89d185; font-size: 12px;")
+            self._ai_test_status[task_key] = (tested_fingerprint, "success")
+
+        def on_fail(message):
+            widgets["test"].setEnabled(True)
+            if tested_fingerprint != self._task_route_fingerprint(task_key, self._build_ai_draft_settings()):
+                widgets["status"].setText("测试结果已过期；配置有更改，请重新测试。")
+                widgets["status"].setStyleSheet("color: #d7ba7d; font-size: 12px;")
+                return
+            safe_message = str(message)
+            for provider in list_providers(draft_settings):
+                key = str(provider.get("api_key") or "").strip()
+                if key:
+                    safe_message = safe_message.replace(key, "[已隐藏]")
+            widgets["status"].setText(f"连接失败：{safe_message}")
+            widgets["status"].setStyleSheet("color: #f48771; font-size: 12px;")
+            self._ai_test_status[task_key] = (tested_fingerprint, "failure")
+
+        run_io_job(
+            self,
+            fn=lambda: self.service.test_ai_connection(task_key, draft_settings),
+            on_ok=on_ok,
+            on_fail=on_fail,
+            busy_message=f"正在测试“{TASK_ROUTE_LABELS.get(task_key, task_key)}”连接…",
+        )
+
+    def _build_ai_draft_settings(self) -> dict:
+        """把界面编辑值应用到隔离副本，供连接测试使用。"""
+        import copy
+
+        draft_settings = copy.deepcopy(self._ai_draft_settings)
+        provider_id = self._selected_provider_id()
+        draft_provider_ids = {provider["id"] for provider in list_providers(draft_settings)}
+        if provider_id and provider_id in draft_provider_ids:
+            update_provider(
+                draft_settings,
+                provider_id,
+                display_name=self.provider_name_input.text().strip(),
+                api_key=self.api_key_input.text().strip(),
+                base_url=self.api_url_input.text().strip(),
+                api_protocol=str(self.protocol_combo.currentData() or "chat_completions"),
+                models={
+                    "video_classification": self.cls_model_input.text().strip(),
+                    "tag_generation": self.tag_model_input.text().strip(),
+                    "content_description": self.desc_model_input.text().strip(),
+                },
+            )
+        routes = {
+            key: {
+                "provider_id": str(widgets["provider"].currentData() or ""),
+                "model": widgets["model"].text().strip(),
+            }
+            for key, widgets in self._route_widgets.items()
+        }
+        replace_task_model_routing(draft_settings, routes)
+        ensure_providers(draft_settings)
+        return draft_settings
+
+    def _task_route_fingerprint(self, task_key: str, settings=None) -> tuple:
+        route = resolve_task_route(settings or self._ai_draft_settings, task_key)
+        return (route.get("provider_id"), route.get("model"), route.get("base_url"), route.get("api_key"), route.get("api_protocol"))
 
     def _on_route_widget_changed(self, *_args) -> None:
         if not getattr(self, "_provider_ui_ready", False):
             return
         self._flush_task_routes_to_settings()
+        self._set_ai_dirty(True)
+        self._clear_ai_test_states()
         self._refresh_effective_config_summary()
 
     def _load_task_routes_ui(self) -> None:
         if not getattr(self, "_route_widgets", None):
             return
-        ensure_providers(self.settings)
-        providers = list_providers(self.settings)
-        routing = get_task_model_routing(self.settings)
+        ensure_providers(self._ai_draft_settings)
+        providers = list_providers(self._ai_draft_settings)
+        routing = get_task_model_routing(self._ai_draft_settings)
         for key, widgets in self._route_widgets.items():
             combo: QComboBox = widgets["provider"]
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("（默认回退）", "")
-            for p in providers:
-                combo.addItem(p.get("display_name") or p["id"], p["id"])
+            combo.addItem("默认回退", "")
+            for provider in providers:
+                combo.addItem(provider.get("display_name") or provider["id"], provider["id"])
             slot = routing.get(key) or {}
-            pid = str(slot.get("provider_id") or "")
-            idx = combo.findData(pid)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            index = combo.findData(str(slot.get("provider_id") or ""))
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            widgets["model"].blockSignals(True)
             widgets["model"].setText(str(slot.get("model") or ""))
+            widgets["model"].blockSignals(False)
             combo.blockSignals(False)
             if key == TASK_ROUTE_KEYS[0]:
                 self.register_setting_widget("task_routing", combo)
@@ -851,12 +1056,9 @@ class SettingsView(QWidget):
             return
         routing = {}
         for key, widgets in self._route_widgets.items():
-            combo: QComboBox = widgets["provider"]
-            routing[key] = {
-                "provider_id": str(combo.currentData() or ""),
-                "model": widgets["model"].text().strip(),
-            }
-        replace_task_model_routing(self.settings, routing)
+            combo = widgets["provider"]
+            routing[key] = {"provider_id": str(combo.currentData() or ""), "model": widgets["model"].text().strip()}
+        replace_task_model_routing(self._ai_draft_settings, routing)
 
     def _selected_provider_id(self) -> str:
         item = self.provider_list.currentItem() if hasattr(self, "provider_list") else None
@@ -865,19 +1067,20 @@ class SettingsView(QWidget):
         return str(item.data(Qt.UserRole) or "")
 
     def _flush_provider_form_to_settings(self) -> None:
-        """把表单字段写回当前列表选中的档案（内存，未落盘）。"""
+        """把表单字段写回 AI 草稿设置，等待显式保存。"""
         if not self._provider_ui_ready:
             return
-        pid = self._selected_provider_id()
-        if not pid:
+        provider_id = self._selected_provider_id()
+        if not provider_id:
             return
         try:
             update_provider(
-                self.settings,
-                pid,
+                self._ai_draft_settings,
+                provider_id,
                 display_name=self.provider_name_input.text().strip(),
                 api_key=self.api_key_input.text().strip(),
                 base_url=self.api_url_input.text().strip(),
+                api_protocol=str(self.protocol_combo.currentData() or "chat_completions"),
                 models={
                     "video_classification": self.cls_model_input.text().strip(),
                     "tag_generation": self.tag_model_input.text().strip(),
@@ -888,7 +1091,7 @@ class SettingsView(QWidget):
             pass
 
     def _load_provider_form(self, provider_id: str) -> None:
-        providers = list_providers(self.settings)
+        providers = list_providers(self._ai_draft_settings)
         provider = None
         for p in providers:
             if p["id"] == provider_id:
@@ -903,6 +1106,8 @@ class SettingsView(QWidget):
             self.provider_name_input.setText(provider.get("display_name") or "")
             self.api_key_input.setText(provider.get("api_key") or "")
             self.api_url_input.setText(provider.get("base_url") or "")
+            protocol_index = self.protocol_combo.findData(provider.get("api_protocol") or "chat_completions")
+            self.protocol_combo.setCurrentIndex(protocol_index if protocol_index >= 0 else 0)
             models = provider.get("models") or {}
             self.cls_model_input.setText(models.get("video_classification") or "")
             self.tag_model_input.setText(models.get("tag_generation") or "")
@@ -913,9 +1118,16 @@ class SettingsView(QWidget):
     def _refresh_provider_list(self, select_id: str = None) -> None:
         if not hasattr(self, "provider_list"):
             return
-        ensure_providers(self.settings)
-        providers = list_providers(self.settings)
-        current_id = str(self.settings.get("current_provider_id") or "")
+        ensure_providers(self._ai_draft_settings)
+        providers = list_providers(self._ai_draft_settings)
+        current_id = str(self._ai_draft_settings.get("current_provider_id") or "")
+        routed_counts = {}
+        routing = get_task_model_routing(self._ai_draft_settings)
+        for task_key in TASK_ROUTE_KEYS:
+            slot = routing.get(task_key) or {}
+            routed_id = str(slot.get("provider_id") or "")
+            if routed_id:
+                routed_counts[routed_id] = routed_counts.get(routed_id, 0) + 1
         target = select_id or self._selected_provider_id() or current_id
         if target not in {p["id"] for p in providers} and providers:
             target = providers[0]["id"]
@@ -926,18 +1138,20 @@ class SettingsView(QWidget):
             select_row = 0
             for i, p in enumerate(providers):
                 name = p.get("display_name") or "未命名"
-                mark = " ★当前" if p["id"] == current_id else ""
-                item = QListWidgetItem(f"{name}{mark}")
+                marks = []
+                if p["id"] == current_id:
+                    marks.append("当前")
+                route_count = routed_counts.get(p["id"], 0)
+                if route_count:
+                    marks.append(f"{route_count} 项任务")
+                suffix = f" · {' · '.join(marks)}" if marks else ""
+                item = QListWidgetItem(f"{name}{suffix}")
                 item.setData(Qt.UserRole, p["id"])
                 self.provider_list.addItem(item)
                 if p["id"] == target:
                     select_row = i
             if self.provider_list.count() > 0:
                 self.provider_list.setCurrentRow(select_row)
-            cur = resolve_current_provider(self.settings)
-            self.current_provider_label.setText(
-                f"当前供应商：{cur.get('display_name') or cur.get('id')}"
-            )
             self.add_provider_btn.setEnabled(len(providers) < MAX_PROVIDERS)
             self.del_provider_btn.setEnabled(len(providers) > 1)
         finally:
@@ -951,14 +1165,13 @@ class SettingsView(QWidget):
     def _on_provider_selection_changed(self, current, previous):
         if self._suppress_provider_signals:
             return
-        # 先保存离开的那条
         if previous is not None:
-            prev_id = str(previous.data(Qt.UserRole) or "")
-            if prev_id:
+            previous_id = str(previous.data(Qt.UserRole) or "")
+            if previous_id:
                 try:
                     update_provider(
-                        self.settings,
-                        prev_id,
+                        self._ai_draft_settings,
+                        previous_id,
                         display_name=self.provider_name_input.text().strip(),
                         api_key=self.api_key_input.text().strip(),
                         base_url=self.api_url_input.text().strip(),
@@ -972,37 +1185,73 @@ class SettingsView(QWidget):
                     pass
         if current is not None:
             self._load_provider_form(str(current.data(Qt.UserRole) or ""))
+            self._refresh_effective_config_summary()
 
     def _on_set_current_provider(self):
         self._flush_provider_form_to_settings()
-        pid = self._selected_provider_id()
-        if not pid:
+        provider_id = self._selected_provider_id()
+        if not provider_id:
             return
         try:
-            set_current_provider(self.settings, pid)
-            self._refresh_provider_list(select_id=pid)
-            # 立即写穿并重建 AI 客户端，避免「设为当前」后仍用旧 Key
-            try:
-                SettingsManager.save_settings(self.settings, self.service.db)
-            except Exception as exc:
-                self._set_save_status(f"切换供应商保存失败：{exc}", error=True)
-                QMessageBox.critical(self, "保存失败", f"当前供应商已在内存中切换，但尚未可靠写入配置：{exc}\n请重试保存。")
-                return
+            set_current_provider(self._ai_draft_settings, provider_id)
+            self._set_ai_dirty(True)
+            self._clear_ai_test_states()
+            self._refresh_provider_list(select_id=provider_id)
+            self._refresh_effective_config_summary()
+        except ProviderError as error:
+            QMessageBox.warning(self, "无法切换", str(error))
+
+    def _apply_ai_draft_to_settings(self, target: dict) -> None:
+        """只合并 AI 连接配置，避免草稿覆盖其他页面的最新偏好。"""
+        import copy
+
+        draft = self._ai_draft_settings
+        target["model_providers"] = copy.deepcopy(draft.get("model_providers") or [])
+        target["current_provider_id"] = str(draft.get("current_provider_id") or "")
+        target["task_model_routing"] = copy.deepcopy(draft.get("task_model_routing") or {})
+        target_api = target.setdefault("api", {})
+        draft_api = draft.get("api") or {}
+        for key in ("key", "base_url", "model_personalization"):
+            if key in draft_api:
+                target_api[key] = copy.deepcopy(draft_api[key])
+        ensure_providers(target)
+
+    def _save_ai_settings(self) -> None:
+        import copy
+
+        self._flush_provider_form_to_settings()
+        self._flush_task_routes_to_settings()
+        try:
+            candidate = copy.deepcopy(self.settings)
+            self._apply_ai_draft_to_settings(candidate)
+            # 先持久化候选值；失败时活动设置与 AI 客户端保持原样。
+            SettingsManager.save_settings(candidate, self.service.db)
+            self.settings.clear()
+            self.settings.update(candidate)
             if hasattr(self.service, "reload_ai_from_settings"):
                 self.service.reload_ai_from_settings()
-            self._set_save_status("已切换当前供应商并保存")
-        except ProviderError as e:
-            QMessageBox.warning(self, "无法切换", str(e))
+            self._ai_draft_settings = copy.deepcopy(self.settings)
+            ensure_providers(self._ai_draft_settings)
+            self._refresh_provider_list(select_id=self._selected_provider_id())
+            self._set_ai_dirty(False)
+            self._set_save_status("AI 设置已保存并应用；新配置用于后续请求。")
+            self.settings_applied.emit()
+        except Exception as exc:
+            self._set_ai_dirty(True)
+            self._set_save_status(f"AI 设置保存失败：{exc}", error=True)
+            QMessageBox.critical(self, "AI 设置保存失败", str(exc))
 
     def _on_add_provider(self):
         self._flush_provider_form_to_settings()
         try:
             _, provider = add_provider(
-                self.settings,
-                display_name=f"供应商{len(list_providers(self.settings)) + 1}",
+                self._ai_draft_settings,
+                display_name=f"供应商{len(list_providers(self._ai_draft_settings)) + 1}",
                 set_as_current=False,
             )
             self._refresh_provider_list(select_id=provider["id"])
+            self._set_ai_dirty(True)
+            self._clear_ai_test_states()
         except ProviderLimitError as e:
             QMessageBox.warning(self, "已达上限", str(e))
         except ProviderError as e:
@@ -1013,7 +1262,7 @@ class SettingsView(QWidget):
         pid = self._selected_provider_id()
         if not pid:
             return
-        providers = list_providers(self.settings)
+        providers = list_providers(self._ai_draft_settings)
         if len(providers) <= 1:
             QMessageBox.information(self, "无法删除", "至少保留一个模型供应商档案。")
             return
@@ -1031,8 +1280,10 @@ class SettingsView(QWidget):
         if reply != QMessageBox.Yes:
             return
         try:
-            remove_provider(self.settings, pid)
+            remove_provider(self._ai_draft_settings, pid)
             self._refresh_provider_list()
+            self._set_ai_dirty(True)
+            self._clear_ai_test_states()
         except ProviderError as e:
             QMessageBox.warning(self, "无法删除", str(e))
 
@@ -1296,26 +1547,26 @@ class SettingsView(QWidget):
         form = QFormLayout(container)
         form.setSpacing(15)
         
-        # 1. 重命名模板（镜像常规页签的唯一入口；编辑请到「常规」）
-        rename_group = QGroupBox("文件名模板")
+        # 1. 自动重命名规则
+        rename_group = QGroupBox("自动重命名规则")
         rename_form = QFormLayout(rename_group)
-        
-        self.filename_tmpl = QLineEdit()
-        pattern = SettingsManager.get_setting(self.settings, "rename_pattern", "{category}-{tags}-{summary}-{original_name}")
-        self.filename_tmpl.setText(pattern)
-        self.filename_tmpl.setReadOnly(True)
-        self.filename_tmpl.setToolTip("重命名模式在「常规 → 自动重命名规则」中编辑，这里仅同步展示。")
-        
-        vars_hint = QLabel("变量: {date}, {category}, {tags}, {summary}, {original_name}")
+
+        pattern = SettingsManager.get_setting(
+            self.settings,
+            "rename_pattern",
+            "{category}-{tags}-{summary}-{original_name}",
+        )
+        self.pattern_input = QLineEdit(pattern)
+        self.filename_tmpl = self.pattern_input  # 兼容旧调用方；不创建第二个镜像控件。
+        self.pattern_input.setPlaceholderText("{category}-{tags}-{summary}-{original_name}")
+        self.pattern_input.textChanged.connect(self._on_rename_changed)
+
+        vars_hint = QLabel("可用变量: {date}, {category}, {tags}, {summary}, {original_name}")
         vars_hint.setStyleSheet("color: #888; font-size: 11px;")
-        mirror_hint = QLabel("编辑入口：常规 → 自动重命名规则（此处仅同步展示实际保存值）。")
-        mirror_hint.setStyleSheet("color: #888; font-size: 11px;")
-        
-        rename_form.addRow("模式:", self.filename_tmpl)
+        rename_form.addRow("命名模式:", self.pattern_input)
         rename_form.addRow("", vars_hint)
-        rename_form.addRow("", mirror_hint)
         form.addRow(rename_group)
-        
+
         # 2. XMP 导出设置
         xmp_group = QGroupBox("XMP 元数据配置")
         xmp_form = QFormLayout(xmp_group)
@@ -1416,12 +1667,17 @@ class SettingsView(QWidget):
             QMessageBox.critical(self, "错误", f"恢复默认界面布局失败：{exc}")
 
     def apply_settings(self):
-        """同步 UI 数据到 settings 字典并保存（敏感配置的明确保存区）"""
+        """同步 UI 数据并保存；AI 页的按钮仅保存 AI 配置。"""
+        import copy
+
+        if getattr(self, "_provider_ui_ready", False) and self.tabs.currentIndex() == 1:
+            self._save_ai_settings()
+            return
         # 模型供应商：表单 → 档案 → 任务路由 → 写穿扁平 api
         if self._provider_ui_ready:
             self._flush_provider_form_to_settings()
             self._flush_task_routes_to_settings()
-            ensure_providers(self.settings)
+            self._apply_ai_draft_to_settings(self.settings)
         
         # Processing
         SettingsManager.update_setting(self.settings, "processing.max_workers", self.workers_spin.value())
@@ -1524,8 +1780,11 @@ class SettingsView(QWidget):
             if hasattr(self.service, "reload_ai_from_settings"):
                 self.service.reload_ai_from_settings()
             if self._provider_ui_ready:
+                self._ai_draft_settings = copy.deepcopy(self.settings)
+                ensure_providers(self._ai_draft_settings)
                 self._refresh_provider_list(select_id=self._selected_provider_id())
                 self._load_task_routes_ui()
+                self._set_ai_dirty(False)
             self._refresh_effective_config_summary()
             self._set_save_status("所有设置已保存并已应用")
             QMessageBox.information(self, "成功", "设置已保存并已应用到 AI 引擎，界面偏好将尽量立即生效。")

@@ -99,8 +99,13 @@ def test_view_has_searchable_catalog(qt_app, service):
 
 def test_view_category_jump(qt_app, service):
     view = SettingsView(service)
+    assert view.tabs.tabBar().isHidden()
     view._on_category_jump("ai")
     assert view.tabs.currentIndex() == 1
+    assert view._category_buttons["ai"].isChecked()
+    view._on_category_jump("everyday")
+    assert view.tabs.currentIndex() == 3
+    assert view._category_buttons["everyday"].isChecked()
 
 
 # —— 视图：普通偏好防抖自动保存 ——
@@ -155,14 +160,161 @@ def test_sensitive_api_key_requires_explicit_save(qt_app, service, silent_boxes,
     assert json.loads(settings_path.read_text(encoding="utf-8"))["api"]["key"] == "sk-sensitive"
 
 
+# —— AI 引擎设置体验 ——
+
+def test_ai_settings_split_provider_and_route_sections(qt_app, service):
+    view = SettingsView(service)
+    assert view.ai_sections.count() == 2
+    assert view.ai_sections.tabText(0) == "供应商档案"
+    assert view.ai_sections.tabText(1) == "任务模型路由"
+    from PySide6.QtWidgets import QScrollArea
+    assert isinstance(view.ai_sections.widget(0), QScrollArea)
+    assert set(view._route_widgets) == set(__import__("core.model_providers", fromlist=["TASK_ROUTE_KEYS"]).TASK_ROUTE_KEYS)
+    assert all(view._route_widgets[key]["provider"].itemText(0) == "默认回退" for key in view._route_widgets)
+    assert "实际使用" in view._route_widgets[next(iter(view._route_widgets))]["resolved"].text()
+    assert all("fetch" in widgets for widgets in view._route_widgets.values())
+    assert view.api_key_input.echoMode() == view.api_key_input.EchoMode.Password
+
+
+def test_provider_default_models_are_collapsed_as_advanced_fallbacks(qt_app, service):
+    view = SettingsView(service)
+    assert view.provider_default_model_group.isCheckable()
+    assert not view.provider_default_model_group.isChecked()
+    assert "高级回退" in view.provider_default_model_group.title()
+    view.provider_default_model_group.setChecked(True)
+    assert not view.cls_model_input.isHidden()
+
+
+def test_provider_protocol_is_draft_until_explicit_save(qt_app, service, tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr("core.video_organizer_service.get_settings_file_path", lambda: str(settings_path))
+    view = SettingsView(service)
+    provider_id = view._selected_provider_id()
+    responses_index = view.protocol_combo.findData("responses")
+    view.protocol_combo.setCurrentIndex(responses_index)
+
+    assert view._ai_config_dirty is True
+    assert not settings_path.exists()
+    assert __import__("core.model_providers", fromlist=["find_provider"]).find_provider(
+        view._build_ai_draft_settings(), provider_id
+    )["api_protocol"] == "responses"
+    original_settings = __import__("copy").deepcopy(service.settings)
+    assert service.settings == original_settings
+
+    view._save_ai_settings()
+    assert __import__("core.model_providers", fromlist=["find_provider"]).find_provider(
+        service.settings, provider_id
+    )["api_protocol"] == "responses"
+
+
+def test_ai_settings_test_uses_route_and_does_not_persist(qt_app, service, tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr("core.video_organizer_service.get_settings_file_path", lambda: str(settings_path))
+    view = SettingsView(service)
+    view.tabs.setCurrentIndex(1)
+    view.ai_sections.setCurrentIndex(1)
+    route_key = next(iter(view._route_widgets))
+    route = view._route_widgets[route_key]
+    before = __import__("copy").deepcopy(service.settings)
+    route["model"].setText("draft-model")
+    assert view._ai_config_dirty is True
+    assert service.settings == before
+    assert not settings_path.exists()
+    assert route["status"].text().startswith("尚未测试")
+    view._save_ai_settings()
+    assert settings_path.exists()
+    from core.model_providers import resolve_task_route
+    assert resolve_task_route(service.settings, route_key)["model"] == "draft-model"
+    assert "已保存" in view.ai_save_state_label.text()
+
+
+def test_ai_settings_inline_test_uses_selected_task_without_saving(qt_app, service, tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr("core.video_organizer_service.get_settings_file_path", lambda: str(settings_path))
+    view = SettingsView(service)
+    view.tabs.setCurrentIndex(1)
+    task_key = next(iter(view._route_widgets))
+    before = __import__("copy").deepcopy(service.settings)
+    view.service.test_ai_connection = lambda key, settings: {
+        "provider_id": "draft-provider", "display_name": "草稿供应商",
+        "model": "draft-model", "model_count": 1,
+    }
+    monkeypatch.setattr(
+        "gui.views.settings.run_io_job",
+        lambda _parent, fn, on_ok, on_fail, **_kwargs: on_ok(fn()),
+    )
+    view._test_task_connection(task_key)
+    assert view._route_widgets[task_key]["status"].text().startswith("连接成功：草稿供应商 / chat_completions / draft-model")
+    assert service.settings == before
+    assert not settings_path.exists()
+
+
+def test_ai_connection_failure_status_redacts_secret(qt_app, service, monkeypatch):
+    view = SettingsView(service)
+    view.tabs.setCurrentIndex(1)
+    secret = "sk-private-test-value"
+    view.api_key_input.setText(secret)
+    task_key = next(iter(view._route_widgets))
+    monkeypatch.setattr(
+        "gui.views.settings.run_io_job",
+        lambda _parent, fn, on_ok, on_fail, **_kwargs: on_fail(f"request failed with {secret}"),
+    )
+    view._test_task_connection(task_key)
+    status = view._route_widgets[task_key]["status"].text()
+    assert "[已隐藏]" in status
+    assert secret not in status
+
+
+def test_ai_provider_add_and_delete_stay_in_draft_until_saved(qt_app, service, monkeypatch):
+    view = SettingsView(service)
+    before = __import__("copy").deepcopy(service.settings)
+    view._on_add_provider()
+    assert len(__import__("core.model_providers", fromlist=["list_providers"]).list_providers(view._ai_draft_settings)) == 2
+    assert service.settings == before
+    assert view._ai_config_dirty is True
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes)
+    )
+    view._on_delete_provider()
+    assert len(__import__("core.model_providers", fromlist=["list_providers"]).list_providers(view._ai_draft_settings)) == 1
+    assert service.settings == before
+
+
+def test_ai_save_failure_keeps_active_settings_unchanged(qt_app, service, monkeypatch, silent_boxes):
+    view = SettingsView(service)
+    before = __import__("copy").deepcopy(service.settings)
+    view.api_key_input.setText("sk-unsaved")
+    monkeypatch.setattr(
+        SettingsManager, "save_settings",
+        staticmethod(lambda *a, **k: (_ for _ in ()).throw(OSError("disk unavailable"))),
+    )
+    view.tabs.setCurrentIndex(1)
+    view._save_ai_settings()
+    assert service.settings == before
+    assert view._ai_config_dirty is True
+
+
+def test_ai_settings_api_key_visibility_toggle(qt_app, service):
+    view = SettingsView(service)
+    view.api_key_reveal_btn.setChecked(True)
+    assert view.api_key_input.echoMode() == view.api_key_input.EchoMode.Normal
+    view.api_key_reveal_btn.setChecked(False)
+    assert view.api_key_input.echoMode() == view.api_key_input.EchoMode.Password
+
+
 # —— 视图：重命名入口唯一 ——
 
 def test_rename_pattern_has_single_editable_entry(qt_app, service):
     view = SettingsView(service)
-    # 导出页签仅镜像展示，不可编辑
-    assert view.filename_tmpl.isReadOnly() is True
+    assert view.filename_tmpl is view.pattern_input
+    assert view.pattern_input.isReadOnly() is False
+    matches = catalog.search_entries("重命名")
+    match = next(m for m in matches if m.entry.widget_key == "rename_pattern")
+    assert match.entry.tab_index == 4
+    view._on_settings_search("重命名")
+    assert view.focus_setting("rename_pattern") is True
+    assert view.tabs.currentIndex() == 4
     view.pattern_input.setText("{category}-{summary}")
-    assert view.filename_tmpl.text() == "{category}-{summary}"
     view.prefs_controller.flush()
     assert service.settings["rename_pattern"] == "{category}-{summary}"
 
