@@ -3,7 +3,7 @@
 Status: claimed
 GitHub Issue: #35 — https://github.com/jiahao07A/video-organizer-pro/issues/35
 Branch: `docs/35-experience-planning`
-PR: 待创建
+PR: [#37](https://github.com/jiahao07A/video-organizer-pro/pull/37)
 
 ## 目标和背景
 
