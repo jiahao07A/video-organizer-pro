@@ -3,7 +3,7 @@
 Status: claimed
 GitHub Issue: #34 — https://github.com/jiahao07A/video-organizer-pro/issues/34
 Branch: `chore/34-ignore-local-artifacts`
-PR: 待创建
+PR: [#36](https://github.com/jiahao07A/video-organizer-pro/pull/36)
 
 ## 背景与目标
 
@@ -33,4 +33,4 @@ PR: 待创建
 
 ## 验证计划
 
-使用 `git check-ignore -v data/… .video-organizer-data.json build-attempt/… dist-attempt/…` 检查匹配；使用 `git check-ignore` 的反向检查确认源文件与词表草稿未被这些新规则命中；运行 `git diff --check`。
+使用 `git check-ignore -v data/… .video-organizer-data.json build-attempt/… dist-attempt/…` 检查新增仓库级规则。词表草稿没有加入共享 `.gitignore`；当前克隆通过 `.git/info/exclude` 单独过滤它，文件保留在本机且该设置不会传播。运行 `git diff --check`。
