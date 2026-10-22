@@ -4,6 +4,7 @@ Status: blocked
 
 GitHub Issue: [#38](https://github.com/jiahao07A/video-organizer-pro/issues/38)
 Branch: `chore/38-windows-rc2`
+PR: [#39](https://github.com/jiahao07A/video-organizer-pro/pull/39)
 Release tag: `v0.0.0-rc2`（仅在发布门槛全部满足后创建）
 
 ## 背景与目标
