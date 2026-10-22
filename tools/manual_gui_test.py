@@ -90,6 +90,16 @@ def main() -> int:
             except Exception as exc:
                 print(f"等待后台任务失败: {exc}", file=sys.stderr)
             try:
+                media_preview = getattr(
+                    getattr(getattr(window, "workstation_page", None), "detail_panel", None),
+                    "media_preview",
+                    None,
+                )
+                if media_preview is not None:
+                    media_preview.set_media(None)
+                    if app is not None:
+                        app.processEvents()
+                window.close()
                 window.deleteLater()
                 if app is not None:
                     app.processEvents()

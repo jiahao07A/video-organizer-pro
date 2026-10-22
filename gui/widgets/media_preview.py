@@ -116,6 +116,11 @@ class MediaPreviewWidget(QWidget):
         self.play_btn.setEnabled(bool(self._path) and HAS_MULTIMEDIA)
         self.reveal_btn.setEnabled(bool(self._path))
         if not self._path:
+            if HAS_MULTIMEDIA and self._player:
+                self._player.setSource(QUrl())
+            self._duration = 0
+            self.seek_slider.setRange(0, 0)
+            self._update_time_label(0)
             return
         if HAS_MULTIMEDIA and self._player:
             self._player.setSource(QUrl.fromLocalFile(self._path))

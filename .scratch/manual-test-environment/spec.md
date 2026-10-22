@@ -4,7 +4,11 @@ Status: resolved
 
 Created: 2026-10-19
 
-Branch: `feat/10-portable-data-directory`（工作区已有本地改动，本任务不覆盖或整理这些改动）
+GitHub Issue: [#10](https://github.com/jiahao07A/video-organizer-pro/issues/10)
+
+Branch: `feat/10-portable-data-directory`
+
+PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 
 ## 1. 背景与目标
 
@@ -20,6 +24,7 @@ Branch: `feat/10-portable-data-directory`（工作区已有本地改动，本任
 - 为应用日志和分析任务指标配置独立的诊断目录；临时数据库、配置、结果和合成素材在会话结束时删除。
 - 生成清理报告，记录临时目录是否成功删除及失败原因；诊断日志和报告保留在 Git 忽略的 `logs/manual-tests/` 下。
 - 提供可见 GUI 启动脚本，支持记录数量、诊断目录和临时素材模式参数。
+- 临时人工测试界面禁用管理数据目录切换入口；直接调用同一处理函数也必须早退，避免写入应用真实定位记录。
 - 增加自动化测试，验证路径隔离、日志保留、清理和环境变量恢复。
 - 提供简体中文人工测试使用说明和清理边界。
 
@@ -44,6 +49,7 @@ Branch: `feat/10-portable-data-directory`（工作区已有本地改动，本任
 
 - [x] 从任意工作目录运行人工脚本时，服务数据库、设置、标签配置、结果和合成素材均位于会话临时根目录。
 - [x] GUI 可以打开并看到预置的素材库记录与标签数据，默认不会读取项目工作区数据。
+- [x] 临时会话的设置页禁用数据目录切换；直接调用处理函数也不会启动目录选择或定位记录写入。
 - [x] 会话结束后临时数据库和临时素材根不存在；诊断目录仍存在且包含会话日志和清理报告。
 - [x] 分析指标默认写入本次诊断目录，不写入项目根 `logs/analysis_jobs/`。
 - [x] 创建失败、清理失败和后台线程未结束时不静默报告成功，清理报告记录错误。

@@ -2505,6 +2505,8 @@ class VideoOrganizerService:
         )
         self._thumbnail_dir = storage_paths.thumbnails
         self.db = DatabaseManager(effective_db_path)
+        if not self._uses_explicit_storage_paths:
+            _service_data_manager().mark_database_initialized(storage_paths.root)
         self.catalog = VideoCatalog(self.db)
         self.settings = (
             settings

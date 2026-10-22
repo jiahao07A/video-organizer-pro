@@ -148,7 +148,7 @@ class DataDirectoryManager:
     def default_paths(self) -> DataPaths:
         return self.paths_for(self.default_root)
 
-    def read_locator(self) -> Optional[str]:
+    def _read_locator_payload(self) -> Optional[dict]:
         candidates = [
             path
             for path in (self.locator_path, self.fallback_locator_path)
@@ -170,18 +170,33 @@ class DataDirectoryManager:
             root = payload.get("data_root")
             if not isinstance(root, str) or not root.strip():
                 raise DataDirectoryError("数据目录定位记录缺少有效路径")
-            valid_payloads.append((payload.get("updated_at", ""), root))
+            initialized = payload.get("database_initialized", True)
+            if not isinstance(initialized, bool):
+                raise DataDirectoryError("数据目录定位记录的数据库状态无效")
+            payload = dict(payload)
+            payload["data_root"] = os.path.abspath(root)
+            payload["database_initialized"] = initialized
+            valid_payloads.append(payload)
         if not valid_payloads:
             return None
-        _, root = max(valid_payloads, key=lambda item: item[0])
-        return os.path.abspath(root)
+        return max(valid_payloads, key=lambda item: item.get("updated_at", ""))
 
-    def write_locator(self, root: str) -> None:
+    def read_locator(self) -> Optional[str]:
+        payload = self._read_locator_payload()
+        return payload["data_root"] if payload is not None else None
+
+    def write_locator(
+        self,
+        root: str,
+        *,
+        database_initialized: bool = True,
+    ) -> None:
         root_path = os.path.abspath(os.fspath(root))
         payload = {
             "format": DATA_DIRECTORY_FORMAT,
             "version": DATA_DIRECTORY_VERSION,
             "data_root": root_path,
+            "database_initialized": bool(database_initialized),
             "updated_at": datetime.now().astimezone().isoformat(),
         }
         try:
@@ -199,16 +214,37 @@ class DataDirectoryManager:
                     f"{primary_error}; {fallback_error}"
                 ) from fallback_error
 
+    def mark_database_initialized(self, root: str) -> None:
+        """记录首次创建数据库已完成，避免之后缺库时被当成新目录。"""
+        root_path = os.path.abspath(os.fspath(root))
+        database_path = self.paths_for(root_path).database
+        self._validate_existing_database(database_path, require=True)
+        locator = self._read_locator_payload()
+        if (
+            locator is None
+            or os.path.normcase(locator["data_root"]) != os.path.normcase(root_path)
+        ):
+            return
+        if not locator["database_initialized"]:
+            self.write_locator(root_path, database_initialized=True)
+
     def inspect(self) -> DataDirectoryInspection:
-        selected = self.read_locator()
+        locator = self._read_locator_payload()
+        selected = locator["data_root"] if locator is not None else None
         if selected is not None:
             try:
                 self.ensure_writable(selected, create=False)
-                self._validate_existing_database(
-                    self.paths_for(selected).database,
-                    require=True,
-                )
-                self._validate_existing_data_writable(self.paths_for(selected))
+                selected_paths = self.paths_for(selected)
+                if os.path.exists(selected_paths.database):
+                    self._validate_existing_database(
+                        selected_paths.database,
+                        require=True,
+                    )
+                elif locator["database_initialized"]:
+                    raise DataDirectoryError(
+                        f"已初始化的数据目录缺少数据库: {selected_paths.database}"
+                    )
+                self._validate_existing_data_writable(selected_paths)
             except DataDirectoryError as exc:
                 return DataDirectoryInspection(
                     state=DataDirectoryState.INVALID,
@@ -218,13 +254,21 @@ class DataDirectoryManager:
                     locator_path=self.locator_path,
                     message=str(exc),
                 )
+            message = (
+                "使用已选择的数据目录。"
+                if (
+                    locator["database_initialized"]
+                    or os.path.isfile(selected_paths.database)
+                )
+                else "已选择数据目录，数据库将在首次启动或旧数据导入时初始化。"
+            )
             return DataDirectoryInspection(
                 state=DataDirectoryState.ACTIVE,
                 application_directory=self.application_directory,
                 default_root=self.default_root,
                 active_root=selected,
                 locator_path=self.locator_path,
-                message="使用已选择的数据目录。",
+                message=message,
             )
 
         legacy_items = self._legacy_items()
@@ -351,7 +395,7 @@ class DataDirectoryManager:
         if self._has_management_data(paths):
             raise DataDirectoryConflictError("目标目录已有管理数据，不能按空目录激活")
         self.ensure_writable(paths.root, create=True)
-        self.write_locator(paths.root)
+        self.write_locator(paths.root, database_initialized=False)
         return paths
 
     def activate_existing(self, root: str) -> DataPaths:
@@ -473,7 +517,10 @@ class DataDirectoryManager:
                 os.rmdir(target_root)
             os.replace(stage, target_root)
             activated = True
-            self.write_locator(target_root)
+            self.write_locator(
+                target_root,
+                database_initialized=os.path.isfile(source_paths.database),
+            )
             return final_paths
         except Exception:
             if activated and os.path.isdir(target_root):
@@ -579,8 +626,6 @@ class DataDirectoryManager:
             DATABASE_NAME,
             SETTINGS_NAME,
             TAG_CONFIG_NAME,
-            BACKUP_DIRECTORY_NAME,
-            THUMBNAILS_DIRECTORY_NAME,
             RESULTS_JSON_NAME,
             RESULTS_CSV_NAME,
         )

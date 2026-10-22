@@ -246,6 +246,7 @@ class ManualTestEnvironment:
             results_json=paths.results_json,
             results_csv=paths.results_csv,
         )
+        self.service.manual_test_environment = True
         self._seed_records()
 
     def _create_synthetic_media_file(self, path: Path) -> bool:
