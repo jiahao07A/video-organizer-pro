@@ -16,6 +16,12 @@ README.md
 *.db-wal
 video_analysis_results.json
 video_analysis_results.csv
+# Root-level portable data and locator state (local runtime, never source assets)
+/data/
+/.video-organizer-data.json
+# Root-level local build attempts; release build/ and dist/ rules remain below
+/build-attempt/
+/dist-attempt/
 backups/*
 !backups/obsolete_20260211/
 !backups/obsolete_20260211/*.py
