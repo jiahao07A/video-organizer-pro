@@ -67,4 +67,4 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 
 为支持 #10 的脱敏 GUI 走查，增加隔离的临时人工测试环境：临时数据库、设置、标签配置和合成素材位于系统临时根；诊断日志及清理报告独立保留在 `logs/manual-tests/`。`python tools/manual_gui_test.py --records 2 --offscreen` 验证启动与清理，清理报告显示 `temp_data_removed: true`、`errors: []`。此检查不能替代可见窗口的 Windows 人工走查，截图/录屏尚未完成。
 
-验证：`python -m pytest tests/test_data_directory.py tests/test_data_directory_gui.py tests/test_manual_test_environment.py -q`（31 passed）；`python -m compileall -q core gui tests tools` 通过；`git diff --check` 通过。全量测试需在本分支提交后补充运行结果。
+验证：`python -m pytest tests/test_data_directory.py tests/test_data_directory_gui.py tests/test_manual_test_environment.py -q`（31 passed）；`python -m pytest -q`（399 passed）；`python -m compileall -q core gui tests tools` 通过；`git diff --check` 通过。`python tools/manual_gui_test.py --records 2 --offscreen` 清理报告为 `temp_data_removed: true`、`errors: []`；临时数据已删除，诊断日志保留。可见 Windows GUI 人工走查、截图/录屏和真实权限场景仍未完成。
