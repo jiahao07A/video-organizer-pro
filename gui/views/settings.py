@@ -81,6 +81,9 @@ class SettingsView(QWidget):
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
         self.service = service
+        self._data_directory_switch_enabled = not bool(
+            getattr(service, "manual_test_environment", False)
+        )
         self.settings = service.settings
         self._provider_ui_ready = False
         self._suppress_provider_signals = False
@@ -529,6 +532,8 @@ class SettingsView(QWidget):
         )
 
     def _choose_data_directory(self) -> None:
+        if not self._data_directory_switch_enabled:
+            return
         target = QFileDialog.getExistingDirectory(self, "选择管理数据目录")
         if not target:
             return
@@ -642,6 +647,11 @@ class SettingsView(QWidget):
         data_row.addWidget(self.data_directory_label, 1)
         self.data_directory_btn = QPushButton("选择或搬迁目录")
         self.data_directory_btn.clicked.connect(self._choose_data_directory)
+        self.data_directory_btn.setEnabled(self._data_directory_switch_enabled)
+        if not self._data_directory_switch_enabled:
+            self.data_directory_btn.setToolTip(
+                "临时人工测试会话中禁用目录切换，以保护应用真实数据定位记录。"
+            )
         data_row.addWidget(self.data_directory_btn)
         data_layout.addLayout(data_row)
         data_hint = QLabel(
@@ -650,6 +660,11 @@ class SettingsView(QWidget):
         )
         data_hint.setWordWrap(True)
         data_hint.setStyleSheet("color: #888; font-size: 12px;")
+        if not self._data_directory_switch_enabled:
+            data_hint.setText(
+                data_hint.text()
+                + " 临时人工测试会话中已禁用目录切换，以免触碰应用真实定位记录。"
+            )
         data_layout.addWidget(data_hint)
         form.addRow(data_group)
 

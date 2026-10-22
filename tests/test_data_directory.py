@@ -35,20 +35,44 @@ def test_default_directory_uses_application_location_not_process_cwd(tmp_path: P
     assert manager.default_paths().database.endswith("data\\video_organizer.db") or manager.default_paths().database.endswith("data/video_organizer.db")
 
 
-def test_locator_is_path_only_and_survives_working_directory_changes(tmp_path: Path):
+def test_repository_backup_sources_are_not_legacy_management_data(tmp_path: Path):
+    app = tmp_path / "app"
+    obsolete = app / "backups" / "obsolete_20260211"
+    obsolete.mkdir(parents=True)
+    (obsolete / "legacy_helper.py").write_text("pass\n", encoding="utf-8")
+    thumbnails = app / ".thumbnails"
+    thumbnails.mkdir()
+    (thumbnails / "orphan.webp").write_bytes(b"orphan")
+
+    inspection = DataDirectoryManager(application_directory=str(app)).inspect()
+
+    assert inspection.state is DataDirectoryState.DEFAULT_NEW
+    assert inspection.legacy_items == ()
+
+
+def test_locator_stores_only_required_state_and_survives_working_directory_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     app = tmp_path / "app"
     selected = tmp_path / "selected"
     manager = DataDirectoryManager(application_directory=str(app))
-    manager.ensure_writable(str(selected), create=True)
-    manager.write_locator(str(selected))
+    manager.activate_empty(str(selected))
 
     other = tmp_path / "other"
     other.mkdir()
+    monkeypatch.chdir(other)
     manager2 = DataDirectoryManager(application_directory=str(app))
     assert manager2.read_locator() == str(selected.resolve())
     assert manager2.inspect().active_root == str(selected.resolve())
     payload = json.loads((app / ".video-organizer-data.json").read_text(encoding="utf-8"))
-    assert set(payload) >= {"format", "version", "data_root"}
+    assert set(payload) == {
+        "format",
+        "version",
+        "data_root",
+        "database_initialized",
+        "updated_at",
+    }
+    assert payload["database_initialized"] is False
     assert "settings" not in payload
     assert "api" not in payload
 
@@ -105,7 +129,9 @@ def test_legacy_migration_copies_database_config_and_thumbnail_without_moving_so
         connection.close()
 
 
-def test_legacy_layout_without_database_migrates_for_first_json_import(tmp_path: Path):
+def test_legacy_layout_without_database_migrates_for_first_json_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     source = tmp_path / "app"
     source.mkdir()
     legacy_json = source / "video_analysis_results.json"
@@ -133,6 +159,25 @@ def test_legacy_layout_without_database_migrates_for_first_json_import(tmp_path:
     assert snapshot_manifest["status"] == "complete"
     assert snapshot_manifest["files"]
     assert manager.read_locator() == str(Path(target.root).resolve())
+    assert manager.inspect().state is DataDirectoryState.ACTIVE
+
+    import core.video_organizer_service as service_module
+    from core.startup_upgrade import UpgradeStatus
+    from core.video_organizer_service import VideoOrganizerService
+
+    monkeypatch.setattr(service_module, "_service_data_manager", lambda: manager)
+    pending = VideoOrganizerService.inspect_startup_upgrade(
+        include_import_report=False
+    )
+    assert pending.status is UpgradeStatus.NEEDS_CONFIRMATION
+
+    imported = VideoOrganizerService.run_startup_upgrade(confirmed=True)
+    assert imported.status is UpgradeStatus.COMPLETED
+    service = VideoOrganizerService(on_log=lambda _message: None)
+    assert Path(target.database).is_file()
+    assert manager.inspect().state is DataDirectoryState.ACTIVE
+    locator = json.loads(Path(manager.locator_path).read_text(encoding="utf-8"))
+    assert locator["database_initialized"] is True
 
 
 def test_existing_target_is_not_implicitly_merged_or_overwritten(tmp_path: Path):
@@ -402,7 +447,12 @@ def test_migration_rejects_thumbnail_reference_outside_target_directory(
     assert manager.read_locator() is None
 
 
-def test_empty_directory_can_be_selected_as_active(tmp_path: Path):
+def test_empty_directory_can_be_selected_then_initialized_by_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import core.video_organizer_service as service_module
+    from core.video_organizer_service import VideoOrganizerService
+
     app = tmp_path / "app"
     selected = tmp_path / "selected"
     manager = DataDirectoryManager(application_directory=str(app))
@@ -411,7 +461,19 @@ def test_empty_directory_can_be_selected_as_active(tmp_path: Path):
 
     assert paths.root == str(selected.resolve())
     assert manager.read_locator() == str(selected.resolve())
+    assert manager.inspect().state is DataDirectoryState.ACTIVE
 
+    monkeypatch.setattr(service_module, "_service_data_manager", lambda: manager)
+    service = VideoOrganizerService(on_log=lambda _message: None)
+
+    assert Path(paths.database).is_file()
+    assert manager.inspect().state is DataDirectoryState.ACTIVE
+    locator = json.loads(Path(manager.locator_path).read_text(encoding="utf-8"))
+    assert locator["database_initialized"] is True
+
+    os.remove(paths.database)
+    assert manager.inspect().state is DataDirectoryState.INVALID
+    assert "缺少数据库" in manager.inspect().message
 
 
 def test_nonempty_unrecognized_directory_is_not_activated_as_empty(tmp_path: Path):

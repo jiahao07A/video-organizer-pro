@@ -74,7 +74,7 @@ def test_catalog_resolves_relative_thumbnail_against_database_directory(
     assert detail["thumbnail_path"] == str(thumbnail.resolve())
 
 
-
+def test_catalog_filters_text_status_tags_and_summary(tmp_path):
     service = _service(tmp_path)
     _insert(
         service,

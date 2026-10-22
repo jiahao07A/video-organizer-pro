@@ -12,9 +12,12 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QRunnable, QThread, QThreadPool, QTimer
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QWidget
 
+from core.manual_test_environment import ManualTestEnvironment
+from gui.views.settings import SettingsView
 from gui.views.settings import _window_has_active_background_work
+from gui.widgets.media_preview import HAS_MULTIMEDIA, MediaPreviewWidget
 
 
 class _WaitingWorker(QThread):
@@ -86,6 +89,66 @@ def test_data_directory_switch_detects_thumbnail_model_thread_pool():
         window.close()
         model.close()
         app.processEvents()
+
+
+def test_manual_test_settings_cannot_change_application_data_locator(
+    tmp_path, monkeypatch
+):
+    app = QApplication.instance() or QApplication([])
+    environment = ManualTestEnvironment(
+        record_count=0,
+        diagnostics_root=str(tmp_path / "diagnostics"),
+        create_media_files=False,
+    ).start()
+    view = SettingsView(environment.service)
+    try:
+        assert view.data_directory_btn.isEnabled() is False
+        monkeypatch.setattr(
+            QFileDialog,
+            "getExistingDirectory",
+            lambda *_args, **_kwargs: pytest.fail(
+                "临时人工测试不应打开生产数据目录选择器"
+            ),
+        )
+        view._choose_data_directory()
+        assert environment.service.manual_test_environment is True
+    finally:
+        view.close()
+        app.processEvents()
+        report = environment.close()
+        assert report["temp_data_removed"] is True
+
+
+def test_manual_media_preview_releases_synthetic_file_before_cleanup(tmp_path):
+    if not HAS_MULTIMEDIA:
+        pytest.skip("Qt Multimedia is unavailable")
+
+    app = QApplication.instance() or QApplication([])
+    environment = ManualTestEnvironment(
+        record_count=0,
+        diagnostics_root=str(tmp_path / "diagnostics"),
+        create_media_files=False,
+    ).start()
+    media_path = environment.media_root / "preview.mp4"
+    if not environment._create_synthetic_media_file(media_path):
+        environment.close()
+        pytest.skip("ffmpeg could not create a valid synthetic video")
+
+    preview = MediaPreviewWidget()
+    try:
+        preview.set_media(str(media_path))
+        app.processEvents()
+        assert not preview._player.source().isEmpty()
+
+        preview.set_media(None)
+        app.processEvents()
+        assert preview._player.source().isEmpty()
+    finally:
+        preview.close()
+        preview.deleteLater()
+        app.processEvents()
+        report = environment.close()
+        assert report["temp_data_removed"] is True
 
 
 def test_startup_directory_migration_keeps_gui_event_loop_responsive():
