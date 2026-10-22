@@ -3,7 +3,7 @@
 Status: claimed
 GitHub Issue: #21 — https://github.com/jiahao07A/video-organizer-pro/issues/21
 Branch: `feat/21-settings-effective-config`
-PR: 待创建
+PR: [#33](https://github.com/jiahao07A/video-organizer-pro/pull/33)
 
 ## 背景和目标
 
