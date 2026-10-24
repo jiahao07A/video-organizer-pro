@@ -487,7 +487,11 @@ class SettingsView(QWidget):
     def _data_directory_text(self) -> str:
         try:
             inspection = self.service.data_directory_inspection()
-            return f"当前目录：{inspection.active_root}\n状态：{inspection.message}"
+            return (
+                f"当前目录：{inspection.active_root}\n"
+                f"便携默认目录：{inspection.default_root}\n"
+                f"状态：{inspection.message}"
+            )
         except Exception as exc:
             return f"当前目录不可用：{exc}"
 

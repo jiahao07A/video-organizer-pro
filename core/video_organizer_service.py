@@ -1341,8 +1341,7 @@ class VideoProcessor:
         except Exception:
             return ""
 
-    @classmethod
-    def extract_frames(cls, video_path: str, max_frames: int = 10, target_size: int = 512,
+    def extract_frames(self, video_path: str, max_frames: int = 10, target_size: int = 512,
                        save_thumbnail: bool = False, use_scene_detection: bool = True,
                        thumbnails_dir: Optional[str] = None) -> Dict[str, Any]:
         logger.debug(f"开始抽取视频帧: {video_path} (最大帧数: {max_frames})")
@@ -1385,10 +1384,10 @@ class VideoProcessor:
                 if ret:
                     if i == 0:
                         # phash 走 PIL，需要 RGB
-                        phash = cls.calculate_phash(frame)
+                        phash = self.calculate_phash(frame)
                         
                         if save_thumbnail:
-                            thumbnail_root = thumbnails_dir or THUMBNAILS_DIR
+                            thumbnail_root = thumbnails_dir or self.thumbnails_dir
                             if not os.path.exists(thumbnail_root):
                                 os.makedirs(thumbnail_root)
                             file_hash = hashlib.md5(video_path.encode()).hexdigest()
@@ -1399,12 +1398,12 @@ class VideoProcessor:
                                 # frame 为 BGR，与 cv2.imwrite 一致，色相正确
                                 cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_WEBP_QUALITY), 80])
                             except Exception:
-                                thumbnail_path = os.path.join(thumbnails_dir or THUMBNAILS_DIR, f"{file_hash}.jpg")
+                                thumbnail_path = os.path.join(thumbnails_dir or self.thumbnails_dir, f"{file_hash}.jpg")
                                 cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
                     # 保持 BGR：cv2.imencode 按 BGR 写 JPEG；切勿先转 RGB 再 encode
-                    resized_frame = cls.resize_image(frame, target_size)
-                    base64_str = cls.encode_image_to_base64(resized_frame)
+                    resized_frame = self.resize_image(frame, target_size)
+                    base64_str = self.encode_image_to_base64(resized_frame)
                     if base64_str:
                         base64_frames.append(base64_str)
         except Exception:
