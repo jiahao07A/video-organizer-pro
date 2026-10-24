@@ -77,6 +77,35 @@ def test_locator_stores_only_required_state_and_survives_working_directory_chang
     assert "api" not in payload
 
 
+def test_corrupt_locator_is_reported_as_invalid_for_alternate_selection(
+    tmp_path: Path,
+):
+    app = tmp_path / "app"
+    app.mkdir()
+    locator = app / ".video-organizer-data.json"
+    locator.write_text("{broken", encoding="utf-8")
+
+    inspection = DataDirectoryManager(application_directory=str(app)).inspect()
+
+    assert inspection.state is DataDirectoryState.INVALID
+    assert "定位记录无法读取" in inspection.message
+
+
+def test_incomplete_default_locator_restores_legacy_migration_gate(
+    tmp_path: Path,
+):
+    app = tmp_path / "app"
+    app.mkdir()
+    manager = DataDirectoryManager(application_directory=str(app))
+    manager.write_locator(str(app / "data"), database_initialized=True)
+    (app / "video_organizer.db").write_bytes(b"legacy")
+
+    inspection = manager.inspect()
+
+    assert inspection.state is DataDirectoryState.LEGACY
+    assert "video_organizer.db" in inspection.legacy_items
+
+
 def test_legacy_layout_is_reported_without_opening_old_database(tmp_path: Path):
     (tmp_path / "video_organizer.db").write_bytes(b"legacy")
     manager = DataDirectoryManager(application_directory=str(tmp_path))
@@ -237,7 +266,9 @@ def test_existing_management_file_permission_failure_is_reported(
     assert "设置文件不可写" in result.message
 
 
-
+def test_migration_rejects_target_inside_source_thumbnail_directory(
+    tmp_path: Path,
+):
     source = tmp_path / "source"
     source.mkdir()
     (source / "video_organizer.db").write_bytes(b"legacy")
@@ -279,6 +310,41 @@ def test_migration_validates_integrity_and_thumbnail_references(
 
     assert True in calls
     assert list(Path(target.backups).glob("backup_*"))
+
+
+def test_migration_recreates_preexisting_empty_target_when_activation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import core.data_directory as data_directory_module
+
+    source = tmp_path / "app"
+    source.mkdir()
+    _make_database(source / "video_organizer.db")
+    (source / "settings.json").write_text("{}", encoding="utf-8")
+    (source / "tag_config.json").write_text("{}", encoding="utf-8")
+    (source / ".thumbnails").mkdir()
+    (source / ".thumbnails" / "thumb.webp").write_bytes(b"thumbnail")
+    target = tmp_path / "external" / "data"
+    target.mkdir(parents=True)
+    manager = DataDirectoryManager(application_directory=str(source))
+
+    original_replace = data_directory_module.os.replace
+
+    def fail_replace(source_path, destination_path):
+        if os.path.normcase(os.path.abspath(destination_path)) == os.path.normcase(
+            str(target.resolve())
+        ):
+            raise OSError("模拟激活失败")
+        return original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(data_directory_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="模拟激活失败"):
+        manager.migrate_legacy(str(target))
+
+    assert target.is_dir()
+    assert not (target / "video_organizer.db").exists()
+    assert (source / "video_organizer.db").exists()
 
 
 def test_locator_failure_rolls_back_activated_migration_target(

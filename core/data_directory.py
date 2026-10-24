@@ -229,7 +229,20 @@ class DataDirectoryManager:
             self.write_locator(root_path, database_initialized=True)
 
     def inspect(self) -> DataDirectoryInspection:
-        locator = self._read_locator_payload()
+        try:
+            locator = self._read_locator_payload()
+        except DataDirectoryError as exc:
+            # 定位记录损坏时必须保留改选目录的启动出口；不能把异常直接
+            # 传播到启动入口并让用户只能退出应用。
+            return DataDirectoryInspection(
+                state=DataDirectoryState.INVALID,
+                application_directory=self.application_directory,
+                default_root=self.default_root,
+                active_root=self.default_root,
+                locator_path=self.locator_path,
+                message=str(exc),
+            )
+
         selected = locator["data_root"] if locator is not None else None
         if selected is not None:
             try:
@@ -246,6 +259,26 @@ class DataDirectoryManager:
                     )
                 self._validate_existing_data_writable(selected_paths)
             except DataDirectoryError as exc:
+                # 旧版本可能已经写过指向默认 data/ 的定位记录，但旧布局
+                # 尚未完成迁移。此时优先恢复旧布局迁移门禁，避免把旧库
+                # 误报为丢失；外部自选目录仍按无效目录处理。
+                legacy_items = self._legacy_items()
+                selected_is_default = os.path.normcase(
+                    os.path.abspath(selected)
+                ) == os.path.normcase(os.path.abspath(self.default_root))
+                database_missing = not os.path.exists(
+                    self.paths_for(selected).database
+                )
+                if selected_is_default and database_missing and legacy_items:
+                    return DataDirectoryInspection(
+                        state=DataDirectoryState.LEGACY,
+                        application_directory=self.application_directory,
+                        default_root=self.default_root,
+                        active_root=self.default_root,
+                        locator_path=self.locator_path,
+                        legacy_items=tuple(legacy_items),
+                        message="检测到尚未迁移的程序旁旧布局，需要确认迁移。",
+                    )
                 return DataDirectoryInspection(
                     state=DataDirectoryState.INVALID,
                     application_directory=self.application_directory,
@@ -527,6 +560,16 @@ class DataDirectoryManager:
                 shutil.rmtree(target_root, ignore_errors=True)
                 if target_was_empty_directory:
                     os.makedirs(target_root, exist_ok=True)
+            elif (
+                target_was_empty_directory
+                and not os.path.exists(target_root)
+            ):
+                # os.rmdir(target_root) 已成功但 os.replace(stage, target_root)
+                # 失败时，保留用户原有的空目录边界，便于安全重试。
+                try:
+                    os.makedirs(target_root, exist_ok=True)
+                except OSError:
+                    pass
             if os.path.exists(stage):
                 shutil.rmtree(stage, ignore_errors=True)
             raise
