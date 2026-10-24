@@ -28,6 +28,7 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 *.pyo
+release/
 
 # Local tooling and editor files
 .vscode/
