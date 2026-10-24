@@ -12,7 +12,7 @@
 - [下载 `VideoOrganizer-v0.0.0-setup-win-x64.exe`](https://github.com/jiahao07A/video-organizer-pro/releases/download/v0.0.0/VideoOrganizer-v0.0.0-setup-win-x64.exe)
 - [查看所有版本与校验值](https://github.com/jiahao07A/video-organizer-pro/releases)
 
-安装程序提供标准 Windows 安装向导、开始菜单入口、可选桌面快捷方式和卸载入口。安装版不需要用户预先安装 Python。首次启动时，程序会在安装目录旁建立 `data` 管理数据目录；如果安装位置不可写，会提示选择其他目录。
+安装程序提供标准 Windows 安装向导、开始菜单入口、可选桌面快捷方式和卸载入口。安装版不需要用户预先安装 Python。首次启动时，程序会在安装目录下建立 `data` 管理数据目录；如果安装位置不可写，会提示选择其他目录。
 
 > AI 分析仍需要用户配置可用的 OpenAI 兼容 API。`ffmpeg` 仅在音频转录或视频内部元数据处理等功能需要时使用，不随本安装程序承诺内置。
 
@@ -149,7 +149,7 @@ API Key 只保存在本机管理数据目录中。不要把 `settings.json`、�
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PySide6 qt-material opencv-python numpy openai Pillow ImageHash "scenedetect[opencv]" pytest
+python -m pip install PySide6 opencv-python numpy openai Pillow ImageHash "scenedetect[opencv]" pytest
 python video_organizer_pyside6.py
 ```
 
@@ -184,7 +184,7 @@ python -m PyInstaller build_app.spec --noconfirm `
 
 `v0.0.0` 正式版发布前执行了以下检查：
 
-- 自动化测试：`python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"`
+- 自动化测试：`python -m pytest -q`
 - Python 编译检查：`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py`
 - Git 空白检查：`git diff --check`
 - PyInstaller Windows x64 目录包构建
@@ -205,7 +205,6 @@ video-organizer-pro/
 ├── tests/                       # 自动化测试
 ├── installer/                   # Windows 安装器配置
 ├── build_app.spec               # PyInstaller 配置
-├── CONTEXT.md                   # 产品领域词汇
 └── docs/                        # ADR 与协作规则
 ```
 
@@ -237,7 +236,6 @@ video-organizer-pro/
 
 ## 相关文档
 
-- [项目领域词汇](./CONTEXT.md)
 - [架构决策记录](./docs/adr/)
 - [本地议题追踪约定](./docs/agents/issue-tracker.md)
 - [Git 与 GitHub 工作流](./docs/agents/git-github-workflow.md)
