@@ -3,7 +3,7 @@
 Status: resolved
 GitHub Issue: [#46](https://github.com/jiahao07A/video-organizer-pro/issues/46)
 Branch: `docs/46-v000-release-record`
-PR: 发布准备 [#47](https://github.com/jiahao07A/video-organizer-pro/pull/47)；本次发布记录 PR 创建后补充
+PR: 发布准备 [#47](https://github.com/jiahao07A/video-organizer-pro/pull/47)；发布记录 [#48](https://github.com/jiahao07A/video-organizer-pro/pull/48)
 Release tag: [`v0.0.0`](https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.0)
 
 ## 背景与目标
@@ -85,4 +85,3 @@ Release tag: [`v0.0.0`](https://github.com/jiahao07A/video-organizer-pro/release
 - `compileall`、`git diff --check`、目录包清单审计、隔离安装/启动/卸载冒烟均通过。
 - 安装和卸载返回码均为 `0`；卸载删除程序文件，但保留隔离测试目录内的 `data/video_organizer.db`。
 - 后续 README/发布记录仅更新文档，不改变已发布安装包的源提交；验证证据已同步至 GitHub Issue #46。
-
