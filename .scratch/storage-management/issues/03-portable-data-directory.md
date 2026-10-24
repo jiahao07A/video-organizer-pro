@@ -67,4 +67,11 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 
 为支持 #10 的脱敏 GUI 走查，增加隔离的临时人工测试环境：临时数据库、设置、标签配置和合成素材位于系统临时根；诊断日志及清理报告独立保留在 `logs/manual-tests/`。`python tools/manual_gui_test.py --records 2 --offscreen` 验证启动与清理，清理报告显示 `temp_data_removed: true`、`errors: []`。此检查不能替代可见窗口的 Windows 人工走查，截图/录屏尚未完成。
 
-验证：`python -m pytest tests/test_data_directory.py tests/test_data_directory_gui.py tests/test_manual_test_environment.py -q`（31 passed）；`python -m pytest -q`（399 passed）；`python -m compileall -q core gui tests tools` 通过；`git diff --check` 通过。`python tools/manual_gui_test.py --records 2 --offscreen` 清理报告为 `temp_data_removed: true`、`errors: []`；临时数据已删除，诊断日志保留。可见 Windows GUI 人工走查、截图/录屏和真实权限场景仍未完成。
+### 2026-10-24 评审修复与用户初步验收反馈
+
+追加修复提交 `b9d2dc1 fix(storage): 修复便携目录初始化与隔离边界` 已快进推送到 PR #32 的原分支，未改写共享历史。修复内容包括：旧布局检测不再把归档脚本/孤立缩略图当作旧管理数据；定位记录保存数据库首次初始化状态并在数据库创建后更新；临时人工测试禁用数据目录切换；恢复筛选测试独立定义；退出临时 GUI 会话前释放 Qt 多媒体文件引用。
+
+验证：定向回归 `python -m pytest -q tests/test_data_directory.py tests/test_data_directory_gui.py tests/test_manual_test_environment.py tests/test_video_catalog.py` 为 40 passed；排除已确认基线故障的全量命令 `python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 为 402 passed、1 deselected；编译检查和 `git diff --check` 通过。后者排除的启动升级对话框失败在基线 `3086377` 也复现，已独立记录为 Issue #40，用户要求不将其作为 PR #32 或 RC2 阻塞项。
+
+用户反馈手动 GUI 测试初步通过，并明确要求不因进一步 GUI 走查阻塞后续流程。此前临时隔离会话正常关闭，清理报告为 `temp_data_removed: true`、`errors: []`。PR #32 仍需非作者维护者审阅批准；GitHub 当前没有状态检查结果。Issue #10 暂保持开放，待合并及最终收尾后再关闭。
+
