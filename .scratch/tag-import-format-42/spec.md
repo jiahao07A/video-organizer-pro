@@ -1,6 +1,6 @@
 # 标签词表导入格式解析修复
 
-Status: claimed
+Status: resolved
 GitHub Issue: [#42](https://github.com/jiahao07A/video-organizer-pro/issues/42)
 Branch: `fix/42-tag-import-format`
 PR: [#44](https://github.com/jiahao07A/video-organizer-pro/pull/44)
@@ -43,3 +43,9 @@ PR: [#44](https://github.com/jiahao07A/video-organizer-pro/pull/44)
 复现日志确认 `词.txt` 的 11 行注释、5 个分组标题、21 行别名格式曾全部进入 AI 分类，分类输入为 178 条而分类结果达到 194 条。已增加解析、章节回退分组、别名持久化和输入外 AI 结果过滤。
 
 验证：`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py` 通过；`python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 为 `408 passed, 1 deselected`；`git diff --check` 通过。提交 `0b4b326` 已推送，PR #44 等待非作者审阅、必要 CI 和重新打包后的人工导入验收。
+
+### 2026-10-24 合并与 RC3
+
+PR #44 已通过主 Agent 审阅并以 Rebase and merge 合入 `main`，合并提交为 `830b12bfbd55e40b1bdacfd6a6eb3764171896fb`；Issue #42 已自动关闭。后续 RC3 从合并后的 `main` 构建并发布，记录见 `.scratch/windows-rc3-release/spec.md`。
+
+验证补充：相关测试 `18 passed`；完整回归 `408 passed, 1 deselected`；隔离构建、ZIP 审计和启动/退出冒烟通过。Windows RC3 包内真实词表导入仍未人工验证，已在 Issue #43 和 RC3 发布说明中明确列为未验证项。
