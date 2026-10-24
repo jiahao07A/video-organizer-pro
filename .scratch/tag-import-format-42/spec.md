@@ -3,7 +3,7 @@
 Status: claimed
 GitHub Issue: [#42](https://github.com/jiahao07A/video-organizer-pro/issues/42)
 Branch: `fix/42-tag-import-format`
-PR: 待创建
+PR: [#44](https://github.com/jiahao07A/video-organizer-pro/pull/44)
 
 ## 背景与目标
 
@@ -40,4 +40,6 @@ PR: 待创建
 
 ### 2026-10-24 实现与验证
 
-复现日志确认 `词.txt` 的 11 行注释、5 个分组标题、21 行别名格式曾全部进入 AI 分类，分类输入为 178 条而分类结果达到 194 条。已增加解析、章节回退分组、别名持久化和输入外 AI 结果过滤；对应测试与提交待完成。
+复现日志确认 `词.txt` 的 11 行注释、5 个分组标题、21 行别名格式曾全部进入 AI 分类，分类输入为 178 条而分类结果达到 194 条。已增加解析、章节回退分组、别名持久化和输入外 AI 结果过滤。
+
+验证：`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py` 通过；`python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 为 `408 passed, 1 deselected`；`git diff --check` 通过。提交 `0b4b326` 已推送，PR #44 等待非作者审阅、必要 CI 和重新打包后的人工导入验收。
