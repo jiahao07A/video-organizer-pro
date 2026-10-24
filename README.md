@@ -191,7 +191,7 @@ python -m PyInstaller build_app.spec --noconfirm `
 - 发布包清单审计：排除 API Key、设置、标签配置、数据库、日志、备份、缩略图缓存和真实视频
 - 隔离安装后的启动/退出与标准卸载流程冒烟
 
-已发布资产页面会记录实际测试数量、Python/PyInstaller/Qt 版本、安装包大小和 SHA-256。自动化测试通过不代表外部 AI 服务、所有视频编码、剪辑软件导入和所有文件系统权限组合都已覆盖。
+已发布资产页面会记录安装包大小和 SHA-256。正式版 `v0.0.0` 完整测试结果为 `408 passed, 1 failed`：失败项为首次升级对话框 GUI 测试 `tests/test_startup_upgrade_gui.py::test_startup_upgrade_dialog_confirms_and_reports_progress`，该用例单独运行曾通过，但完整套件运行会超时；这是当前已知限制。自动化测试通过不代表外部 AI 服务、所有视频编码、剪辑软件导入和所有文件系统权限组合都已覆盖。
 
 ## 项目结构
 
