@@ -1,9 +1,9 @@
 # Windows x64 v0.0.0 正式版发布
 
-Status: in_progress
+Status: claimed
 GitHub Issue: [#46](https://github.com/jiahao07A/video-organizer-pro/issues/46)
 Branch: `chore/46-readme-windows-installer`
-PR: 待创建
+PR: [#47](https://github.com/jiahao07A/video-organizer-pro/pull/47)
 Release tag: `v0.0.0`
 
 ## 背景与目标
@@ -35,8 +35,8 @@ Release tag: `v0.0.0`
 
 ## 验收标准
 
-- README 与 `CONTEXT.md`、已接受 ADR 和当前界面入口一致；历史已删除字段不再作为当前能力宣传。
-- `python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 通过；`compileall` 与 `git diff --check` 通过。
+- README 与已接受 ADR 和当前界面入口一致；历史已删除字段不再作为当前能力宣传。
+- `python -m pytest -q` 通过；`compileall` 与 `git diff --check` 通过。
 - PyInstaller 目录包构建成功，清单不含敏感配置、运行数据库、日志、备份或真实素材。
 - Inno Setup 安装程序构建成功，安装向导能安装程序、创建快捷方式并注册卸载项。
 - 隔离安装目录启动/退出冒烟通过；卸载后程序目录和快捷方式按标准流程清理。
@@ -44,9 +44,9 @@ Release tag: `v0.0.0`
 
 ## 风险与回滚
 
-- 安装目录默认位于 `Program Files` 时可能不可写；程序按既有数据目录规则提示用户另选管理数据目录，不静默创建错误数据。
+- 安装目录默认位于当前用户可写的 `%LocalAppData%\Programs\Video Organizer Pro`，管理数据默认位于安装目录下的 `data` 子目录；程序按既有数据目录规则提示用户另选目录，不静默创建错误数据。
 - 打包环境当前为 Python 3.13.12；RC3 已在同一环境完成目录包验证，正式版记录该环境及工具版本。
-- Inno Setup 本机未预装，需要安装构建工具或使用官方可复现安装器工具链；工具本身不进入发布资产。
+- 构建工具使用 Inno Setup 6.7.3；工具本身不进入发布资产。
 - 若构建/安装/启动验证失败，停止发布，不复用 `v0.0.0` 标签；修复后以新提交重新构建。已发布的 `v0.0.0-rc3` 保留作为回退版本。
 
 ## 验证计划
@@ -69,10 +69,10 @@ Release tag: `v0.0.0`
 - README 已按当前代码和领域文档重写；移除历史独立情绪/评分类字段和“完整一键回滚”等过度承诺，补充安装、首次配置、数据目录、标签人工确认和风险边界。
 - 新增 `installer/VideoOrganizer.iss`，使用 Inno Setup 6.7.3 生成标准 Windows x64 EXE 安装程序；安装目录默认使用当前用户可写的 `%LocalAppData%\Programs\Video Organizer Pro`，不打包 `data/`。
 - 构建环境：Windows x64，Python 3.13.12，PyInstaller 6.19.0，PySide6 6.10.2，Inno Setup 6.7.3。
-- 自动化测试：`python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` → `408 passed, 1 deselected`。
+- 自动化测试：`python -m pytest -q` → 待在合并后主干重新运行并记录。
 - 编译与空白检查：`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py`、`git diff --check` 通过。
 - 目录包清单审计：1078 个文件；未发现 `settings.json`、`tag_config.json`、数据库、日志、备份或真实素材；运行时 `词.txt` 位于 PyInstaller `_internal` 资源目录。
 - 隔离安装启动/退出冒烟通过：程序启动后创建隔离 `data\video_organizer.db`；标准卸载返回码 `0`，程序文件移除而管理数据保留。
 - 安装资产：`VideoOrganizer-v0.0.0-setup-win-x64.exe`，大小 `95303731` 字节，SHA-256 `2DAE91C125F9CFB48B3D95C41963E62C47911C598ABAB7D8AF832F3A7EF5DAC3`。
 
-尚未完成 GitHub 标签、Release 上传和远端资产核对；完成后追加正式版发布记录。
+正式版标签、Release 上传和远端资产核对将在合并后完成，并在本记录中追加最终证据。

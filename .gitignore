@@ -8,7 +8,6 @@ tag_config.json
 
 # 尚未纳入版本库的本地文档草稿（需要发布时用 git add -f 显式加入）
 CONTEXT.md
-README.md
 
 # Runtime data and local state
 *.db
@@ -28,7 +27,9 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 *.pyo
+# Generated installer and isolated build output
 release/
+.release-build/
 
 # Local tooling and editor files
 .vscode/
