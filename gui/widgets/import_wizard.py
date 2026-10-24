@@ -29,6 +29,8 @@ class TagImportWizard(QWizard):
         super().__init__(parent)
         self.import_service = import_service
         self.imported_tags = []
+        self.imported_aliases = {}
+        self.imported_groups = {}
         self.classified_data = {} # {tag_name: category_id}
         
         self.setWindowTitle("标签导入向导")
@@ -82,6 +84,12 @@ class FileSelectionPage(QWizardPage):
             self.path_label.setText(file_path)
             tags = self.wizard().import_service.read_tags_from_file(file_path)
             self.wizard().imported_tags = tags
+            self.wizard().imported_aliases = dict(
+                getattr(self.wizard().import_service, "last_import_aliases", {}) or {}
+            )
+            self.wizard().imported_groups = dict(
+                getattr(self.wizard().import_service, "last_import_groups", {}) or {}
+            )
             self.preview_edit.setPlainText("\n".join(tags))
             self.completeChanged.emit()
 
@@ -122,10 +130,11 @@ class AIProcessingPage(QWizardPage):
             for t in tags:
                 flat_data[t] = cat_id
         
-        # 未被 AI 分类的标签默认落到建议组（禁止 pool）
+        # 未被 AI 分类的标签优先沿用词表章节，否则落到建议组。
+        source_groups = getattr(self.wizard(), "imported_groups", {}) or {}
         for t in self.wizard().imported_tags:
             if t not in flat_data:
-                flat_data[t] = "custom"
+                flat_data[t] = source_groups.get(t, "custom")
                 
         self.wizard().classified_data = flat_data
         self._is_finished = True
