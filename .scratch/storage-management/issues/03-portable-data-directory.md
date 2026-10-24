@@ -1,6 +1,6 @@
 # 03：统一便携数据目录
 
-Status: claimed
+Status: resolved
 
 GitHub Issue: [#10](https://github.com/jiahao07A/video-organizer-pro/issues/10)
 
@@ -74,3 +74,9 @@ PR: [#32](https://github.com/jiahao07A/video-organizer-pro/pull/32)
 验证：定向回归 `python -m pytest -q tests/test_data_directory.py tests/test_data_directory_gui.py tests/test_manual_test_environment.py tests/test_video_catalog.py` 为 40 passed；排除已确认基线故障的全量命令 `python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 为 402 passed、1 deselected；编译检查和 `git diff --check` 通过。后者排除的启动升级对话框失败在基线 `3086377` 也复现，已独立记录为 Issue #40，用户要求不将其作为 PR #32 或 RC2 阻塞项。
 
 用户反馈手动 GUI 测试初步通过，并明确要求不因进一步 GUI 走查阻塞后续流程。此前临时隔离会话正常关闭，清理报告为 `temp_data_removed: true`、`errors: []`。PR #32 仍需非作者维护者审阅批准；GitHub 当前没有状态检查结果。Issue #10 暂保持开放，待合并及最终收尾后再关闭。
+
+### 2026-10-24 合并收尾
+
+PR #32 已通过 Rebase and merge 合入 `main`，合并提交为 `cd5b44dc94aa0d75e3e38c31dcbff1dd3b656f1a`。评审修正提交 `90a214d1b147699695799ffa8df5f7b754517d36` 已包含损坏定位记录改选、未完成旧布局迁移恢复、激活失败空目录保留、缩略图目录注入和独立回归用例修正。
+
+最终验证：`python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 为 `406 passed, 1 deselected`；编译检查和 `git diff --check` 通过。Issue #10 已关闭，Issue #40 继续独立跟踪。

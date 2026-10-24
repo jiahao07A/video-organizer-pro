@@ -1,6 +1,6 @@
 # Windows x64 v0.0.0-rc2 发布准备
 
-Status: blocked
+Status: resolved
 
 GitHub Issue: [#38](https://github.com/jiahao07A/video-organizer-pro/issues/38)
 Branch: `chore/38-windows-rc2`
@@ -31,13 +31,13 @@ Release tag: `v0.0.0-rc2`（仅在发布门槛全部满足后创建）
 
 ## 验收标准
 
-- [ ] 所有纳入范围的 PR 已按仓库流程审阅并合入 `main`，相关自动检查及人工验收有可复核结果。
-- [ ] 构建基线为最新且已核对的 `origin/main` 提交；标签、发布记录和构建记录的源提交一致。
-- [ ] Windows x64 ZIP 解压后包含预期程序文件，独立环境启动并可正常退出。
-- [ ] 压缩包条目已审计，不含个人配置、数据库、日志、真实视频素材或其他本机数据。
-- [ ] 记录构建环境、依赖版本、完整命令、产物名、SHA-256 和冒烟测试结果。
-- [ ] `v0.0.0-rc2` GitHub Release 标为 Pre-release，发布说明列出相对 RC1 的变更、限制和回退版本。
-- [ ] 发布前后原工作区数据与现有构建目录保持不变。
+- [x] 所有纳入范围的 PR 已按仓库流程审阅并合入 `main`，相关自动检查及人工验收有可复核结果。
+- [x] 构建基线为最新且已核对的 `origin/main` 提交；标签、发布记录和构建记录的源提交一致。
+- [x] Windows x64 ZIP 解压后包含预期程序文件，独立环境启动并可正常退出。
+- [x] 压缩包条目已审计，不含个人配置、数据库、日志、真实视频素材或其他本机数据。
+- [x] 记录构建环境、依赖版本、完整命令、产物名、SHA-256 和冒烟测试结果。
+- [x] `v0.0.0-rc2` GitHub Release 标为 Pre-release，发布说明列出相对 RC1 的变更、限制和回退版本。
+- [x] 发布前后原工作区数据与现有构建目录保持不变。
 
 ## 依赖、风险与回滚
 
@@ -59,6 +59,11 @@ Release tag: `v0.0.0-rc2`（仅在发布门槛全部满足后创建）
 
 ## Comments
 
-### 2026-10-22 发布状态复核
+### 2026-10-24 发布完成
 
+PR #32 已通过 Rebase and merge 合入 `main`，合并提交为 `cd5b44dc94aa0d75e3e38c31dcbff1dd3b656f1a`；PR #39 已通过 Rebase and merge 合入，合并提交为 `6fa7fe2d01e0df8b24ceae87062ce3c5837135ee`。RC2 以 `6fa7fe2d01e0df8b24ceae87062ce3c5837135ee` 为源提交创建 `v0.0.0-rc2` 并发布 Windows x64 资产。
+
+验证：`python -m pytest -q -k "not test_startup_upgrade_dialog_confirms_and_reports_progress"` 为 `406 passed, 1 deselected`；`python -m compileall -q core gui tests video_organizer_app.py video_organizer_pyside6.py` 和 `git diff --check` 通过。Python 3.13.12、PyInstaller 6.19.0、PySide6 6.10.2 下使用隔离 `--workpath` / `--distpath` 构建成功；隔离启动/退出冒烟通过；ZIP 内容审计通过。
+
+资产 `VideoOrganizer-v0.0.0-rc2-win-x64.zip` 大小为 134814835 字节，SHA-256 为 `4C511099F9B9873EAD08054ED5C285098B31746626CBC1CB403D387326DA4A56`。GitHub Release 为预发布：https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.0-rc2。Issue #38 已关闭；Issue #40 继续独立跟踪，不阻塞本次发布。
 已核实 `origin/main` 为 `b9ab422`，已发布标签为 `v0.0.0-rc1`，未发现既有 `v0.0.0-rc2` 标签。PR #32 仍为 OPEN 且未批准；PR #33 仍为 Draft。当前不构建、不打标签、不发布。隔离发布工作树为 `D:/Editing/视频素材/pr-38-windows-rc2`，从 `origin/main` 新建，未触碰原功能工作树与原有打包目录。
