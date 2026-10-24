@@ -1919,6 +1919,24 @@ class TagsView(QWidget):
                     except Exception:
                         pass
                     self.add_tag_to_dim_if_new(dim, name)
+
+            # 词表中的别名只写入同义词表，不作为第二个标准词入组。
+            for alias, standard in (
+                getattr(wizard, "imported_aliases", {}) or {}
+            ).items():
+                alias = str(alias or "").strip()
+                standard = str(standard or "").strip()
+                if not alias or not standard or alias == standard:
+                    continue
+                try:
+                    self.service.db.add_synonym(standard, alias)
+                except Exception:
+                    pass
+            if hasattr(self.service.ai, "init_tag_libraries"):
+                try:
+                    self.service.ai.init_tag_libraries()
+                except Exception:
+                    pass
             # 与文件配置对齐
             try:
                 self.service.tag_config = self.import_service.ai.tag_config or self.service.tag_config
