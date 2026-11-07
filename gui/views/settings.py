@@ -735,16 +735,16 @@ class SettingsView(QWidget):
         proc_form = QFormLayout(proc_group)
         
         self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(1, 32)
+        self.workers_spin.setRange(1, 512)
         self.workers_spin.setValue(
             int(SettingsManager.get_setting(self.settings, "processing.max_workers", 16) or 16)
         )
         self.workers_spin.setToolTip(
-            "分析管线并发（等 AI 的任务数）。过大不会加快抽帧，反而卡死整机。建议 8～16，硬顶 32。"
+            "同时处理多少条视频（包括抽帧、等待AI和整理结果），上限512。不是每秒请求数；图片准备好后才请求AI。建议先用8～16。"
         )
 
         self.extract_parallel_spin = QSpinBox()
-        self.extract_parallel_spin.setRange(1, 16)
+        self.extract_parallel_spin.setRange(1, 512)
         self.extract_parallel_spin.setValue(
             int(
                 SettingsManager.get_setting(
@@ -754,11 +754,11 @@ class SettingsView(QWidget):
             )
         )
         self.extract_parallel_spin.setToolTip(
-            "同时 OpenCV 解码抽帧的路数。4K 素材建议 2～4；过大必导致整机/GUI 卡死。"
+            "视频分析前，同时为多少条视频解码并准备AI图片，上限512。默认4；4K建议2～4。若AI请求稀疏且CPU/磁盘有余量，可逐步调高；不要超过分析任务并行数。"
         )
 
         self.extract_workers_spin = QSpinBox()
-        self.extract_workers_spin.setRange(1, 32)
+        self.extract_workers_spin.setRange(1, 512)
         self.extract_workers_spin.setValue(
             int(
                 SettingsManager.get_setting(
@@ -768,7 +768,7 @@ class SettingsView(QWidget):
             )
         )
         self.extract_workers_spin.setToolTip(
-            "工作范围入库时缩略图抽帧并发。建议 4～8。"
+            "仅在新视频入库时生成列表缩略图，上限512，建议4～8。不会提高分析AI请求并发，也不控制标签库AI分类。"
         )
         
         self.frames_spin = QSpinBox()
@@ -780,6 +780,10 @@ class SettingsView(QWidget):
         self.quality_spin.setValue(SettingsManager.get_setting(self.settings, "processing.jpeg_quality", 80))
         
         self.scene_detect_cb = QCheckBox("启用智能场景检测")
+        self.scene_detect_cb.setToolTip(
+            "开启时会先遍历解码视频寻找场景，长视频的图片准备可能较慢；"
+            "关闭后按时间均匀抽帧，速度通常更快，但送给AI的画面会不同。不会自动替你关闭。"
+        )
         self.scene_detect_cb.setChecked(SettingsManager.get_setting(self.settings, "processing.enable_scene_detection", True))
         
         self.audio_cb = QCheckBox("启用音频转录 (Whisper)")
@@ -795,9 +799,18 @@ class SettingsView(QWidget):
             ))
         )
         
-        proc_form.addRow("分析管线并发:", self.workers_spin)
-        proc_form.addRow("同时抽帧路数:", self.extract_parallel_spin)
-        proc_form.addRow("入库抽帧并发:", self.extract_workers_spin)
+        proc_form.addRow("同时分析的视频数:", self.workers_spin)
+        proc_form.addRow("分析图片准备并行数:", self.extract_parallel_spin)
+        proc_form.addRow("入库缩略图并行数:", self.extract_workers_spin)
+        concurrency_help = QLabel(
+            "分析流程：准备图片 → 请求 AI → 保存结果。\n"
+            "“同时分析的视频数”是整条流程的任务上限，32不代表每秒32次请求；"
+            "“分析图片准备并行数”决定前置抽帧速度。\n"
+            "智能场景检测会先遍历解码视频，可能延后AI请求；关闭则均匀抽帧，画面选择会不同。\n"
+            "“入库缩略图并行数”只用于新素材入库；以上三项不控制标签库 AI 分类。保存后用于下一次任务。"
+        )
+        concurrency_help.setWordWrap(True)
+        proc_form.addRow(concurrency_help)
         proc_form.addRow("AI 分析抽帧数:", self.frames_spin)
         proc_form.addRow("JPEG 压缩质量:", self.quality_spin)
         proc_form.addRow(self.scene_detect_cb)

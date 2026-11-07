@@ -26,6 +26,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Set, Union, Any, Callable
 from core.ai_gateway import AiRequestGateway
+from core.background_process import hidden_process_options, quiet_ffmpeg_probe
 from core.storage_backup import (
     STORAGE_IO_LOCK,
     StorageBackupError,
@@ -67,12 +68,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VideoOrganizer")
 
-# 尝试导入可选库
-try:
-    from scenedetect import detect, ContentDetector, SceneManager, open_video
-    HAS_SCENEDETECT = True
-except ImportError:
-    HAS_SCENEDETECT = False
+# 场景检测只在实际抽帧时加载，启动无需探测FFmpeg。
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _scene_detection_components():
+    try:
+        with quiet_ffmpeg_probe():
+            from scenedetect import ContentDetector, SceneManager, open_video
+        return ContentDetector, SceneManager, open_video
+    except ImportError:
+        return None
 
 try:
     import imagehash
@@ -1021,6 +1027,40 @@ class DatabaseManager:
             rows = self.execute_query("SELECT * FROM tags_library ORDER BY usage_count DESC")
         return [dict(row) for row in rows]
 
+    def import_tags_batch(self, assignments: Dict[str, str], aliases: Dict[str, str], *, projection_recovery=None) -> None:
+        """一次事务改派/插入标准词及别名，保留已有词的ID和附加属性。"""
+        with self.lock:
+            with self._managed_connection() as conn:
+                existing = {}
+                for row in conn.execute("SELECT id, dimension, tag_name FROM tags_library ORDER BY id"):
+                    existing.setdefault(row['tag_name'], []).append(row)
+                for name, dimension in assignments.items():
+                    rows = existing.get(name, [])
+                    if rows:
+                        keep = next((r for r in rows if str(r['dimension'] or '').lower() == dimension.lower()), rows[0])
+                        conn.executemany("DELETE FROM tags_library WHERE id = ?", [(r['id'],) for r in rows if r['id'] != keep['id']])
+                        conn.execute("UPDATE tags_library SET dimension = ? WHERE id = ?", (dimension, keep['id']))
+                    else:
+                        conn.execute("INSERT INTO tags_library(dimension,tag_name,is_learned) VALUES(?,?,0)", (dimension, name))
+                conn.executemany("INSERT OR REPLACE INTO synonyms(standard_tag,alias) VALUES(?,?)", [(standard, alias) for alias, standard in aliases.items()])
+                if projection_recovery is not None:
+                    # 与词表同一事务：进程在投影落盘前退出也不能再回灌旧文件。
+                    conn.execute(
+                        "INSERT OR REPLACE INTO storage_metadata(key,value) VALUES(?,?)",
+                        ('tag_import_projection_pending', json.dumps(projection_recovery, ensure_ascii=False)),
+                    )
+
+    def bulk_add_tag_definitions(self, definitions: List[tuple]) -> None:
+        """兼容多语言/图标的初始化投影，一次事务替代逐词连接和提交。"""
+        if not definitions:
+            return
+        with self.lock:
+            with self._managed_connection() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO tags_library(dimension,tag_name,is_learned,name_en,icon) VALUES(?,?,?,?,?)",
+                    definitions,
+                )
+
     def update_tag(self, tag_id: int, updates: Dict):
         set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
         params = list(updates.values()) + [tag_id]
@@ -1376,8 +1416,10 @@ class VideoProcessor:
         phash = ""
         
         scene_list = []
-        if use_scene_detection and HAS_SCENEDETECT:
+        components = _scene_detection_components() if use_scene_detection else None
+        if components:
             try:
+                ContentDetector, SceneManager, open_video = components
                 video = open_video(video_path)
                 scene_manager = SceneManager()
                 scene_manager.add_detector(ContentDetector())
@@ -1455,7 +1497,7 @@ class AudioTranscriber:
         不再在此处自行创建 OpenAI 客户端。
         """
         try:
-            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, **hidden_process_options())
             # 本次独占临时目录，避免覆盖或清理源素材旁的既有同名音频。
             with tempfile.TemporaryDirectory(prefix="video-organizer-audio-") as temp_dir:
                 audio_path = os.path.join(temp_dir, "audio.mp3")
@@ -1466,6 +1508,7 @@ class AudioTranscriber:
                     ],
                     capture_output=True,
                     check=True,
+                    **hidden_process_options(),
                 )
 
                 use_gateway = gateway
@@ -1505,7 +1548,7 @@ class MetadataInjector:
                 "-metadata", f"comment={summary} | Tags: {tags_str}", 
                 "-codec", "copy", temp_path
             ]
-            subprocess.run(cmd, capture_output=True, check=True)
+            subprocess.run(cmd, capture_output=True, check=True, **hidden_process_options())
             os.replace(temp_path, video_path)
             return True
         except Exception:
@@ -1571,6 +1614,7 @@ class AIHandler:
         if not self.db:
             return
             
+        definitions = []
         # 优先使用 tag_config (v6.0)
         if self.tag_config:
             # v6.0 结构
@@ -1584,21 +1628,22 @@ class AIHandler:
                             name = tag_def.get("name")
                             name_en = tag_def.get("en")
                             icon = tag_def.get("icon")
-                            self.db.add_tag(dim, name, is_learned=0, name_en=name_en, icon=icon)
+                            definitions.append((dim, name, 0, name_en, icon))
                         else:
-                            self.db.add_tag(dim, tag_def, is_learned=0)
+                            definitions.append((dim, tag_def, 0, None, None))
             # v5.0 结构 (兼容迁移过程中的瞬态)
             elif "config" in self.tag_config:
                 for item in self.tag_config["config"]:
                     dim = item.get("id")
                     tags = item.get("tags", [])
                     for tag in tags:
-                        self.db.add_tag(dim, tag, is_learned=0)
+                        definitions.append((dim, tag, 0, None, None))
         else:
             # 兼容旧版 settings 结构
             for dim, tags in self.settings.get("tag_dimensions", {}).items():
                 for tag in tags:
-                    self.db.add_tag(dim, tag, is_learned=0)
+                    definitions.append((dim, tag, 0, None, None))
+        self.db.bulk_add_tag_definitions(definitions)
 
     def _get_api_response(
         self,
@@ -2556,7 +2601,7 @@ class VideoOrganizerService:
             SettingsManager.get_setting(self.settings, "processing.extract_parallel", 4)
             or 4
         )
-        ep = max(1, min(ep, 16))
+        ep = max(1, min(ep, 512))
         self._extract_parallel = ep
         self._extract_sem = threading.Semaphore(ep)
         self._xmp_ctx_cache = None
@@ -3548,6 +3593,17 @@ class VideoOrganizerService:
 
     def load_tag_config(self) -> Dict:
         """加载标签配置，并支持从旧版本自动迁移至 v6.0"""
+        with STORAGE_IO_LOCK:
+            with self.db.lock:
+                pending = self.db.get_storage_metadata('tag_import_projection_pending')
+                if pending is not None:
+                    config = self._tag_config_projection(pending['config'])
+                    try:
+                        self._write_tag_import_projection(config)
+                    except Exception:
+                        # 数据库已提交。文件仍不可写也使用正确内存，保留恢复记录。
+                        logger.warning('标签配置投影尚未恢复，继续使用数据库词表；备份：%s', pending.get('backup'), exc_info=True)
+                    return config
         default_v6 = {
             "version": "6.0",
             "global_settings": {
@@ -3643,8 +3699,15 @@ class VideoOrganizerService:
             pass
         self.tag_config = config
         try:
-            with STORAGE_IO_LOCK:
+            with STORAGE_IO_LOCK, self.db.lock:
+                pending = self.db.get_storage_metadata('tag_import_projection_pending')
+                if pending is not None:
+                    # 恢复期间用户又修改组规则：恢复记录也必须跟上最新配置。
+                    pending['config'] = config
+                    self.db.set_storage_metadata('tag_import_projection_pending', pending)
                 write_json_atomic(self._tag_config_path, config)
+                if pending is not None:
+                    self.db.execute_non_query("DELETE FROM storage_metadata WHERE key = ?", ('tag_import_projection_pending',))
             # 更新 AI Handler 中的配置
             if hasattr(self, "ai"):
                 self.ai.tag_config = config
@@ -3718,6 +3781,68 @@ class VideoOrganizerService:
             pass
         return draft
 
+    def _tag_config_projection(self, source: Dict) -> Dict:
+        """保留组规则及多语言定义，仅由权威DB生成各组词列表。"""
+        import copy
+        config = copy.deepcopy(source)
+        by_group = {}
+        for row in self.db.get_tags_detail():
+            by_group.setdefault(row['dimension'], []).append(row['tag_name'])
+        definitions = {
+            tag['name']: tag
+            for group in config.get('tag_groups') or []
+            for tag in group.get('tags') or []
+            if isinstance(tag, dict) and tag.get('name')
+        }
+        for group in config.get('tag_groups') or []:
+            group['tags'] = [definitions.get(name, name) for name in by_group.get(group['id'], [])]
+        return config
+
+    def _write_tag_import_projection(self, config: Dict) -> None:
+        write_json_atomic(self._tag_config_path, config)
+        self.db.execute_non_query("DELETE FROM storage_metadata WHERE key = ?", ('tag_import_projection_pending',))
+
+    def commit_tag_import(self, classified: Dict[str, List[str]], aliases=None) -> Dict[str, Any]:
+        """已确认的导入一次写库，配置仅为DB词表投影；跨文件失败保留可恢复备份。"""
+        import copy
+        from core.tag_group_ops import known_group_ids, reject_pool_in_classified
+
+        config = copy.deepcopy(self.tag_config)
+        known = known_group_ids(config.get('tag_groups') or [])
+        ok, error = reject_pool_in_classified(classified or {}, known)
+        if not ok:
+            raise ValueError(error)
+        assignments = {}
+        for group, names in (classified or {}).items():
+            group = str(group or '').strip()
+            for raw in names:
+                name = str(raw or '').strip()
+                if not name:
+                    continue
+                if name in assignments and assignments[name] != group:
+                    raise ValueError(f'同一标准词不能导入多个组：{name}')
+                assignments[name] = group
+        alias_map = {str(a).strip(): str(s).strip() for a, s in (aliases or {}).items() if str(a).strip() and str(s).strip() and str(a).strip() != str(s).strip()}
+        with STORAGE_IO_LOCK:
+            # 同时锁DB，避免备份到提交之间其他任务写入；不自动恢复覆盖后续数据。
+            with self.db.lock:
+                available = set(assignments) | {r['tag_name'] for r in self.db.get_tags_detail()}
+                if any(standard not in available for standard in alias_map.values()):
+                    raise ValueError('别名所指标准词不在本次导入或已有词库中')
+                backup = self._storage_backup_manager().create_backup()
+                try:
+                    self.db.import_tags_batch(assignments, alias_map, projection_recovery={'config': config, 'backup': backup})
+                except Exception as exc:
+                    raise RuntimeError(f'标签导入事务失败，数据库变更已回滚：{exc}。备份保留在 {backup}') from exc
+                config = self._tag_config_projection(config)
+                self.tag_config = config
+                self.ai.tag_config = config
+                try:
+                    self._write_tag_import_projection(config)
+                except Exception as exc:
+                    raise RuntimeError(f'标签已写入数据库，但配置投影保存失败：{exc}。请保留备份 {backup}，重试加载词库；不要重复创建空库。') from exc
+        return {'imported': len(assignments), 'aliases': len(alias_map), 'backup': backup}
+
     def commit_cold_start_draft(
         self,
         draft,
@@ -3744,16 +3869,16 @@ class VideoOrganizerService:
         )
         self.save_tag_config(cfg)
         # 同步标准词入库（dimension 用小写组 id）
+        definitions = []
         for group in cfg.get("tag_groups") or []:
             gid = group.get("id")
             for t in group.get("tags") or []:
                 name = t if isinstance(t, str) else (t.get("name") if isinstance(t, dict) else None)
                 if name and gid:
-                    self.db.add_tag(str(gid).strip(), str(name).strip(), is_learned=0)
+                    definitions.append((str(gid).strip(), str(name).strip(), 0, None, None))
+        self.db.bulk_add_tag_definitions(definitions)
         # 别名
-        for alias, standard in (draft.alias_map or {}).items():
-            if alias and standard:
-                self.db.add_synonym(standard, alias)
+        self.db.import_tags_batch({}, {alias: standard for alias, standard in (draft.alias_map or {}).items() if alias and standard})
         # 刷新 AI 侧标签库
         if hasattr(self, "ai") and hasattr(self.ai, "init_tag_libraries"):
             try:
@@ -4410,14 +4535,14 @@ class VideoOrganizerService:
             SettingsManager.get_setting(self.settings, "processing.max_workers", 16)
             or 16
         )
-        # 硬顶：过高并发对整机（含 GUI）是灾难；用户仍可到 32
-        max_workers_cfg = max(1, min(max_workers_cfg, 32))
+        # 硬顶：过高并发对整机（含 GUI）是灾难；用户可按机器和服务能力调整到512
+        max_workers_cfg = max(1, min(max_workers_cfg, 512))
         # 刷新抽帧闸门（设置可能已改）
         ep = int(
             SettingsManager.get_setting(self.settings, "processing.extract_parallel", 4)
             or 4
         )
-        ep = max(1, min(ep, 16))
+        ep = max(1, min(ep, 512))
         self._extract_parallel = ep
         self._extract_sem = threading.Semaphore(ep)
         self._xmp_ctx_cache = None

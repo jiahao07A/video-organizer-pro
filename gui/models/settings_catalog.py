@@ -102,19 +102,19 @@ SETTINGS_ENTRIES: Tuple[SettingsEntry, ...] = (
     ),
     # —— 常规页签 ——
     SettingsEntry(
-        "processing.max_workers", "workers", "分析管线并发",
-        "analysis", ("并发", "管线", "max_workers", "线程"),
-        MANUAL, "分析任务的并发上限，保存后用于下一轮分析。", 0,
+        "processing.max_workers", "workers", "同时分析的视频数",
+        "analysis", ("并发", "管线", "max_workers", "线程", "分析管线并发"),
+        MANUAL, "同时处理视频的上限（包括图片准备和等待AI），不是每秒请求数；保存后用于下一轮分析。", 0,
     ),
     SettingsEntry(
-        "processing.extract_parallel", "extract_parallel", "同时抽帧路数",
-        "analysis", ("抽帧", "解码", "openCV", "extract_parallel"),
-        MANUAL, "同时 OpenCV 解码抽帧的上限，保存后用于下一轮分析。", 0,
+        "processing.extract_parallel", "extract_parallel", "分析图片准备并行数",
+        "analysis", ("抽帧", "解码", "openCV", "extract_parallel", "同时抽帧路数"),
+        MANUAL, "为AI准备图片的并行视频数，默认4；图片就绪后才请求AI。保存后用于下一轮分析。", 0,
     ),
     SettingsEntry(
-        "processing.extract_workers", "extract_workers", "入库抽帧并发",
-        "analysis", ("入库", "缩略图", "抽帧", "extract_workers"),
-        MANUAL, "工作范围入库时缩略图抽帧并发，保存后用于下一次入库。", 0,
+        "processing.extract_workers", "extract_workers", "入库缩略图并行数",
+        "analysis", ("入库", "缩略图", "抽帧", "extract_workers", "入库抽帧并发"),
+        MANUAL, "仅控制新素材入库的缩略图生成，不影响分析或标签AI请求。保存后用于下一次入库。", 0,
     ),
     SettingsEntry(
         "processing.max_frames", "frames", "AI 分析抽帧数",
@@ -129,7 +129,7 @@ SETTINGS_ENTRIES: Tuple[SettingsEntry, ...] = (
     SettingsEntry(
         "processing.enable_scene_detection", "scene_detect", "智能场景检测",
         "analysis", ("场景检测", "scene"),
-        MANUAL, "是否启用场景检测，保存后用于下一轮分析。", 0,
+        MANUAL, "场景检测需遍历解码视频；关闭后均匀抽帧，图片选择会不同。保存后用于下一轮分析。", 0,
     ),
     SettingsEntry(
         "processing.enable_audio_transcription", "audio", "音频转录",

@@ -48,7 +48,10 @@ def _status_code(error: Any) -> Optional[int]:
 
 def _error_message(error: BaseException) -> str:
     message = str(error) or error.__class__.__name__
-    if _status_code(error) == 400 and "the content of image_url field is unsafe" in message.lower():
+    if _status_code(error) == 400 and any(
+        text in message.lower()
+        for text in ("the content of image_url field is unsafe", "the content of image_url.url field is unsafe")
+    ):
         # 明确这是服务端对本次图像输入的拒绝，不能推断素材损坏或客户端版本回归。
         # 不改变图像、不换模型/供应商，也不把该400变成自动重试。
         return (
@@ -160,6 +163,7 @@ class AiRequestGateway:
         self.timeout = float(timeout)
         self.metrics_recorder = metrics_recorder
         self._clients: Dict[Tuple[str, str, str], Any] = {}
+        self._client_lock = threading.RLock()
         self._default_client: Any = None
         self._default_fingerprint: Optional[Tuple[str, str, str]] = None
         self._tls = threading.local()
@@ -212,10 +216,14 @@ class AiRequestGateway:
         """返回当前供应商的兼容客户端，供旧门面和测试注入使用。"""
         route = self._current_route()
         fingerprint = self._connection_fingerprint(route)
-        if self._default_client is None or self._default_fingerprint != fingerprint:
-            self._default_client = self._client_for_route(route, self.timeout)
-            self._default_fingerprint = fingerprint
-        return self._default_client
+        with self._client_lock:
+            if self._default_client is None or self._default_fingerprint != fingerprint:
+                self._default_client = self._clients.get(fingerprint)
+                if self._default_client is None:
+                    self._default_client = self._client_for_route(route, self.timeout)
+                    self._clients[fingerprint] = self._default_client
+                self._default_fingerprint = fingerprint
+            return self._default_client
 
     @property
     def client_cache(self) -> Dict[Tuple[str, str, str], Any]:
@@ -226,13 +234,15 @@ class AiRequestGateway:
         route = self.resolve_route(task_key)
         fingerprint = self._connection_fingerprint(route)
         # 同一供应商凭据被修改后丢弃旧缓存；已在进行中的调用仍持有自己的 client 引用。
-        for old_fingerprint in list(self._clients):
-            if old_fingerprint[0] == fingerprint[0] and old_fingerprint != fingerprint:
-                self._clients.pop(old_fingerprint, None)
-        client = self._clients.get(fingerprint)
-        if client is None:
-            client = self._client_for_route(route, self.timeout)
-            self._clients[fingerprint] = client
+        # 只保护客户端创建/缓存；网络请求在锁外，不能把32路请求串行化。
+        with self._client_lock:
+            for old_fingerprint in list(self._clients):
+                if old_fingerprint[0] == fingerprint[0] and old_fingerprint != fingerprint:
+                    self._clients.pop(old_fingerprint, None)
+            client = self._clients.get(fingerprint)
+            if client is None:
+                client = self._client_for_route(route, self.timeout)
+                self._clients[fingerprint] = client
         return client, route
 
     def test_connection(self, task_key: str = "video_classification") -> Dict[str, Any]:
@@ -268,10 +278,11 @@ class AiRequestGateway:
 
     def reload(self) -> Any:
         """清空所有连接缓存，并返回最新当前供应商客户端。"""
-        self._clients.clear()
-        self._default_client = None
-        self._default_fingerprint = None
-        return self.default_client()
+        with self._client_lock:
+            self._clients.clear()
+            self._default_client = None
+            self._default_fingerprint = None
+            return self.default_client()
 
     def _set_failure(self, failure: Optional[ApiCallFailure]) -> None:
         self._last_failure = failure

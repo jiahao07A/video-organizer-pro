@@ -45,27 +45,13 @@ class MediaPreviewWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        if HAS_MULTIMEDIA:
-            self.video_widget = QVideoWidget()
-            self.video_widget.setMinimumHeight(200)
-            self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            layout.addWidget(self.video_widget, 1)
-
-            self._audio = QAudioOutput()
-            self._player = QMediaPlayer()
-            self._player.setAudioOutput(self._audio)
-            self._player.setVideoOutput(self.video_widget)
-            self._player.positionChanged.connect(self._on_position)
-            self._player.durationChanged.connect(self._on_duration)
-            self._player.playbackStateChanged.connect(self._on_state)
-        else:
-            self.placeholder = QLabel("当前环境无多媒体组件\n可点下方「打开文件夹」或使用系统播放器")
-            self.placeholder.setAlignment(Qt.AlignCenter)
-            self.placeholder.setMinimumHeight(180)
-            self.placeholder.setStyleSheet(
-                "border: 2px dashed #666; border-radius: 8px; background: #1a1a1a;"
-            )
-            layout.addWidget(self.placeholder, 1)
+        # 空详情面板不枚举媒体设备/初始化解码器，避免阻塞启动及列表创建。
+        self.video_widget = None
+        self.placeholder = QLabel("选择素材后可播放预览" if HAS_MULTIMEDIA else "当前环境无多媒体组件\n可使用系统播放器")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setMinimumHeight(200)
+        self.placeholder.setStyleSheet("border: 2px dashed #666; border-radius: 8px; background: #1a1a1a;")
+        layout.addWidget(self.placeholder, 1)
 
         # 进度
         prog_row = QHBoxLayout()
@@ -110,6 +96,24 @@ class MediaPreviewWidget(QWidget):
 
         self._set_volume(80)
 
+    def _ensure_player(self):
+        if self._player is not None or not HAS_MULTIMEDIA:
+            return
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumHeight(200)
+        self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.layout().replaceWidget(self.placeholder, self.video_widget)
+        self.placeholder.hide()
+        self._audio = QAudioOutput(self)
+        self._player = QMediaPlayer(self)
+        self._player.setAudioOutput(self._audio)
+        self._player.setVideoOutput(self.video_widget)
+        self._player.positionChanged.connect(self._on_position)
+        self._player.durationChanged.connect(self._on_duration)
+        self._player.playbackStateChanged.connect(self._on_state)
+        self._set_volume(self.volume_slider.value())
+        self._set_speed()
+
     def set_media(self, path: str | None):
         self.stop()
         self._path = path if path and os.path.isfile(path) else None
@@ -122,6 +126,7 @@ class MediaPreviewWidget(QWidget):
             self.seek_slider.setRange(0, 0)
             self._update_time_label(0)
             return
+        self._ensure_player()
         if HAS_MULTIMEDIA and self._player:
             self._player.setSource(QUrl.fromLocalFile(self._path))
             self.play_btn.setText("播放")

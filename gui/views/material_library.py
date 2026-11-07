@@ -489,9 +489,13 @@ class MaterialLibraryView(QWidget):
 
     def _refresh_operation_target_summary(self):
         try:
-            snapshot = self._resolve_batch_snapshot()
+            # 展示摘要只读已返回的分页计数；执行操作时再解析完整路径快照。
+            selected = len(self._get_selected_paths())
+            total = self._page_total
+            source = f"列表选中 {selected} 条" if selected else "当前可见列表全部"
             self.target_summary_label.setText(
-                self._format_operation_target_snapshot(snapshot)
+                f"操作目标集：{source} · 可见列表 {total} 条"
+                f" · 实际处理 {selected or total} 条 · {self._filter_summary_text()}"
             )
         except Exception as exc:
             self.target_summary_label.setText(f"操作目标集：暂时无法计算（{exc}）")
