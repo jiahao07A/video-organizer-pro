@@ -48,6 +48,13 @@ def _status_code(error: Any) -> Optional[int]:
 
 def _error_message(error: BaseException) -> str:
     message = str(error) or error.__class__.__name__
+    if _status_code(error) == 400 and "the content of image_url field is unsafe" in message.lower():
+        # 明确这是服务端对本次图像输入的拒绝，不能推断素材损坏或客户端版本回归。
+        # 不改变图像、不换模型/供应商，也不把该400变成自动重试。
+        return (
+            "AI 服务拒绝了本次图像输入（HTTP 400，image_url unsafe）。"
+            "不能据此判定素材损坏；未自动重试。请核查服务端图像审核/接口限制，必要时联系供应商。"
+        )
     return message[:200] + ("…" if len(message) > 200 else "")
 
 

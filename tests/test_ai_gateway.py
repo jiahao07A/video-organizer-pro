@@ -104,6 +104,24 @@ def test_auth_error_is_not_retried():
     assert gateway.get_last_failure().retriable is False
 
 
+def test_image_unsafe_error_explains_provider_rejection_without_retry_or_payload(caplog):
+    class ImageRejected(Exception):
+        status_code = 400
+    error = ImageRejected("Error code: 400 - {'error': {'message': 'the content of image_url field is unsafe'}}")
+    client = FakeChatClient([error, fake_response('{"ok": true}')])
+    gateway = AiRequestGateway({})
+    content = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,PRIVATE_IMAGE"}}]
+    result = gateway.request_chat(model="m", system_prompt="sys", content_parts=content, client=client,
+                                  retry_config=RetryConfig(call_extra_attempts=5), sleeper=lambda _: None)
+    assert result is None and len(client.calls) == 1
+    failure = gateway.get_last_failure()
+    assert failure.retriable is False
+    assert "AI 服务" in failure.message and "图像" in failure.message
+    assert "400" in failure.message and "image_url" in failure.message
+    assert "PRIVATE_IMAGE" not in failure.message + caplog.text
+    assert client.calls[0]["messages"][1]["content"] == content
+
+
 def test_audio_transcription_uses_gateway_retry(tmp_path: Path):
     audio = tmp_path / "voice.mp3"
     audio.write_bytes(b"audio")

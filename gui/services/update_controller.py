@@ -57,6 +57,7 @@ class UpdateController(QObject):
         self._releases = []
         self._auto_started = False
         self._checked_ready = False
+        self.mirror_used = False
         self.preferences = {"auto_check": True, "preview": False, "last_check": 0, "skipped": "", "snooze_until": 0}
         try:
             path = self.cache / "preferences.json"
@@ -139,7 +140,13 @@ class UpdateController(QObject):
         transfer.completed.connect(done)
         transfer.failed.connect(failed)
         transfer.progress.connect(self._progress)
+        transfer.source_changed.connect(self._using_mirror)
         transfer.start()
+
+    def _using_mirror(self, source):
+        self.mirror_used = True
+        self.message = f"GitHub 网络请求失败，正在使用国内镜像 {source} 重试…"
+        self.changed.emit()
 
     def _progress(self, received, total):
         if self.state == UpdateState.DOWNLOADING:
@@ -160,6 +167,7 @@ class UpdateController(QObject):
             return
         self._checked_ready = self.state == UpdateState.READY
         self._manual = manual
+        self.mirror_used = False
         self._page, self._releases = 1, []
         self.preferences["last_check"] = time.time()
         try:
@@ -252,6 +260,7 @@ class UpdateController(QObject):
     def download(self):
         if self.busy or not self.release:
             return
+        self.mirror_used = False
         try:
             directory = self.release_directory()
             directory.mkdir(parents=True, exist_ok=True)
@@ -298,6 +307,7 @@ class UpdateController(QObject):
     def import_offline(self, manifest: Path):
         if self.busy:
             return
+        self.mirror_used = False
         self._set(UpdateState.DOWNLOADING, "正在校验离线更新包…")
         def operation():
             if manifest.stat().st_size > MAX_MANIFEST_BYTES:
