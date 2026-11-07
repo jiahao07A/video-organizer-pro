@@ -1,8 +1,11 @@
 # 0.0.1-rc3：个别素材分析诊断与更新网络兜底
 
-Status: claimed
+Status: resolved
 GitHub Issues: #54（分析诊断）、#55（镜像兜底）
 Branch: feat/54-rc3-analysis-update
+PR: #56（已合并）
+合并提交：fcc7c460b1e7fc952dba87728d3c6d7312a01e01
+Release：https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.1-rc3
 基线：6603ff948dab37484e4b3eaae0e12f16644c5fb4（rc2 发布记录）
 
 ## 范围与目标
@@ -22,7 +25,7 @@ Branch: feat/54-rc3-analysis-update
 - [x] 用户确认当前rc2强制重新分析已经成功；原错误不再稳定复现，保留根因未确定的诊断结论。
 - [x] 修复完成后使用子代理双轴 review；两轴均无确定新增缺陷，主 Agent 已复核，专项各47项通过。原始400仍保留未复现边界。
 - [x] 用户于2026-11-07明确批准“commit并合并,然后发布release”。
-- [ ] 提交并通过PR合并，发布v0.0.1-rc3预发布版，回验远端资产。
+- [x] 提交26b16d3并通过PR #56合并为fcc7c46；发布v0.0.1-rc3预发布版，四项远端资产下载逐字节摘要比对一致，清单验签和安装包校验通过。
 
 ## 调查进展
 

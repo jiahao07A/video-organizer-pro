@@ -1,6 +1,6 @@
 # rc3 验证与评审记录
 
-Status: claimed
+Status: resolved
 Issues: #54 / #55
 基线：6603ff948dab37484e4b3eaae0e12f16644c5fb4
 
@@ -38,3 +38,13 @@ Issues: #54 / #55
 - 安装包104598528字节，SHA-256：579ed52f85404f70a2877b8f1c96d60153efb5e12c79ac4b9f7ab38e011195d9。
 - 本轮隔离测试不替代真实旧版到新版在线更新、交互默认重启时序或断电验收；上述既有限制仍保留。
 - 2026-11-07 用户明确批准提交、合并与发布release；继续通过PR合并及草稿资产回验后公开的流程，不复用覆盖旧标签/资产。
+
+## 合并发布结果
+
+- 功能提交26b16d3375fe459af47e999f3684ddc871034638，经PR #56 rebase合并为fcc7c460b1e7fc952dba87728d3c6d7312a01e01；合并前后源树一致。
+- 最终公开资产来自`.release-build/rc3-release-assets/`，重新签署正式发布说明，安装EXE仍与已验收候选包完全一致，未重新构建或修改二进制。
+- 草稿上传四项资产后，用gh重新下载至全新`.release-build/rc3-draft-verify/`；客户端内置公钥验签、安装包大小/摘要校验、四项资产逐项SHA-256比对均通过。
+- v0.0.1-rc3于北京时间2026-11-07 14:14:43公开为prerelease，非latest；远端元数据isDraft=false、isPrerelease=true，标签指向上述合并提交。
+- Release：https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.1-rc3。
+- 公开后匿名HTTPS回验发布API及清单/签名：内置公钥验签通过，rc2测试渠道能发现rc3，正式渠道排除rc3；不是仅依赖草稿认证下载验证。
+- Issue #54以诊断及提示改进完成关闭，明确根因未知；Issue #55由PR完成关闭，两者均已追加合并提交、验证和限制。
