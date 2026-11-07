@@ -654,6 +654,25 @@ class DatabaseManager:
         """
         self.execute_non_query(query, self._video_upsert_params(video_data))
 
+    def update_video_path(self, old_path: str, new_path: str, status: Optional[str] = None) -> None:
+        """原地更新素材路径，避免路径变化被当成新素材再次入库。"""
+        assignments = ["path = ?", "filename = ?"]
+        params = [new_path, os.path.basename(new_path)]
+        if status is not None:
+            assignments.append("status = ?")
+            params.append(status)
+        params.append(old_path)
+        with self.lock:
+            with self._managed_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"UPDATE videos SET {', '.join(assignments)} WHERE path = ?",
+                    tuple(params),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("素材库源路径记录已不存在，无法更新路径")
+                conn.commit()
+
     def delete_video(self, path: str):
         self.execute_non_query("DELETE FROM videos WHERE path = ?", (path,))
 
@@ -1152,7 +1171,7 @@ class DatabaseManager:
         )
 
 class SettingsManager:
-    """管理配置信息，支持从 SQLite 数据库或 settings.json 加载，支持嵌套键名访问"""
+    """以 settings.json 为设置来源，支持嵌套键名和显式旧数据库恢复。"""
 
     @staticmethod
     def deep_copy_defaults() -> Dict:
@@ -1213,9 +1232,12 @@ class SettingsManager:
     def load_settings(
         db: Optional[DatabaseManager] = None,
         settings_path: Optional[str] = None,
+        *,
+        recover_from_database: bool = False,
     ) -> Dict:
         """
-        加载配置：默认值深拷贝 → settings.json → 数据库整包备份（settings_blob）。
+        普通启动仅以默认值补齐 settings.json 的缺失字段。
+        文件缺失时，只有显式恢复才读取旧 settings_blob；已有文件始终优先。
         """
         settings = SettingsManager.deep_copy_defaults()
         resolved_settings_path = SettingsManager._settings_path(db, settings_path)
@@ -1223,23 +1245,23 @@ class SettingsManager:
         # 1. 文件
         if os.path.exists(resolved_settings_path):
             try:
-                with open(resolved_settings_path, "r", encoding="utf-8") as f:
+                with open(resolved_settings_path, "r", encoding="utf-8-sig") as f:
                     file_settings = json.load(f)
-                if isinstance(file_settings, dict):
-                    SettingsManager.deep_update(settings, file_settings)
+                if not isinstance(file_settings, dict):
+                    raise ValueError("根节点必须是 JSON 对象（{}）")
+                SettingsManager.deep_update(settings, file_settings)
             except Exception as e:
-                logger.warning(f"读取 settings.json 失败: {e}")
+                # 阻止启动后将默认值写回损坏文件，保留用户手动编辑内容。
+                raise ValueError(f"配置文件读取失败：{resolved_settings_path}；{e}") from e
 
-        # 2. 数据库整包（若存在则覆盖同名字段，便于从 DB 恢复）
-        if db:
-            try:
-                blob = db.get_setting("settings_blob")
-                if isinstance(blob, dict):
-                    SettingsManager.deep_update(settings, blob)
-                elif isinstance(blob, str) and blob.strip():
-                    SettingsManager.deep_update(settings, json.loads(blob))
-            except Exception as e:
-                logger.debug(f"从数据库加载 settings_blob 跳过: {e}")
+        elif recover_from_database and db is not None:
+            blob = db.get_setting("settings_blob")
+            if isinstance(blob, str):
+                blob = json.loads(blob)
+            if blob is not None:
+                if not isinstance(blob, dict):
+                    raise ValueError("数据库设置备份必须是 JSON 对象")
+                SettingsManager.deep_update(settings, blob)
 
         # 模型供应商：无档案则从旧扁平 api 迁移；写穿 api.* 供 AIHandler
         try:
@@ -4974,6 +4996,10 @@ class VideoOrganizerService:
                     logger.warning(f"正则表达式错误: {ree}")
             
             new_fn = FileManager.sanitize_filename(new_fn, max_len=200)
+            # 模板可能没有显式包含 original_name；扩展名属于文件格式，必须始终保留。
+            source_ext = os.path.splitext(current_fn)[1]
+            if source_ext and not new_fn.lower().endswith(source_ext.lower()):
+                new_fn = f"{new_fn}{source_ext}"
             target_path = os.path.join(dir_name, new_fn)
             
             if os.path.normpath(physical_path) == os.path.normpath(target_path):
@@ -5013,10 +5039,7 @@ class VideoOrganizerService:
                 self.db.add_rename_record(session_id, physical_path, target_path)
                 history_recorded = True
                 original_item = dict(item)
-                item["path"] = target_path
-                item["filename"] = os.path.basename(target_path)
-                item["status"] = "renamed"
-                self.db.upsert_video(item)
+                self.db.update_video_path(physical_path, target_path, status="renamed")
                 success_count += 1
             except Exception as e:
                 # 数据库历史/路径更新失败时，立即补偿物理重命名；补偿失败则明确留下人工处理项。
@@ -5037,11 +5060,11 @@ class VideoOrganizerService:
                             os.rename(target_path, physical_path)
                     except Exception as file_exc:
                         compensation_errors.append(f"文件名补偿失败：{file_exc}")
+                # 路径更新失败时数据库仍保留源路径；若更新后后续步骤失败，恢复原路径。
                 if locals().get("renamed"):
                     try:
-                        original_item["path"] = physical_path
-                        original_item["filename"] = os.path.basename(physical_path)
-                        self.db.upsert_video(original_item)
+                        if self.db.get_video_by_path(physical_path) is None:
+                            self.db.update_video_path(target_path, physical_path)
                     except Exception as db_restore_exc:
                         compensation_errors.append(f"素材库源路径恢复失败：{db_restore_exc}")
                 failed_items.append({
@@ -5100,11 +5123,7 @@ class VideoOrganizerService:
                 rows = self.db.execute_query("SELECT * FROM videos WHERE path = ?", (new_path,))
                 if not rows:
                     raise ValueError("素材库中找不到目标路径记录")
-                video_data = dict(rows[0])
-                video_data["path"] = old_path
-                video_data["filename"] = os.path.basename(old_path)
-                video_data["status"] = "analyzed"
-                self.db.upsert_video(video_data)
+                self.db.update_video_path(new_path, old_path, status="analyzed")
                 restored += 1
                 if xmp_issue:
                     failures.append(f"{new_path}：视频已恢复，但{xmp_issue}")

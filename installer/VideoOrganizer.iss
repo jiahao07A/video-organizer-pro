@@ -4,7 +4,8 @@
 
 #define AppName "Video Organizer Pro"
 #define AppPublisher "Video Organizer Pro"
-#define AppVersion "0.0.0"
+#define AppVersion "0.0.1-rc1"
+#define AppNumericVersion "0.0.1"
 #define AppExeName "VideoOrganizer.exe"
 #define AppId "{{D4FD6D1D-6D2D-4B2C-8B6D-000000000000}"
 #ifndef DistDir
@@ -28,11 +29,12 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
+DisableDirPage=no
 DisableProgramGroupPage=yes
 ChangesAssociations=no
-VersionInfoVersion={#AppVersion}.0
+VersionInfoVersion={#AppNumericVersion}.0
 VersionInfoProductName={#AppName}
-VersionInfoProductVersion={#AppVersion}
+VersionInfoProductVersion={#AppNumericVersion}
 VersionInfoDescription={#AppName} Windows x64 installer
 
 [Languages]
@@ -43,6 +45,10 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#DistDir}\VideoOrganizer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; 升级安装时清除旧包误带的单个 ICU DLL，否则旧文件仍会遮蔽系统 ICU。
+Type: files; Name: "{app}\_internal\icuuc.dll"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"

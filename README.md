@@ -7,6 +7,8 @@
 
 ## 下载正式版
 
+预发布测试版本 **v0.0.1-rc1** 已修复重命名扩展名、重复入库、安装启动及设置覆盖问题：[下载安装包](https://github.com/jiahao07A/video-organizer-pro/releases/download/v0.0.1-rc1/VideoOrganizer-v0.0.1-rc1-setup-win-x64.exe) · [发布说明与校验文件](https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.1-rc1)。
+
 当前正式版为 **v0.0.0**，提供 Windows x64 标准安装程序：
 
 - [下载 `VideoOrganizer-v0.0.0-setup-win-x64.exe`](https://github.com/jiahao07A/video-organizer-pro/releases/download/v0.0.0/VideoOrganizer-v0.0.0-setup-win-x64.exe)
@@ -128,6 +130,21 @@ API Key 只保存在本机管理数据目录中。不要把 `settings.json`、�
 | `video_analysis_results.json` / `.csv` | 用户主动导出的分析结果副本 |
 
 可以在“系统设置 → 管理数据目录”中选择或搬迁管理数据。搬迁前会备份、复制并验证，原目录会保留；原始视频文件路径不会因管理数据目录搬迁而改变。
+
+### 手动编辑 settings.json
+
+先在“系统设置 → 管理数据目录”确认当前目录，然后完全退出程序，备份并编辑该目录中的 `settings.json`，保存后重新启动。默认位置为安装目录下的 `data/settings.json`。运行中编辑文件不会自动刷新，界面保存或退出时仍可能写回内存中的设置。
+
+普通启动以文件内容为准，默认值只补齐缺少的字段，数据库中的旧设置副本不会覆盖手动修改；未识别的自定义字段也会在保存时保留。文件须为有效的 JSON 对象，支持 UTF-8 和 UTF-8 BOM。语法错误会明确阻止启动，请修正文件或恢复备份，程序不会静默用默认设置覆盖错误文件。
+
+| 想修改的内容 | 对应字段 |
+| --- | --- |
+| 界面偏好、处理参数、重命名规则 | `ui_preferences`、`processing`、`rename_pattern` |
+| 供应商连接信息和档案默认模型 | `model_providers` 中的 `api_key`、`base_url`、`models` |
+| 默认供应商 | `current_provider_id`，对应某个供应商的 `id` |
+| 每种 AI 功能使用的供应商和模型 | `task_model_routing` 对应功能的 `provider_id`、`model` |
+
+`api.key`、`api.base_url` 和 `api.model_personalization` 是由当前供应商生成的兼容字段。已有供应商档案时，请编辑上表中的供应商或任务路由字段，这些兼容字段会随之同步。只有旧文件没有供应商档案时，才使用 `api` 连接字段创建初始档案。其他 `api` 参数仍按原字段编辑。
 
 卸载程序时，应用管理数据通常会保留在原目录中。重新安装后可以继续使用该目录；如果要彻底移除本地数据，需要用户自行确认后删除备份、数据库和设置文件。
 
