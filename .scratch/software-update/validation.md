@@ -82,3 +82,14 @@ Issue：#51
 - 证据：`.release-build/rc2-platform-fix-installed-check/result.json`、install-1.log、install-2.log。
 - 仍未验证交互安装后默认重启的互斥时序，本次未修改该路径；静默冒烟不作为此路径通过证据。
 - 未 commit、push、创建标签或公开 Release，待用户验收批准。
+
+## 用户授权后的合并与公开发布（2026-11-07）
+
+- 用户明确批准 commit、合并、发布 0.0.1-rc2。
+- 功能提交 f5573e72558867eba37f557ac46f3af540790335，PR #52 rebase 合入 e24e3b587cbc6ab04881a88d98bc4d00121af505。
+- 合并前后 `git diff f5573e7 e24e3b5 --exit-code` 无差异；主干更新专用再验证 50 passed（4.99 秒）。
+- 标签 v0.0.1-rc2 指向 e24e3b5；先创建草稿预发布再上传安装包、update.json、update.json.sig、SHA-256 文件，共 4 个资产。
+- 草稿资产全部下载至 `.release-build/rc2-draft-download-verify`；使用客户端内置公钥验签、安装包大小/摘要校验及全部资产逐个 hash 对比通过。
+- 2026-11-07 05:13:10 UTC 公开为 prerelease；未改正式版 Latest，没有覆盖历史标签或资产。
+- Release：https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.1-rc2 。发布安装包 SHA-256 与上节最新交付一致。
+- 未验证边界继续有效，公开发布说明已列出；没有将静默安装结果冒充交互自动重启或真实断电验收。
