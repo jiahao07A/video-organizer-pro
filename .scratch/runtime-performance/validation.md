@@ -80,3 +80,11 @@ Issues: #58 / #59 / #60
 - SHA-256：`CBA596EA034033578C4F763D72A0954838A48BDB0E079D9335CEA1D61407447F`；同目录提供`SHA256SUMS.txt`及`build-info.json`。
 - 同一目录包另构建isolated-smoke变体，仅用于验证，不注册卸载项/不创建快捷方式；隔离安装验证通过，不触碰用户安装目录或素材库。结果：installed_version=0.0.1-rc4、startup_exit_code=0、update_session=completed、custom_data_preserved=true、record_count=1、reinstall_preserved_settings=true；证据`.release-build/perf-rc4-installed-check/result.json`。
 - 安装后的真实EXE另进行启动窗口审计：8秒观察，无子进程，无可见ConsoleWindowClass，正常退出码0；证据`.release-build/perf-rc4-startup-data/startup-evidence.json`。定位记录只写隔离安装目录，标准安装器输入目录保持不含测试定位文件。
+# rc4最终发布候选验证（2026-11-07）
+
+PR #61，功能提交f907b58；规范与需求独立review均无阻断项。最终完整回归513 passed、9 skipped；其后新增3项512保存/重载及运行时传递检查，runtime专项26 passed。512未进行真实供应商/视频解码压测，400拒绝规则仍未知。
+
+最终构建使用全新rc4-release-final目录。包体审计1084文件、365891592字节，GUI子系统正确、无私有数据，恢复保护、512与image_url.url提示修正在包内。标准安装器104631742字节，SHA-256：ea8bc99116a21aa12fabd00486828fc9e6c003c9491cf9cf069de7426c0f5aee。Ed25519清单验签、安装器摘要/大小验证通过。
+
+隔离安装器两次安装成功：0.0.1-rc4、更新session completed、自选数据根保留、1条合成记录和设置保留、未创建空库，正常退出码0。安装后的真实EXE观察8秒：无子进程、无可见控制台、正常退出码0。证据位于忽略目录rc4-release-final-installed-check/result.json及rc4-release-final-startup-data/startup-evidence.json。生产数据未改动，旧构建全部保留。
+
