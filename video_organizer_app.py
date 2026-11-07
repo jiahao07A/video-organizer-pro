@@ -205,6 +205,16 @@ def _prepare_startup_upgrade(app: QApplication) -> bool:
 
 def main():
     app = QApplication(sys.argv)
+    from core.app_version import APP_VERSION
+    from core.update_runtime import hold_application_mutex, pending_startup_session
+    from core.software_update import UpdateError, update_cache
+    app.setApplicationVersion(APP_VERSION)
+    try:
+        hold_application_mutex()
+        update_session = pending_startup_session()
+    except Exception as exc:
+        QMessageBox.critical(None, "更新恢复检查失败", str(exc) + "\n请保留原数据和更新前备份，查看安装目录中的更新与恢复文档。")
+        return 1
 
     if not _prepare_data_directory():
         return 1
@@ -222,6 +232,17 @@ def main():
     # 启动主窗口
     window = MainWindow(service)
     window.show()
+    if update_session and update_session.is_pending:
+        try:
+            message = update_session.reconcile(APP_VERSION, service._data_paths.root)
+            update_session.save(update_cache())
+        except (UpdateError, OSError) as exc:
+            QMessageBox.critical(window, "更新核对失败", str(exc))
+            window.close()
+            return 1
+        if message:
+            window.status_bar.showMessage(message, 30000)
+            window.update_controller.message = message
 
     return app.exec()
 

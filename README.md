@@ -118,6 +118,16 @@ API Key 只保存在本机管理数据目录中。不要把 `settings.json`、�
 
 ## 数据目录
 
+### 软件更新
+
+支持更新机制的安装版可在“系统设置 → 软件更新”中检查新版、选择是否接收测试版本、下载并安装。
+默认每天后台检查一次正式版，不自动下载。安装前会要求结束后台任务、保存设置并备份管理数据，
+安装后会核对原素材库。首个支持该机制的版本仍需手动安装一次，ZIP 旧版不自动覆盖文件。
+离线更新需将官方安装包、`update.json` 和 `update.json.sig` 放在同一目录后导入。
+详细操作、旧版接入、失败恢复和维护者签名发布流程见 [软件更新与恢复](docs/软件更新与恢复.md)。
+
+源码环境需额外安装固定更新依赖：`python -m pip install -r requirements-update.txt`。
+
 安装版默认使用程序旁的 `data` 目录。管理数据包括：
 
 | 内容 | 作用 |
@@ -196,6 +206,8 @@ python -m PyInstaller build_app.spec --noconfirm `
 ```
 
 正式版安装器的 Inno Setup 配置位于 `installer/VideoOrganizer.iss`。安装器工具只用于维护者构建，不需要随用户安装。
+请通过 `tools/build_installer.py --iscc <ISCC.exe> --dist <目录包父目录> --output <全新输出目录>` 编译，
+该工具从 `core/app_version.py` 获取统一版本号。发布清单通过 `tools/update_release.py` 生成并签名。
 
 ## 验证记录
 

@@ -99,6 +99,63 @@ class SettingsView(QWidget):
         self._search_widget_map = {}
         self._entry_status_labels = {}
         self.setup_ui()
+        self._manual_dirty = False
+        self._bind_manual_dirty()
+
+    def _bind_manual_dirty(self):
+        def dirty(*_args):
+            self._manual_dirty = True
+        for widget in self.tabs.findChildren(QWidget):
+            # 更新偏好独立即时保存，不属于“保存所有设置”。
+            node = widget
+            is_update = False
+            while node is not None:
+                if node.objectName() == "software_update_panel":
+                    is_update = True
+                    break
+                node = node.parentWidget()
+            if is_update or getattr(widget, "_update_dirty_bound", False):
+                continue
+            signal = None
+            if isinstance(widget, QLineEdit):
+                signal = widget.textEdited
+            elif isinstance(widget, QPlainTextEdit) and not widget.isReadOnly():
+                signal = widget.textChanged
+            elif isinstance(widget, QSpinBox):
+                signal = widget.valueChanged
+            elif isinstance(widget, QCheckBox):
+                signal = widget.toggled
+            elif isinstance(widget, QComboBox):
+                signal = widget.currentIndexChanged
+            if signal is not None:
+                signal.connect(dirty)
+                widget._update_dirty_bound = True
+
+    def create_update_tab(self):
+        from gui.services.update_controller import UpdateController
+        from gui.widgets.software_update import SoftwareUpdatePanel
+        controller = getattr(self.service, "update_controller", None)
+        if controller is None:
+            controller = UpdateController(self.service, self)
+            self.service.update_controller = controller
+        def install():
+            callback = getattr(self.window(), "install_update", None)
+            if callback:
+                callback()
+            else:
+                QMessageBox.warning(self, "软件更新", "请从完整应用主窗口执行安装")
+        self.update_panel = SoftwareUpdatePanel(controller, install, self)
+        self.register_setting_widget("software_update", self.update_panel)
+        return self.update_panel
+
+    def save_before_update(self):
+        if self._manual_dirty:
+            answer = QMessageBox.question(self, "保存设置", "检测到设置页改动。保存所有设置后继续更新？", QMessageBox.Save | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer != QMessageBox.Save:
+                return False
+            if not self.apply_settings(silent=True):
+                return False
+        return self.prefs_controller.flush()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -129,6 +186,7 @@ class SettingsView(QWidget):
         
         # 5. 导出模板 (V6.0 MEGA UPDATE)
         self.tabs.addTab(self.create_export_tab(), "导出模板")
+        self.tabs.addTab(self.create_update_tab(), "软件更新")
 
         # 所有页签建立后，为普通界面偏好绑定防抖自动保存
         self.register_autosave_widgets()
@@ -1630,7 +1688,7 @@ class SettingsView(QWidget):
             self._set_save_status(f"恢复布局失败：{exc}", error=True)
             QMessageBox.critical(self, "错误", f"恢复默认界面布局失败：{exc}")
 
-    def apply_settings(self):
+    def apply_settings(self, silent=False):
         """同步 UI 数据到 settings 字典并保存（敏感配置的明确保存区）"""
         # 模型供应商：表单 → 档案 → 任务路由 → 写穿扁平 api
         if self._provider_ui_ready:
@@ -1743,11 +1801,15 @@ class SettingsView(QWidget):
                 self._load_task_routes_ui()
             self._refresh_effective_config_summary()
             self._set_save_status("所有设置已保存并已应用")
-            QMessageBox.information(self, "成功", "设置已保存并已应用到 AI 引擎，界面偏好将尽量立即生效。")
+            self._manual_dirty = False
+            if not silent:
+                QMessageBox.information(self, "成功", "设置已保存并已应用到 AI 引擎，界面偏好将尽量立即生效。")
             self.settings_applied.emit()
+            return True
         except Exception as e:
             self._set_save_status(f"保存失败：{e}", error=True)
             QMessageBox.critical(self, "错误", f"保存设置失败: {e}")
+            return False
 
     def reset_to_defaults(self):
         reply = QMessageBox.question(self, "确认", "确定要恢复所有设置为默认值吗？这将覆盖当前配置。",
@@ -1775,6 +1837,9 @@ class SettingsView(QWidget):
             self.tabs.addTab(self.create_prompts_tab(), "Prompt 模板")
             self.tabs.addTab(self.create_interface_tab(), "界面")
             self.tabs.addTab(self.create_export_tab(), "导出模板")
+            self.tabs.addTab(self.create_update_tab(), "软件更新")
             self.register_autosave_widgets()
+            self._bind_manual_dirty()
+            self._manual_dirty = True
             self.register_setting_widget("rename_pattern", self.pattern_input)
             QMessageBox.information(self, "已重置", "设置已重置为默认值，请点击「保存所有设置」以写入磁盘。")

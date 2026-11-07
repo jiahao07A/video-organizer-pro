@@ -59,6 +59,11 @@ class SettingsMatch:
 
 # 覆盖当前设置界面全部可编辑项；key 保持与现有配置键一致。
 SETTINGS_ENTRIES: Tuple[SettingsEntry, ...] = (
+    SettingsEntry(
+        "software_update", "software_update", "软件更新",
+        "everyday", ("更新", "版本", "检查更新", "测试版", "离线", "下载"),
+        MANUAL, "自动检查、渠道和离线安装；独立即时保存。", 5,
+    ),
     # —— 界面页签（日常偏好，自动保存）——
     SettingsEntry(
         "ui_preferences.theme", "theme", "主题",
