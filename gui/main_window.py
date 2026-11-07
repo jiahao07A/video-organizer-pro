@@ -2,7 +2,7 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame,
     QLabel, QListWidget, QListWidgetItem, QStackedWidget,
-    QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox
+    QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox, QDialog
 )
 from PySide6.QtCore import Qt, QTimer
 from .views.workstation import WorkstationView
@@ -19,6 +19,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.service = service
         self.settings = service.settings
+        from gui.services.update_controller import UpdateController
+        self.update_controller = UpdateController(service, self)
+        self.service.update_controller = self.update_controller
+        self.update_controller.available.connect(self.show_update_notice)
+        self.update_controller.prepared.connect(self._launch_update)
+        self.update_controller.changed.connect(self._update_state_changed)
+        self.update_controller.notice_dismissed.connect(self._dismiss_update_notice)
+        self._update_preparing = False
+        self._update_exiting = False
+        self._update_notice = None
         
         self.setWindowTitle("Video Organizer Pro (PySide6)")
         self.resize(1400, 900)
@@ -36,6 +46,102 @@ class MainWindow(QMainWindow):
         self.apply_sidebar_width()
         if self._pending_scope_scan:
             QTimer.singleShot(0, self._kick_background_scope_scan)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_controller.start_automatic_checks()
+
+    def show_update_notice(self):
+        from gui.widgets.software_update import SoftwareUpdatePanel
+        if self._update_notice is not None:
+            self._update_notice.show()
+            self._update_notice.raise_()
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("发现软件更新")
+        dialog.setModal(False)
+        dialog.resize(680, 500)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(SoftwareUpdatePanel(self.update_controller, self.install_update, dialog))
+        self._update_notice = dialog
+        dialog.show()
+
+    def _dismiss_update_notice(self):
+        if self._update_notice:
+            self._update_notice.hide()
+
+    def install_update(self):
+        from core.update_runtime import is_installed
+        from gui.views.settings import _window_has_active_background_work
+        from core.software_update import UpdateState
+        if self.update_controller.state != UpdateState.READY or self.update_controller.busy:
+            return
+        if not is_installed():
+            QMessageBox.information(self, "首次安装", "当前为源码或便携版。请先从官网下载并手动安装支持更新机制的安装版，启动后选择原管理数据目录。")
+            return
+        if _window_has_active_background_work(self):
+            QMessageBox.warning(self, "任务尚未结束", "请先完成分析、扫描、重命名、导出、标签 AI 或数据维护任务，再安装更新。不会强制中断任务。")
+            return
+        try:
+            if self.settings_page is not None and not self.settings_page.save_before_update():
+                return
+            SettingsManager.save_settings(self.service.settings, self.service.db)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法保存设置", str(exc))
+            return
+        # 对话框与主窗口一起冻结，防止备份期间再次启动任务或改设置。
+        self._update_preparing = True
+        self.centralWidget().setEnabled(False)
+        if self._update_notice:
+            self._update_notice.setEnabled(False)
+        self.update_controller.prepare()
+
+    def _update_state_changed(self):
+        from core.software_update import UpdateState
+        if self._update_preparing and self.update_controller.state == UpdateState.FAILED:
+            self._update_preparing = False
+            self.centralWidget().setEnabled(True)
+            if self._update_notice:
+                self._update_notice.setEnabled(True)
+            QMessageBox.warning(self, "更新准备失败", self.update_controller.message)
+
+    def _launch_update(self, session):
+        from core.update_runtime import launch_installer
+        from gui.views.settings import _window_has_active_background_work
+        try:
+            if _window_has_active_background_work(self):
+                raise RuntimeError("发现仍在运行的后台任务，已停止安装")
+            c = self.update_controller
+            launch_installer(c.release_directory() / c.release.filename, session, c.cache)
+            self._update_preparing = False
+            self._update_exiting = True
+            if self._update_notice:
+                self._update_notice.close()
+            self.close()
+        except Exception as exc:
+            self.update_controller._fail(str(exc))
+
+    def closeEvent(self, event):
+        from gui.views.settings import _window_has_active_background_work
+        if self._update_exiting:
+            event.accept()
+            return
+        if self._update_preparing or _window_has_active_background_work(self):
+            QMessageBox.warning(self, "任务尚未结束", "请等待后台任务完成后再退出；分析可先使用“取消分析”。")
+            event.ignore()
+            return
+        if self.update_controller.busy:
+            if self.update_controller.transfer:
+                self.update_controller.transfer.cancel()
+            event.ignore()
+            self.status_bar.showMessage("正在取消更新请求，请稍后再次退出", 5000)
+            return
+        if self.settings_page is not None and not self.settings_page.prefs_controller.flush():
+            event.ignore()
+            return
+        if self._update_notice:
+            self._update_notice.close()
+        event.accept()
 
     def _kick_background_scope_scan(self):
         page = getattr(self, "workstation_page", None)
