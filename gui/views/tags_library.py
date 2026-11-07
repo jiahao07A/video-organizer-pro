@@ -1896,57 +1896,39 @@ class TagsView(QWidget):
         wizard = TagImportWizard(self.import_service, self)
         if wizard.exec() == QWizard.Accepted:
             results = getattr(wizard, "final_classified", {}) or {}
-            # 服务层落盘（拒绝 pool / 未知组）
-            ok, err = True, ""
-            if hasattr(self.import_service, "persist_classified_tags"):
-                ok, err = self.import_service.persist_classified_tags(results)
-            if not ok:
-                QMessageBox.warning(self, "导入失败", err or "无法写入标签库")
+            from PySide6.QtWidgets import QProgressDialog
+            from gui.workers.catalog_worker import run_catalog_query
+            class ImportProgress(QProgressDialog):
+                # 提交阶段不可中途退出；仅后台完成回调accept结束，避免Esc放开编辑。
+                def reject(self):
+                    pass
+                def closeEvent(self, event):
+                    event.ignore()
+            progress = ImportProgress("正在备份并导入标签…", "", 0, 0, self)
+            progress.setWindowTitle("导入标签")
+            progress.setWindowModality(Qt.ApplicationModal)
+            progress.setCancelButton(None)
+            progress.setWindowFlag(Qt.WindowCloseButtonHint, False)
+            outcome = {}
+            def success(result):
+                outcome['result'] = result
+                progress.accept()
+            def failure(message):
+                outcome['error'] = message
+                progress.accept()
+            # 只有文件/DB操作在后台，Qt模型一次性刷新仍留在主线程。
+            aliases = dict(getattr(wizard, 'imported_aliases', {}) or {})
+            run_catalog_query(
+                self, fn=lambda: self.service.commit_tag_import(results, aliases),
+                on_ok=success, on_fail=failure, worker_key='_tag_import_worker',
+            )
+            progress.exec()
+            if 'error' in outcome:
+                QMessageBox.warning(self, "导入失败", outcome['error'])
                 return
-            # DB + 内存模型同步
-            for cat_id, tags in results.items():
-                dim = (cat_id or "").strip()
-                if not dim or dim.lower() == "pool":
-                    for tag_name in tags:
-                        self.add_ungrouped_as_pending(tag_name)
-                    continue
-                for tag_name in tags:
-                    name = (tag_name or "").strip()
-                    if not name:
-                        continue
-                    try:
-                        self.service.db.add_tag(dim, name, is_learned=0)
-                    except Exception:
-                        pass
-                    self.add_tag_to_dim_if_new(dim, name)
-
-            # 词表中的别名只写入同义词表，不作为第二个标准词入组。
-            for alias, standard in (
-                getattr(wizard, "imported_aliases", {}) or {}
-            ).items():
-                alias = str(alias or "").strip()
-                standard = str(standard or "").strip()
-                if not alias or not standard or alias == standard:
-                    continue
-                try:
-                    self.service.db.add_synonym(standard, alias)
-                except Exception:
-                    pass
-            if hasattr(self.service.ai, "init_tag_libraries"):
-                try:
-                    self.service.ai.init_tag_libraries()
-                except Exception:
-                    pass
-            # 与文件配置对齐
-            try:
-                self.service.tag_config = self.import_service.ai.tag_config or self.service.tag_config
-                self.tag_config = self.service.tag_config
-            except Exception:
-                pass
-            self.save_config(silent=True)
+            if 'result' not in outcome:
+                return
             self.load_data()
-            if self.pending_panel is not None:
-                self.pending_panel.reload()
             QMessageBox.information(self, "导入完成", "标签已成功导入并写入标签库。")
 
     def add_ungrouped_as_pending(self, name):

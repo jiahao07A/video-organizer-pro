@@ -104,10 +104,11 @@ def test_auth_error_is_not_retried():
     assert gateway.get_last_failure().retriable is False
 
 
-def test_image_unsafe_error_explains_provider_rejection_without_retry_or_payload(caplog):
+@pytest.mark.parametrize('field', ['image_url', 'image_url.url'])
+def test_image_unsafe_error_explains_provider_rejection_without_retry_or_payload(caplog, field):
     class ImageRejected(Exception):
         status_code = 400
-    error = ImageRejected("Error code: 400 - {'error': {'message': 'the content of image_url field is unsafe'}}")
+    error = ImageRejected("Error code: 400 - {'error': {'message': 'the content of " + field + " field is unsafe'}}")
     client = FakeChatClient([error, fake_response('{"ok": true}')])
     gateway = AiRequestGateway({})
     content = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,PRIVATE_IMAGE"}}]
