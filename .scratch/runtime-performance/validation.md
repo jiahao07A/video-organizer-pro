@@ -1,8 +1,8 @@
 # 性能诊断与验证
 
-Status: claimed
+Status: resolved
 Issues: #58 / #59 / #60
-基线：4c5625b（rc3发布交接）；当前分支fix/58-startup-analysis-performance。未提交或发布。
+基线：4c5625b（rc3发布交接）；功能通过PR #61合并至1df7954，发布标签v0.0.1-rc4。下文未提交阶段记录为历史证据。
 
 ## 反馈循环与结论
 
@@ -88,3 +88,4 @@ PR #61，功能提交f907b58；规范与需求独立review均无阻断项。最�
 
 隔离安装器两次安装成功：0.0.1-rc4、更新session completed、自选数据根保留、1条合成记录和设置保留、未创建空库，正常退出码0。安装后的真实EXE观察8秒：无子进程、无可见控制台、正常退出码0。证据位于忽略目录rc4-release-final-installed-check/result.json及rc4-release-final-startup-data/startup-evidence.json。生产数据未改动，旧构建全部保留。
 
+公开发布：https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.1-rc4 。草稿下载与公开匿名HTTPS下载均通过客户端Ed25519验签和安装器大小/SHA-256复验；安装器、清单、独立签名、摘要文件四资产逐文件与本地一致。公开API筛选确认从rc3开启测试版可发现rc4，正式渠道排除rc4。脚本为忽略目录rc4-verify-assets.py，下载证据在rc4-draft-download与rc4-public-download。
