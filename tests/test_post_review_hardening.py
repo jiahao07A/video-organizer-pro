@@ -443,3 +443,31 @@ def test_rename_database_failure_restores_physical_source(service, tmp_path, mon
     assert not Path(source).with_name("renamed-clip.mp4").exists()
     assert service._last_rename_result["failed_count"] == 1
     assert service.db.get_video_by_path(source) is not None
+
+
+def test_rename_keeps_extension_and_updates_catalog_row_in_place(service, tmp_path):
+    source = _touch(tmp_path / "clip.mp4")
+    service.db.upsert_video({
+        "path": source, "filename": "clip.mp4", "status": "analyzed",
+        "tags": [], "category": "Broll", "summary": "",
+    })
+
+    service.batch_rename(
+        dry_run=False,
+        selected_paths=[source],
+        custom_pattern="renamed",
+        date_value="20261017",
+    )
+
+    target = str(tmp_path / "renamed.mp4")
+    assert Path(target).exists()
+    assert not Path(str(tmp_path / "renamed")).exists()
+    assert service.db.get_video_by_path(source) is None
+    assert service.db.get_video_by_path(target) is not None
+    assert len(service.db.get_all_videos()) == 1
+
+    assert service.rollback_last_session() is True
+    assert Path(source).exists()
+    assert service.db.get_video_by_path(target) is None
+    assert service.db.get_video_by_path(source) is not None
+    assert len(service.db.get_all_videos()) == 1

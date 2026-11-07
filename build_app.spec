@@ -49,6 +49,14 @@ a = Analysis(
     noarchive=False,
 )
 
+# Qt 6 使用 Windows 10+ 系统自带的 ICU（不带版本后缀的函数名）。
+# 构建机 PATH 中的 Poppler/Conda 可能带同名但 ABI 不兼容的 icuuc.dll；
+# 不发布这个系统库，避免它遮蔽 Windows/System32 中的正确实现。
+a.binaries = [
+    entry for entry in a.binaries
+    if entry[0].replace('\\', '/').rsplit('/', 1)[-1].lower() != 'icuuc.dll'
+]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

@@ -2,6 +2,7 @@
 """AI / 嵌套配置持久化。"""
 import json
 import sqlite3
+import pytest
 from pathlib import Path
 
 from core.video_organizer_service import (
@@ -12,6 +13,59 @@ from core.video_organizer_service import (
     get_tag_config_file_path,
 )
 from core.data_directory import LegacyLayoutDetected
+
+
+def test_file_edits_survive_database_conflict_save_and_restart(tmp_path):
+    from core.video_organizer_service import DatabaseManager
+
+    db = DatabaseManager(str(tmp_path / 'test.db'))
+    original = SettingsManager.deep_copy_defaults()
+    SettingsManager.save_settings(original, db)
+    path = tmp_path / 'settings.json'
+    edited = json.loads(path.read_text(encoding='utf-8'))
+    edited['ui_preferences']['font_size'] = 19
+    edited['custom_user_options'] = {'note': '手工修改请保留'}
+    edited['model_providers'][0]['api_key'] = 'edited-placeholder'
+    edited['task_model_routing']['video_classification']['model'] = 'manual-model'
+    path.write_text(json.dumps(edited), encoding='utf-8')
+
+    loaded = SettingsManager.load_settings(db)
+    assert loaded['ui_preferences']['font_size'] == 19
+    assert loaded['api']['key'] == 'edited-placeholder'
+    assert loaded['task_model_routing']['video_classification']['model'] == 'manual-model'
+    SettingsManager.save_settings(loaded, db)
+    reloaded = SettingsManager.load_settings(db)
+    assert reloaded['ui_preferences']['font_size'] == 19
+    assert reloaded['custom_user_options'] == {'note': '手工修改请保留'}
+
+
+@pytest.mark.parametrize('content', ['{"unfinished":', '[]', 'null'])
+def test_invalid_settings_are_rejected_without_overwriting(tmp_path, content):
+    path = tmp_path / 'settings.json'
+    path.write_text(content, encoding='utf-8')
+    with pytest.raises(ValueError, match='配置文件'):
+        SettingsManager.load_settings(settings_path=str(path))
+    assert path.read_text(encoding='utf-8') == content
+
+
+def test_windows_utf8_bom_settings_are_read(tmp_path):
+    path = tmp_path / 'settings.json'
+    path.write_text(json.dumps({'rename_pattern': '手工命名-{original_name}'}), encoding='utf-8-sig')
+    loaded = SettingsManager.load_settings(settings_path=str(path))
+    assert loaded['rename_pattern'] == '手工命名-{original_name}'
+
+
+def test_legacy_database_settings_require_explicit_recovery(tmp_path):
+    from core.video_organizer_service import DatabaseManager
+
+    db = DatabaseManager(str(tmp_path / 'test.db'))
+    db.save_setting('settings_blob', {'rename_pattern': 'legacy-pattern'})
+    assert SettingsManager.load_settings(db)['rename_pattern'] == DEFAULT_SETTINGS['rename_pattern']
+    recovered = SettingsManager.load_settings(db, recover_from_database=True)
+    assert recovered['rename_pattern'] == 'legacy-pattern'
+    path = tmp_path / 'settings.json'
+    path.write_text(json.dumps({'rename_pattern': 'file-pattern'}), encoding='utf-8')
+    assert SettingsManager.load_settings(db, recover_from_database=True)['rename_pattern'] == 'file-pattern'
 
 
 def test_deep_copy_defaults_not_shared():
