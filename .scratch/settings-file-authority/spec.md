@@ -53,3 +53,10 @@ Branch: fix/49-rc1-release
 ### 发布前检查
 - 最终合并运行本轮相关 135 项测试：134 passed、1 failed。失败为旧版已记录的首次升级 GUI 等待超时用例，单独复验同样超时；在 PR 与 Release 中明确列为已知限制。
 - 用户已授权提交、推送和发布；安装包校验值与上述构建记录一致。
+
+### 发布交接（2026-11-07）
+- 用户已明确授权提交、远端同步和发布；修复提交 e0b6cf7 已推送。
+- GitHub Issue：#49；PR：https://github.com/jiahao07A/video-organizer-pro/pull/50。
+- 实现与重新打包已完成，最终相关回归为 134 passed、1 failed（已知首次升级 GUI 超时）。
+- 目标版本：v0.0.1-rc1，作为 Windows x64 预发布；安装包与 SHA256 文件上传 GitHub Release。
+- 最终合并提交、发布地址与验收限制在 Issue #49 的发布总结中记录，以远端状态为准。

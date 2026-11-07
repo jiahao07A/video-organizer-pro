@@ -32,3 +32,10 @@ Branch: fix/49-rc1-release
 
 ## 验证计划
 使用临时目录、临时 SQLite 数据库运行针对性 pytest，再运行完整测试集中的相关模块。
+
+### 发布交接（2026-11-07）
+- 用户已明确授权提交、远端同步和发布；修复提交 e0b6cf7 已推送。
+- GitHub Issue：#49；PR：https://github.com/jiahao07A/video-organizer-pro/pull/50。
+- 实现与重新打包已完成，最终相关回归为 134 passed、1 failed（已知首次升级 GUI 超时）。
+- 目标版本：v0.0.1-rc1，作为 Windows x64 预发布；安装包与 SHA256 文件上传 GitHub Release。
+- 最终合并提交、发布地址与验收限制在 Issue #49 的发布总结中记录，以远端状态为准。
