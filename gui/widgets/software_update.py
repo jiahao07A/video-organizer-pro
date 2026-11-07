@@ -101,6 +101,8 @@ class SoftwareUpdatePanel(QWidget):
     def refresh(self):
         c = self.controller
         self.status.setText(c.message)
+        if c.mirror_used:
+            self.status.setText(c.message + "\n本次使用国内镜像 gh-proxy.org；安装前仍验证官方签名和摘要。")
         timestamp = c.preferences["last_check"]
         self.last.setText("上次检查：" + (datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M") if timestamp else "尚未检查"))
         for checkbox, key in ((self.auto, "auto_check"), (self.preview, "preview")):

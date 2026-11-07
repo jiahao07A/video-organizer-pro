@@ -4,17 +4,20 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
-from core.software_update import UpdateError, validate_url
+from core.software_update import UpdateError, mirror_url, validate_url
 
 
 class HttpTransfer(QObject):
     completed = Signal(object)
     failed = Signal(str)
     progress = Signal(int, int)
+    source_changed = Signal(str)
 
     def __init__(self, manager: QNetworkAccessManager, url: str, *, limit: int, destination: Path = None, parent=None):
         super().__init__(parent)
         self.manager, self.url, self.limit = manager, url, limit
+        self.original_url = url
+        self.using_mirror = False
         self.destination = destination
         self.reply = None
         self.handle = None
@@ -80,6 +83,8 @@ class HttpTransfer(QObject):
                 return
             except UpdateError as exc:
                 self.error = str(exc)
+        if self._try_mirror(reply, status):
+            return
         if self.handle:
             try:
                 self.handle.close()
@@ -94,9 +99,54 @@ class HttpTransfer(QObject):
         reply.deleteLater()
         self.reply = None
         if error:
+            if self.using_mirror:
+                error = "GitHub 与国内镜像均未完成请求：" + error
             self._fail(error)
         else:
             self.completed.emit(self.destination if self.destination else bytes(self.data))
+
+    def _try_mirror(self, reply, status):
+        if self.cancelled or self.error or self.using_mirror:
+            return False
+        network_errors = {
+            QNetworkReply.ConnectionRefusedError, QNetworkReply.RemoteHostClosedError,
+            QNetworkReply.HostNotFoundError, QNetworkReply.TimeoutError,
+            QNetworkReply.TemporaryNetworkFailureError, QNetworkReply.NetworkSessionFailedError,
+            QNetworkReply.UnknownNetworkError, QNetworkReply.ProxyConnectionRefusedError,
+            QNetworkReply.ProxyConnectionClosedError, QNetworkReply.ProxyNotFoundError,
+            QNetworkReply.ProxyTimeoutError,
+        }
+        limited = status == 403 and (
+            bytes(reply.rawHeader("X-RateLimit-Remaining")) == b"0"
+            or bool(reply.rawHeader("Retry-After"))
+        )
+        if not (status == 429 or limited or status in (500, 502, 503, 504)
+                or reply.error() in network_errors):
+            return False
+        try:
+            target = mirror_url(self.original_url)
+        except (UpdateError, ValueError):
+            return False
+        self.using_mirror = True
+        reply.deleteLater()
+        self.reply = None
+        try:
+            if self.handle:
+                self.handle.close()
+                self.handle = None
+            # 首版不续传，明确截断同一个 part 文件，避免拼接两源的数据。
+            if self.destination:
+                self.handle = self.destination.open("wb")
+            self.url = target
+            self.received = 0
+            self.data.clear()
+            self.redirects = 0
+            self.source_changed.emit("gh-proxy.org")
+            self.progress.emit(0, self.limit)
+            self._request()
+        except (OSError, UpdateError) as exc:
+            self._fail(f"镜像请求准备失败：{exc}")
+        return True
 
     def cancel(self):
         self.cancelled = True

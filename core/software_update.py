@@ -25,6 +25,7 @@ TRUSTED_KEYS: dict[str, str] = {
 }
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_INSTALLER_BYTES = 2 * 1024**3 - 1
+UPDATE_MIRROR_BASE = "https://gh-proxy.org/"
 
 
 class UpdateError(RuntimeError):
@@ -60,6 +61,15 @@ def validate_url(url: str, *, api: bool = False) -> str:
     if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
         raise UpdateError("更新地址必须是官方 HTTPS 地址")
     host = (parsed.hostname or "").lower()
+    if host == "gh-proxy.org":
+        if not url.startswith(UPDATE_MIRROR_BASE):
+            raise UpdateError("镜像更新地址格式无效")
+        official = url[len(UPDATE_MIRROR_BASE):]
+        # 镜像仅代理固定仓库的入口，不允许嵌套代理或任意 CDN 链接。
+        if urlsplit(official).hostname not in {"github.com", "api.github.com"}:
+            raise UpdateError("镜像仅支持固定仓库的官方发布地址")
+        validate_url(official, api=api)
+        return url
     path = unquote(parsed.path)
     if any(segment in ("..", ".") for segment in path.split("/")) or "\\" in path:
         raise UpdateError("更新地址路径无效")
@@ -70,6 +80,14 @@ def validate_url(url: str, *, api: bool = False) -> str:
     if host in {"release-assets.githubusercontent.com", "objects.githubusercontent.com"}:
         return url
     raise UpdateError("更新地址不属于官方下载源")
+
+
+def mirror_url(official: str) -> str:
+    """把官方入口转换为单个固定 HTTPS 镜像入口，不能代理任意 URL。"""
+    validate_url(official, api=True)
+    if urlsplit(official).hostname not in {"github.com", "api.github.com"}:
+        raise UpdateError("此更新地址不支持镜像兜底")
+    return UPDATE_MIRROR_BASE + official
 
 
 @dataclass(frozen=True)
