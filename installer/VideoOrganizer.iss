@@ -41,7 +41,10 @@ DisableDirPage=no
 DisableProgramGroupPage=yes
 ChangesAssociations=no
 AppMutex=VideoOrganizerPro.Application
-CloseApplications=no
+; Ask Windows/Inno Setup to send a normal close request to the old app.
+; The user can still cancel if the app refuses to close.
+CloseApplications=yes
+CloseApplicationsFilter=VideoOrganizer.exe
 RestartApplications=no
 UsePreviousAppDir=yes
 #ifdef IsolatedSmoke

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import psutil
@@ -28,7 +29,18 @@ def hold_application_mutex():
         kernel.OpenMutexW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
         kernel.OpenMutexW.restype = ctypes.c_void_p
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        installing = kernel.OpenMutexW(0x100000, False, "VideoOrganizerPro.Installing")
+        # Inno Setup may start the application from its post-install action
+        # before releasing its own mutex. Wait briefly for that normal race;
+        # a long-held mutex still indicates a genuinely active installer.
+        installing = None
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            installing = kernel.OpenMutexW(0x100000, False, "VideoOrganizerPro.Installing")
+            if not installing:
+                break
+            kernel.CloseHandle(installing)
+            installing = None
+            time.sleep(0.1)
         if installing:
             kernel.CloseHandle(installing)
             raise UpdateError("安装器正在运行，请完成或取消安装后再启动应用")

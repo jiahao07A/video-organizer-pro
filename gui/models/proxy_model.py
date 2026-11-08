@@ -17,6 +17,14 @@ def video_matches_filter(video: dict, filter_params: dict) -> bool:
     if not video:
         return False
     params = filter_params or {}
+    recovery_filter = params.get("recovery_filter")
+    state = video.get("recovery_state")
+    if recovery_filter == "unresolved" and (not state or state == "recovered"):
+        return False
+    if recovery_filter == "exhausted" and state != "exhausted":
+        return False
+    if recovery_filter == "ever" and not state:
+        return False
 
     text = (params.get("text") or "").lower()
     if text:

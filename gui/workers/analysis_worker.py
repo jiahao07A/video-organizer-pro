@@ -34,11 +34,12 @@ class AnalysisWorker(QThread):
     snapshot_updated = Signal(dict)  # 结构化进度快照
     task_finished = Signal(bool, str)
 
-    def __init__(self, service: VideoOrganizerService, input_path, force_reanalyze: bool = False):
+    def __init__(self, service: VideoOrganizerService, input_path, force_reanalyze: bool = False, recovery_options=None):
         super().__init__()
         self.service = service
         self.input_path = input_path
         self.force_reanalyze = force_reanalyze
+        self.recovery_options = recovery_options or {}
         self._cancel_requested = False
         self._last_log_emit = 0.0
         self._last_snapshot_emit = 0.0
@@ -102,7 +103,7 @@ class AnalysisWorker(QThread):
             self.service.on_analysis_snapshot = self.handle_snapshot
 
             result = self.service.run_analysis(
-                self.input_path, force_reanalyze=self.force_reanalyze
+                self.input_path, force_reanalyze=self.force_reanalyze, **self.recovery_options
             )
             # 冲刷节流中的最后一条日志/快照
             if self._pending_log:

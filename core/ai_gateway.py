@@ -53,10 +53,10 @@ def _error_message(error: BaseException) -> str:
         for text in ("the content of image_url field is unsafe", "the content of image_url.url field is unsafe")
     ):
         # 明确这是服务端对本次图像输入的拒绝，不能推断素材损坏或客户端版本回归。
-        # 不改变图像、不换模型/供应商，也不把该400变成自动重试。
+        # 是否重试由视频恢复上下文决定，不从拒绝消息推断素材损坏。
         return (
             "AI 服务拒绝了本次图像输入（HTTP 400，image_url unsafe）。"
-            "不能据此判定素材损坏；未自动重试。请核查服务端图像审核/接口限制，必要时联系供应商。"
+            "不能据此判定素材损坏；是否重试取决于400恢复设置。请核查服务端图像审核/接口限制。"
         )
     return message[:200] + ("…" if len(message) > 200 else "")
 
@@ -284,13 +284,66 @@ class AiRequestGateway:
             self._default_fingerprint = None
             return self.default_client()
 
+    def list_models(self, *, route_override: Dict[str, Any]) -> List[str]:
+        """读取指定连接的候选模型，不切换供应商或执行推理。"""
+        try:
+            client = self.client_for_route(route_override)
+            response = client.models.list()
+        except Exception as error:
+            code = _status_code(error)
+            if code in (401, 403):
+                message = "鉴权失败，请检查该供应商的 API Key；仍可手动填写模型。"
+            elif code in (404, 405, 501) or isinstance(error, AttributeError):
+                message = "此连接不提供模型列表，请检查 Base URL 或手动填写模型。"
+            elif code == 429:
+                message = "模型列表请求过于频繁，请稍后重试或手动填写。"
+            elif code in (408, 504) or (code is None and any(word in str(error).lower() for word in ("timeout", "timed out", "connection", "connect"))):
+                message = "获取模型列表超时或网络连接失败，请稍后重试；仍可手动填写。"
+            else:
+                message = f"获取模型列表失败（HTTP {code}），可手动填写。" if code else "获取模型列表失败，请检查连接配置；仍可手动填写。"
+            # 供应商返回的错误可能包含凭据或请求内容，不回传原文。
+            raise RuntimeError(message) from None
+        data = response.get("data") if isinstance(response, dict) else getattr(response, "data", None)
+        if not isinstance(data, (list, tuple)):
+            raise RuntimeError("模型列表格式无法识别，仍可手动填写模型。")
+        names = set()
+        for item in data:
+            name = item if isinstance(item, str) else item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+        return sorted(names, key=lambda value: (value.casefold(), value))
+
     def _set_failure(self, failure: Optional[ApiCallFailure]) -> None:
         self._last_failure = failure
         self._tls.last_failure = failure
 
     def get_last_failure(self) -> Optional[ApiCallFailure]:
-        failure = getattr(self._tls, "last_failure", None)
-        return failure if failure is not None else self._last_failure
+        return getattr(self._tls, "last_failure", None)
+
+    def client_for_route(self, route):
+        fingerprint = self._connection_fingerprint(route)
+        with self._client_lock:
+            if fingerprint not in self._clients:
+                self._clients[fingerprint] = self._client_for_route(route, self.timeout)
+            return self._clients[fingerprint]
+
+    def _client_for_recovery_route(self, route, context):
+        try:
+            return self.client_for_route(route)
+        except Exception as error:
+            if context is None or not context.active:
+                raise
+            # 连接尚未建成，没有发出请求；跳过该候选，不扣预算或重复初始化。
+            from core.analysis_recovery import redact
+            message = redact(f"API连接初始化失败：{error}", [r.get("api_key") for r in context.routes])
+            failure = ValueError(message)
+            context.record(failure)
+            self._set_failure(ApiCallFailure(
+                message=message, retriable=False, task_key=context.task_key,
+                provider_id=route.get("provider_id", ""), model=route.get("model", ""),
+                recovery_handled=True))
+            context.handle_failure(failure, manual=getattr(context, "manual", False))
+            return None
 
     def _record_metrics(
         self,
@@ -340,11 +393,23 @@ class AiRequestGateway:
         retry_config: Optional[RetryConfig] = None,
         cancel_event: Any = None,
         sleeper: Optional[Callable[[float], None]] = None,
+        route_override: Optional[Dict[str, Any]] = None,
+        call_context: Any = None,
     ) -> Any:
         """请求聊天补全，返回 JSON 对象或文本；失败统一返回 None。"""
         use_client = client
         use_model = model
-        if task_key:
+        context = call_context or getattr(self._tls, "recovery_context", None)
+        if context is not None and task_key != context.task_key:
+            context = None
+        route_override = route_override or (context.route if context else None)
+        route = route_override or {}
+        if route_override:
+            use_client = use_client or self._client_for_recovery_route(route_override, context)
+            if use_client is None:
+                return None
+            use_model = route_override.get("model") or model
+        elif task_key:
             # 模型与连接来自同一份路由快照，避免设置切换时混用两次解析结果。
             if use_client is None:
                 use_client, route = self.client_for_task(task_key)
@@ -359,12 +424,17 @@ class AiRequestGateway:
         self._set_failure(None)
         attempt = 0
         compatibility_fallback_used = False
-        include_response_format = bool(json_mode)
+        include_response_format = bool(json_mode) and not (context and context.route_index in context.compatibility)
 
         while True:
             if self._cancelled(cancel_event):
                 logger.info("AI 调用因用户取消而中止")
                 self._failure_and_return("用户取消", retriable=False, cancelled=True)
+                return None
+
+            if context and not context.before_request():
+                self._failure_and_return(context.stop_reason, retriable=False)
+                self._tls.last_failure.recovery_handled = True
                 return None
 
             attempt += 1
@@ -390,6 +460,8 @@ class AiRequestGateway:
                 response = use_client.chat.completions.create(**kwargs)
                 content = _message_content(response)
                 result = _parse_json_content(content) if json_mode else content
+                if context:
+                    context.record(success=True)
                 self._set_failure(None)
                 self._record_metrics(
                     attempt=attempt,
@@ -400,6 +472,18 @@ class AiRequestGateway:
                 return result
             except Exception as error:
                 message = _error_message(error)
+                if context:
+                    from core.analysis_recovery import redact
+                    message = redact(message, [r.get("api_key") for r in context.routes])
+                compatibility_error = bool(json_mode and include_response_format and not compatibility_fallback_used and _response_format_unsupported(error))
+                if context:
+                    context.record(error, compatibility=compatibility_error)
+                    self._set_failure(ApiCallFailure(
+                        message=message, retriable=False, status_code=_status_code(error),
+                        error_code=context.last_error.get("error_code", ""),
+                        task_key=task_key or "", provider_id=route.get("provider_id", ""),
+                        model=use_model, request_id=str(getattr(error, "request_id", "") or ""),
+                        recovery_handled=context.active))
                 if (
                     json_mode
                     and include_response_format
@@ -408,6 +492,8 @@ class AiRequestGateway:
                 ):
                     compatibility_fallback_used = True
                     include_response_format = False
+                    if context:
+                        context.compatibility.add(context.route_index)
                     logger.warning(
                         "AI 服务不支持 response_format，改用客户端 JSON 解析重试"
                     )
@@ -431,8 +517,18 @@ class AiRequestGateway:
                     error=message,
                     retriable=retriable,
                 )
+                if context and context.handle_failure(error, manual=getattr(context, "manual", False)):
+                    return None
                 if not retriable:
                     self._failure_and_return(message, retriable=False)
+                    body = getattr(error, "body", None)
+                    self._tls.last_failure.status_code = _status_code(error)
+                    self._tls.last_failure.task_key = task_key or ""
+                    self._tls.last_failure.provider_id = route.get("provider_id", "")
+                    self._tls.last_failure.model = use_model
+                    self._tls.last_failure.request_id = str(getattr(error, "request_id", "") or "")
+                    if isinstance(body, dict):
+                        self._tls.last_failure.error_code = str(body.get("code") or "")
                     return None
                 if not should_retry_call(
                     attempt, call_extra_attempts=cfg.call_extra_attempts
@@ -451,10 +547,22 @@ class AiRequestGateway:
         retry_config: Optional[RetryConfig] = None,
         cancel_event: Any = None,
         sleeper: Optional[Callable[[float], None]] = None,
+        route_override: Optional[Dict[str, Any]] = None,
+        call_context: Any = None,
     ) -> Optional[str]:
         """请求音频转录，使用与聊天请求相同的连接和调用层策略。"""
         use_client = client
-        if task_key and use_client is None:
+        context = call_context or getattr(self._tls, "recovery_context", None)
+        if context is not None and task_key != context.task_key:
+            context = None
+        route_override = route_override or (context.route if context else None)
+        route = route_override or {}
+        if route_override:
+            use_client = use_client or self._client_for_recovery_route(route_override, context)
+            if use_client is None:
+                return None
+            model = route_override.get("model") or model
+        elif task_key and use_client is None:
             use_client, _ = self.client_for_task(task_key)
         if use_client is None:
             use_client = self.default_client()
@@ -470,6 +578,10 @@ class AiRequestGateway:
             attempt += 1
             try:
                 with path.open("rb") as audio_file:
+                    if context and not context.before_request():
+                        self._failure_and_return(context.stop_reason, retriable=False)
+                        self._tls.last_failure.recovery_handled = True
+                        return None
                     response = use_client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,
@@ -478,6 +590,8 @@ class AiRequestGateway:
                 text = _content_to_text(response).strip()
                 if not text:
                     raise AiResponseError("empty transcription")
+                if context:
+                    context.record(success=True)
                 self._set_failure(None)
                 self._record_metrics(
                     attempt=attempt,
@@ -488,6 +602,14 @@ class AiRequestGateway:
                 return text
             except Exception as error:
                 message = _error_message(error)
+                if context:
+                    from core.analysis_recovery import redact
+                    message = redact(message, [r.get("api_key") for r in context.routes])
+                    context.record(error)
+                    self._set_failure(ApiCallFailure(message=message, retriable=False,
+                        status_code=_status_code(error), error_code=context.last_error.get("error_code", ""),
+                        task_key=task_key, provider_id=route.get("provider_id", ""), model=model,
+                        request_id=str(getattr(error, "request_id", "") or ""), recovery_handled=context.active))
                 retriable = is_retriable(error)
                 self._record_metrics(
                     attempt=attempt,
@@ -497,6 +619,8 @@ class AiRequestGateway:
                     error=message,
                     retriable=retriable,
                 )
+                if context and context.handle_failure(error, manual=getattr(context, "manual", False)):
+                    return None
                 if not retriable:
                     self._failure_and_return(message, retriable=False)
                     return None

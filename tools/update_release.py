@@ -23,6 +23,7 @@ from packaging.version import Version
 
 from core.app_version import APP_VERSION, REPOSITORY
 from core.software_update import ReleaseInfo, verify_installer
+from core.startup_upgrade import CURRENT_DATABASE_VERSION
 
 
 def init_key(path: Path) -> dict:
@@ -60,7 +61,7 @@ def create_manifest(installer: Path, key_path: Path, output: Path, notes: str, t
         "url": f"https://github.com/{REPOSITORY}/releases/download/{tag}/{expected}",
         "filename": expected, "size": installer.stat().st_size,
         "sha256": digest,
-        "min_client_version": "1.0", "database_min": 0, "database_max": 1,
+        "min_client_version": "1.0", "database_min": 0, "database_max": CURRENT_DATABASE_VERSION,
     }
     raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     signature = private.sign(raw)

@@ -2,6 +2,7 @@
 """首次升级 GUI 门禁回归测试。"""
 import json
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,13 +26,14 @@ def qt_app():
 
 
 def _wait_for(app, predicate, timeout=5000):
-    deadline = QTest.qWait
+    # qWait在当前PySide6版本中持有GIL，会饿死执行Python升级逻辑的QThread。
+    # 事件循环由processEvents推进；sleep让后台线程实际获得执行机会。
     elapsed = 0
     while elapsed < timeout:
         app.processEvents()
         if predicate():
             return
-        deadline(20)
+        time.sleep(0.02)
         elapsed += 20
     assert predicate(), "GUI 状态未在时限内满足"
 

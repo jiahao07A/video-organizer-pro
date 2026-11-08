@@ -150,6 +150,7 @@ class VideoQuery:
     excluded_paths: Tuple[str, ...] = ()
     order_by: str = "timestamp"
     descending: bool = True
+    recovery_filter: str = ""
 
     @classmethod
     def from_filter_params(
@@ -187,6 +188,7 @@ class VideoQuery:
             excluded_paths=tuple(str(x) for x in excluded_paths or () if str(x).strip()),
             order_by=order_by,
             descending=descending,
+            recovery_filter=str(p.get("recovery_filter") or ""),
         )
 
 
@@ -217,6 +219,10 @@ class VideoCatalog:
     def _where(self, query: VideoQuery) -> Tuple[str, List[Any]]:
         clauses: List[str] = []
         params: List[Any] = []
+
+        if query.recovery_filter in ("unresolved", "exhausted", "ever"):
+            condition = {"unresolved": " AND r.state<>'recovered'", "exhausted": " AND r.state='exhausted'", "ever": ""}[query.recovery_filter]
+            clauses.append("EXISTS (SELECT 1 FROM video_recovery r WHERE r.video_id=videos.id" + condition + ")")
 
         if query.text:
             needle = f"%{_escape_like(query.text.lower())}%"
@@ -353,6 +359,8 @@ class VideoCatalog:
         limit = max(1, min(int(limit), 2000))
         where, params = self._where(q)
         columns = ", ".join(LIST_COLUMNS)
+        columns += ", (SELECT state FROM video_recovery WHERE video_id=videos.id) AS recovery_state"
+        columns += ", (SELECT updated_at FROM video_recovery WHERE video_id=videos.id) AS recovery_updated_at"
         rows = self.db.execute_query(
             f"SELECT {columns}, COUNT(*) OVER() AS _total_count "
             f"FROM videos{where} ORDER BY {self._order(q)} LIMIT ? OFFSET ?",
@@ -381,7 +389,7 @@ class VideoCatalog:
         return [str(row["path"]) for row in rows if row.get("path")]
 
     def get_detail(self, path: str) -> Optional[Dict[str, Any]]:
-        rows = self.db.execute_query("SELECT * FROM videos WHERE path = ? LIMIT 1", (path,))
+        rows = self.db.execute_query("SELECT *, (SELECT state FROM video_recovery WHERE video_id=videos.id) AS recovery_state FROM videos WHERE path = ? LIMIT 1", (path,))
         if not rows:
             return None
         row = dict(rows[0])

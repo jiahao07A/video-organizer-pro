@@ -97,6 +97,11 @@ class FilterPanel(QFrame):
         layout.addWidget(self.date_end, 2, 3)
 
         reset_btn = QPushButton("重置")
+        self.recovery_combo = QComboBox()
+        for text, value in (("400：不限", ""), ("当前400未恢复", "unresolved"), ("重试耗尽", "exhausted"), ("曾遇到400", "ever")):
+            self.recovery_combo.addItem(text, value)
+        self.recovery_combo.currentIndexChanged.connect(self.emit_filter)
+        layout.addWidget(self.recovery_combo, 3, 1, 1, 2)
         reset_btn.clicked.connect(self.reset_filter)
         layout.addWidget(reset_btn, 3, 4)
 
@@ -165,6 +170,7 @@ class FilterPanel(QFrame):
             self.status_combo.add_item(s)
         self.tag_mode_combo.setCurrentIndex(0)
         self.summary_combo.setCurrentIndex(0)
+        self.recovery_combo.setCurrentIndex(0)
         self.dup_cb.setChecked(False)
         self.date_check.blockSignals(True)
         self.date_check.setChecked(False)
@@ -194,5 +200,6 @@ class FilterPanel(QFrame):
             "date_start": self.date_start.date() if self.date_check.isChecked() else None,
             "date_end": self.date_end.date() if self.date_check.isChecked() else None,
             "alias_map": alias_map,
+            "recovery_filter": self.recovery_combo.currentData() or "",
         }
         self.filterChanged.emit(params)

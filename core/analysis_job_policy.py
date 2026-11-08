@@ -207,6 +207,13 @@ class ApiCallFailure:
     message: str
     retriable: bool = True
     cancelled: bool = False
+    status_code: Optional[int] = None
+    error_code: str = ""
+    task_key: str = ""
+    provider_id: str = ""
+    model: str = ""
+    request_id: str = ""
+    recovery_handled: bool = False
 
 
 def normalize_progress_path(path: str) -> str:
