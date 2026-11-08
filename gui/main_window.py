@@ -136,6 +136,10 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.status_bar.showMessage("正在取消更新请求，请稍后再次退出", 5000)
             return
+        from gui.services.settings_controller import SettingsController
+        if not all(controller.flush() for controller in self.findChildren(SettingsController)):
+            event.ignore()
+            return
         if self.settings_page is not None and not self.settings_page.prefs_controller.flush():
             event.ignore()
             return

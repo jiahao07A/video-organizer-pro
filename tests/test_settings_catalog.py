@@ -92,18 +92,18 @@ def test_catalog_marks_ordinary_prefs_autosave():
 def test_view_has_searchable_catalog(qt_app, service):
     view = SettingsView(service)
     view._on_settings_search("主题")
-    assert view.settings_search_results.count() >= 1
+    assert view.settings_search_results.model().rowCount() >= 1
     assert view.focus_setting("theme") is True
     assert view.tabs.currentIndex() == 3  # 界面页签
 
 
-def test_view_category_jump(qt_app, service):
+def test_view_search_jump(qt_app, service):
     view = SettingsView(service)
-    view._on_category_jump("ai")
+    view.settings_search_input.setText("API Key")
+    item = view.settings_search_results.model().index(0,0)
+    view._on_search_result_activated(item)
     assert view.tabs.currentIndex() == 1
 
-
-# —— 视图：普通偏好防抖自动保存 ——
 
 def test_ordinary_pref_autosaves_and_reports_status(qt_app, service):
     view = SettingsView(service)

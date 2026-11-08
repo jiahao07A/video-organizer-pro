@@ -55,6 +55,8 @@ class MaterialLibraryView(QWidget):
         self.service = service
         self.settings = service.settings
         self._applying_column_widths = False
+        from gui.services.settings_controller import SettingsController
+        self.column_prefs_controller = SettingsController(service, parent=self, debounce_ms=300)
         self._query_generation = 0
         self._detail_generation = 0
         self._page_offset = 0
@@ -108,6 +110,8 @@ class MaterialLibraryView(QWidget):
         toolbar.addWidget(self.view_switch_btn)
         toolbar.addWidget(self.delete_btn)
         toolbar.addWidget(self.add_scope_btn)
+        from gui.widgets.recovery_controls import add_recovery_toolbar
+        add_recovery_toolbar(self, toolbar, layout)
         layout.addLayout(toolbar)
 
         self.target_summary_label = QLabel("操作目标集：正在计算…")
@@ -127,12 +131,15 @@ class MaterialLibraryView(QWidget):
         self.view_stack = QStackedWidget()
 
         self.table_view = QTableView()
-        self.model = VideoTableModel()
+        self.model = VideoTableModel(thumbnail_dir=self.service._thumbnail_dir)
         self.proxy_model = AdvancedSortFilterProxyModel()
         self.proxy_model.setSourceModel(self.model)
         self.proxy_model.setFilterKeyColumn(-1)
         self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.table_view.setModel(self.proxy_model)
+        self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self.show_recovery_context_menu)
+
         # Ordering is performed by the SQL catalog, not by sorting only the
         # currently loaded page in QSortFilterProxyModel.
         self.table_view.setSortingEnabled(False)
@@ -146,7 +153,7 @@ class MaterialLibraryView(QWidget):
         self.table_view.verticalHeader().setDefaultSectionSize(80)
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setSectionResizeMode(COL_FILENAME, QHeaderView.Stretch)
+        header.setStretchLastSection(False)
         for column, width in DEFAULT_TABLE_COLUMN_WIDTHS.items():
             self.table_view.setColumnWidth(column, width)
         header.sectionResized.connect(self._on_column_resized)
@@ -169,6 +176,9 @@ class MaterialLibraryView(QWidget):
 
         self.card_view = QListView()
         self.card_view.setModel(self.proxy_model)
+        self.card_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.card_view.customContextMenuRequested.connect(self.show_recovery_context_menu)
+
         self.card_view.setViewMode(QListView.IconMode)
         self.card_view.setResizeMode(QListView.Adjust)
         self.card_view.setMovement(QListView.Static)
@@ -192,6 +202,8 @@ class MaterialLibraryView(QWidget):
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 2)
         layout.addWidget(self.splitter, 1)
+        from gui.services.responsive_table import ResponsiveTableLayout
+        self.responsive_table = ResponsiveTableLayout(self)
 
         self.status_label = QLabel("")
         self.status_label.setMaximumHeight(22)
@@ -216,17 +228,18 @@ class MaterialLibraryView(QWidget):
         self._selection_shortcuts.append(sc)
 
     def _on_column_resized(self, logical, _old, new):
-        if self._applying_column_widths:
+        if self._applying_column_widths or new <= 0:
             return
         if logical < 0 or logical >= self.model.columnCount():
             return
+        if self.table_view.isColumnHidden(logical):
+            return
         prefs = self.settings.setdefault("ui_preferences", {})
-        widths = prefs.setdefault("table_column_widths", {})
+        widths = migrate_table_column_prefs(prefs.get("table_column_widths") or {}, self.model.columnCount())
         widths[str(logical)] = new
-        try:
-            SettingsManager.save_settings(self.settings, self.service.db)
-        except Exception:
-            pass
+        widths["_schema"] = "no_check_col"
+        prefs["table_column_widths"] = widths
+        self.column_prefs_controller.schedule_save()
 
     def _restore_column_widths(self):
         raw = (self.settings.get("ui_preferences") or {}).get("table_column_widths") or {}
@@ -237,7 +250,7 @@ class MaterialLibraryView(QWidget):
                 try:
                     column = int(key)
                     if 0 <= column < self.model.columnCount():
-                        self.table_view.setColumnWidth(column, int(width))
+                        self.table_view.setColumnWidth(column, max(self.table_view.horizontalHeader().minimumSectionSize(), int(width)) if int(width) > 0 else DEFAULT_TABLE_COLUMN_WIDTHS[column])
                 except (TypeError, ValueError):
                     continue
         finally:
@@ -447,6 +460,14 @@ class MaterialLibraryView(QWidget):
                 seen.add(p)
                 paths.append(p)
         return paths
+
+    def show_recovery_context_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        from gui.widgets.recovery_controls import launch_manual_recovery
+        menu = QMenu(self)
+        action = menu.addAction("重试400失败项")
+        if menu.exec(self.sender().viewport().mapToGlobal(pos)) == action:
+            launch_manual_recovery(self)
 
     def _current_filter_params(self) -> dict:
         params = dict(self._filter_params or {})

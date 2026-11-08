@@ -156,6 +156,11 @@ SETTINGS_ENTRIES: Tuple[SettingsEntry, ...] = (
         "analysis", ("补跑", "失败", "batch"),
         MANUAL, "首轮结束后是否自动补跑失败项，保存后用于下一轮分析。", 0,
     ),
+    SettingsEntry(
+        "processing.http400_recovery", "http400_recovery", "HTTP 400 重试与备用 API",
+        "analysis", ("400", "兜底", "备用", "重试", "fallback", "恢复"),
+        MANUAL, "在常规页的分析失败处理区域编辑，点击保存所有设置后对下一轮分析生效。", 0,
+    ),
     # —— AI 页签（敏感 / 路由，明确保存区）——
     SettingsEntry(
         "api.key", "api_key", "API Key",
@@ -263,26 +268,29 @@ def _score_entry(entry: SettingsEntry, query: str) -> int:
     return best
 
 
-def search_entries(query: str) -> List[SettingsMatch]:
+def search_entries(query: str, entries=None) -> List[SettingsMatch]:
     """按用户输入返回命中设置项，按相关度排序。
 
     空查询返回全部条目（按分类与目录顺序）。
     """
     q = (query or "").strip().lower()
+    entries = SETTINGS_ENTRIES if entries is None else entries
     matches: List[SettingsMatch] = []
     if not q:
-        for order, entry in enumerate(SETTINGS_ENTRIES):
+        for order, entry in enumerate(entries):
             cat = _CATEGORY_BY_ID.get(entry.category_id)
             if cat is None:
                 continue
             matches.append(SettingsMatch(entry=entry, category=cat, score=0))
         return matches
 
-    for entry in SETTINGS_ENTRIES:
+    for entry in entries:
         cat = _CATEGORY_BY_ID.get(entry.category_id)
         if cat is None:
             continue
-        score = _score_entry(entry, q)
+        terms = q.split()
+        scores = [_score_entry(entry, term) or (2 if term in cat.title.lower() else 0) for term in terms]
+        score = sum(scores) if all(scores) else 0
         if score > 0:
             # 让分类标题命中也能被搜到
             if q in cat.title.lower():

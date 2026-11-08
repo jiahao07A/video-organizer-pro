@@ -107,7 +107,7 @@ class ThumbnailDelegate(QStyledItemDelegate):
         if not isinstance(pixmap, QPixmap):
             pixmap = index.sibling(index.row(), self.THUMB_COL).data(Qt.DecorationRole)
 
-        if isinstance(pixmap, QPixmap):
+        if isinstance(pixmap, QPixmap) and not pixmap.isNull():
             painter.save()
             painter.setRenderHint(QPainter.Antialiasing)
             painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -123,6 +123,11 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.restore()
         else:
             super().paint(painter, option, index)
+            painter.save()
+            painter.setPen(option.palette.placeholderText().color())
+            label = "缩略图不可用" if isinstance(pixmap, QPixmap) else "加载中…"
+            painter.drawText(option.rect, Qt.AlignCenter, label)
+            painter.restore()
 
     def sizeHint(self, option, index):
         return QSize(120, 68)
@@ -279,6 +284,12 @@ class StatusDelegate(QStyledItemDelegate):
         status_norm = str(status).lower()
 
         color_map = {
+            "已恢复": ("#52C41A", "#F6FFED"),
+            "耗尽": ("#F5222D", "#FFF1F0"),
+            "已中断": ("#8C8C8C", "#F5F5F5"),
+            "恢复已取消": ("#8C8C8C", "#F5F5F5"),
+            "400": ("#FA8C16", "#FFF7E6"),
+            "等待兜底": ("#722ED1", "#F9F0FF"),
             "待分析": ("#FFA500", "#FFF7E6"),
             "pending": ("#FFA500", "#FFF7E6"),
             "分析中": ("#1890FF", "#E6F7FF"),

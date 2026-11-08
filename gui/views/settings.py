@@ -4,10 +4,11 @@ from PySide6.QtWidgets import (
     QFrame, QFormLayout, QGroupBox, QLineEdit, QSpinBox, 
     QCheckBox, QPushButton, QMessageBox, QTabWidget, QPlainTextEdit,
     QComboBox, QListWidget, QListWidgetItem, QAbstractItemView, QFileDialog,
-    QProgressDialog,
+    QProgressDialog, QSizePolicy, QCompleter, QListView,
 )
-from PySide6.QtCore import QObject, QThread, QThreadPool, Signal, Qt
+from PySide6.QtCore import QObject, QThread, QThreadPool, Signal, Qt, QTimer, QModelIndex
 import threading
+from PySide6.QtGui import QStandardItemModel, QStandardItem
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from core.data_directory import DataDirectoryError
 from core.model_providers import (
@@ -30,11 +31,11 @@ from core.model_providers import (
 
 from gui.models.settings_catalog import (
     AUTOSAVE,
-    list_categories,
     search_entries,
 )
 from gui.services.settings_controller import SettingsController
 from ..workers.io_worker import run_io_job
+from gui.widgets.model_picker import ModelPicker
 
 
 def _window_has_active_background_work(window) -> bool:
@@ -73,7 +74,7 @@ def _window_has_active_background_work(window) -> bool:
 
 
 class SettingsView(QWidget):
-    """设置视图 - 可搜索目录 + 按用户任务分类导航的高级设置系统"""
+    """设置视图 - 可搜索的分页设置界面"""
     settings_applied = Signal()
     ui_preferences_applied = Signal()  # 普通偏好应用不触发 AI 客户端重建。
     interface_layout_reset = Signal()  # 完整布局重置成功后通知主窗口刷新现存列表列宽。
@@ -96,6 +97,9 @@ class SettingsView(QWidget):
         self.prefs_controller.save_failed.connect(
             lambda msg: self._set_save_status(f"界面偏好保存失败：{msg}", error=True)
         )
+        self._search_scroll_timer = QTimer(self)
+        self._search_scroll_timer.setSingleShot(True)
+        self._search_scroll_timer.timeout.connect(self._finish_search_focus)
         self._search_widget_map = {}
         self._entry_status_labels = {}
         self.setup_ui()
@@ -114,7 +118,7 @@ class SettingsView(QWidget):
                     is_update = True
                     break
                 node = node.parentWidget()
-            if is_update or getattr(widget, "_update_dirty_bound", False):
+            if is_update or widget.property("settings_view_only") or getattr(widget, "_update_dirty_bound", False):
                 continue
             signal = None
             if isinstance(widget, QLineEdit):
@@ -166,7 +170,7 @@ class SettingsView(QWidget):
         title.setStyleSheet("font-size: 22px; font-weight: bold; color: #ce9178;")
         layout.addWidget(title)
 
-        # 可搜索设置目录：按用户任务分类导航
+        # 设置搜索：保留分页导航，减少重复目录
         layout.addWidget(self._build_search_bar())
         
         self.tabs = QTabWidget()
@@ -191,7 +195,7 @@ class SettingsView(QWidget):
         # 所有页签建立后，为普通界面偏好绑定防抖自动保存
         self.register_autosave_widgets()
         
-        layout.addWidget(self.tabs)
+        layout.addWidget(self.tabs, 1)
         
         # 底部按钮
         btn_layout = QHBoxLayout()
@@ -215,13 +219,17 @@ class SettingsView(QWidget):
         btn_layout.addStretch()
         btn_layout.addWidget(self.save_btn)
         layout.addLayout(btn_layout)
+        from gui.services.settings_search import build_search_index
+        self._ui_search_entries = build_search_index(self)
 
     # —— 可搜索设置目录 ——
 
     def _build_search_bar(self) -> QWidget:
-        box = QGroupBox("设置目录")
+        box = QWidget()
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         outer = QVBoxLayout(box)
         outer.setSpacing(8)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         row = QHBoxLayout()
         self.settings_search_input = QLineEdit()
@@ -231,62 +239,47 @@ class SettingsView(QWidget):
         row.addWidget(self.settings_search_input, 1)
         outer.addLayout(row)
 
-        cat_row = QHBoxLayout()
-        cat_row.setSpacing(6)
-        cat_row.addWidget(QLabel("分类:"))
-        for cat in list_categories():
-            btn = QPushButton(cat.title)
-            btn.setToolTip(cat.description)
-            btn.clicked.connect(
-                lambda _checked=False, cid=cat.id: self._on_category_jump(cid)
-            )
-            cat_row.addWidget(btn)
-        cat_row.addStretch()
-        outer.addLayout(cat_row)
-
-        self.settings_search_results = QListWidget()
+        self.settings_search_model = QStandardItemModel(self)
+        self.settings_completer = QCompleter(self.settings_search_model, self)
+        self.settings_completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
+        self.settings_completer.setMaxVisibleItems(8)
+        self.settings_search_results = QListView()
         self.settings_search_results.setObjectName("settings_search_results")
-        self.settings_search_results.setMaximumHeight(140)
-        self.settings_search_results.itemActivated.connect(self._on_search_result_activated)
-        self.settings_search_results.itemClicked.connect(self._on_search_result_activated)
-        self.settings_search_results.hide()
-        outer.addWidget(self.settings_search_results)
+        self.settings_search_results.setTextElideMode(Qt.ElideRight)
+        self.settings_completer.setPopup(self.settings_search_results)
+        self.settings_completer.setCompletionRole(Qt.UserRole + 1)
+        self.settings_search_input.setCompleter(self.settings_completer)
+        self.settings_completer.activated[QModelIndex].connect(self._on_search_result_activated)
         return box
 
     def _on_settings_search(self, text: str) -> None:
         query = (text or "").strip()
+        self.settings_search_model.clear()
         if not query:
             self.settings_search_results.hide()
-            self.settings_search_results.clear()
             return
-        matches = search_entries(query)
-        self.settings_search_results.clear()
+        matches = search_entries(query, getattr(self, "_ui_search_entries", None))
         if not matches:
-            item = QListWidgetItem("未找到匹配设置")
+            item = QStandardItem("未找到匹配设置")
             item.setFlags(Qt.NoItemFlags)
-            self.settings_search_results.addItem(item)
+            self.settings_search_model.appendRow(item)
         else:
-            for m in matches[:40]:
-                item = QListWidgetItem(
-                    f"[{m.category.title}] {m.entry.label}"
-                    f"    — {m.entry.effect}"
-                )
-                item.setData(Qt.UserRole, m.entry.widget_key)
-                self.settings_search_results.addItem(item)
-        self.settings_search_results.show()
+            for match in matches:
+                label = f"[{self.tabs.tabText(match.entry.tab_index)}] {match.entry.label}"
+                item = QStandardItem(label)
+                item.setToolTip(match.entry.effect or label)
+                item.setData(match.entry.widget_key, Qt.UserRole)
+                item.setData(query, Qt.UserRole + 1)
+                self.settings_search_model.appendRow(item)
+        self.settings_completer.setCompletionPrefix("")
+        if self.settings_search_input.isVisible() and self.settings_search_input.hasFocus():
+            self.settings_completer.complete()
 
-    def _on_search_result_activated(self, item: QListWidgetItem) -> None:
+    def _on_search_result_activated(self, item) -> None:
         widget_key = item.data(Qt.UserRole)
         if widget_key:
+            self.settings_search_results.hide()
             self.focus_setting(widget_key)
-
-    def _on_category_jump(self, category_id: str) -> None:
-        matches = [m for m in search_entries("") if m.category.id == category_id]
-        if not matches:
-            return
-        first = matches[0]
-        self.tabs.setCurrentIndex(first.entry.tab_index)
-        self.focus_setting(first.entry.widget_key)
 
     def register_setting_widget(self, widget_key: str, widget) -> None:
         """登记设置控件，供搜索定位与内联保存状态展示。"""
@@ -400,12 +393,29 @@ class SettingsView(QWidget):
         from gui.models.settings_catalog import get_entry_by_widget
 
         entry = get_entry_by_widget(widget_key)
-        if entry is not None:
+        tab = getattr(self, "_search_tab_by_key", {}).get(widget_key)
+        if tab is not None:
+            self.tabs.setCurrentIndex(tab)
+        elif entry is not None:
             self.tabs.setCurrentIndex(entry.tab_index)
+        from gui.widgets.recovery_controls import RecoveryPolicyEditor
+        for i in range(self.http400_settings.stack.count()):
+            editor = self.http400_settings.stack.widget(i)
+            if widget is editor or editor.isAncestorOf(widget):
+                self.http400_settings.scope.setCurrentIndex(i)
+                if widget is editor.advanced_body or editor.advanced_body.isAncestorOf(widget):
+                    editor.advanced_toggle.setChecked(True)
+                break
         parent = widget.parentWidget()
         while parent is not None:
+            if parent.layout() is not None:
+                parent.layout().activate()
             if isinstance(parent, QScrollArea):
                 parent.ensureWidgetVisible(widget)
+                if widget_key == "http400_recovery":
+                    # 显示区域标题与整段表单，避免搜索只把范围选择框露在页面底部。
+                    top = widget.mapTo(parent.widget(), widget.rect().topLeft()).y()
+                    parent.verticalScrollBar().setValue(max(0, top - 80))
                 break
             parent = parent.parentWidget()
         widget.setFocus(Qt.OtherFocusReason)
@@ -420,7 +430,24 @@ class SettingsView(QWidget):
                 node.setProperty("settings_highlight", True)
                 node.style().unpolish(node)
                 node.style().polish(node)
+        self._pending_search_widget = widget
+        self._search_scroll_timer.start(20)
         return True
+
+    def _finish_search_focus(self):
+        widget = getattr(self, "_pending_search_widget", None)
+        if widget is None:
+            return
+        parent = widget.parentWidget()
+        while parent is not None:
+            if parent.layout() is not None:
+                parent.layout().activate()
+            if isinstance(parent, QScrollArea):
+                parent.widget().layout().activate()
+                top = widget.mapTo(parent.widget(), widget.rect().topLeft()).y()
+                parent.verticalScrollBar().setValue(max(0, top - 60))
+                break
+            parent = parent.parentWidget()
 
     def _collect_child_widgets(self, widget) -> list:
         found = []
@@ -536,10 +563,10 @@ class SettingsView(QWidget):
         results = getattr(self, "settings_search_results", None)
         if results is None or not results.isVisible():
             return
-        for row in range(results.count()):
-            item = results.item(row)
+        for row in range(results.model().rowCount()):
+            item = results.model().index(row, 0)
             if item.data(Qt.UserRole) == widget_key:
-                results.setCurrentItem(item)
+                results.setCurrentIndex(item)
                 break
 
     def _data_directory_text(self) -> str:
@@ -819,10 +846,12 @@ class SettingsView(QWidget):
         form.addRow(proc_group)
 
         # 分析重试（高级，ADR-0005）
-        retry_group = QGroupBox("分析重试（高级）")
+        failure_group = QGroupBox("分析失败处理")
+        failure_layout = QVBoxLayout(failure_group)
+        retry_group = QGroupBox("普通错误重试（超时、限流等）")
         retry_form = QFormLayout(retry_group)
         retry_hint = QLabel(
-            "自动重试可提高成功率，但会增加 API 费用。批次补跑仅对失败项再跑 1 轮。"
+            "适用于超时、限流等可重试错误。HTTP 400 使用下方独立规则，不重复计次。重试会增加 API 请求与费用。"
         )
         retry_hint.setWordWrap(True)
         retry_hint.setStyleSheet("color: #888; font-size: 12px;")
@@ -849,10 +878,19 @@ class SettingsView(QWidget):
             ))
         )
         retry_form.addRow(retry_hint)
-        retry_form.addRow("调用层额外重试:", self.call_extra_spin)
-        retry_form.addRow("单条最大尝试:", self.item_max_spin)
+        retry_form.addRow("单次请求额外重试:", self.call_extra_spin)
+        retry_form.addRow("单视频流程最多尝试:", self.item_max_spin)
         retry_form.addRow(self.batch_rerun_cb)
-        form.addRow(retry_group)
+        failure_layout.addWidget(retry_group)
+        from gui.widgets.recovery_controls import RecoverySettingsPanel
+        recovery_group = QGroupBox("HTTP 400 重试与备用 API")
+        recovery_layout = QVBoxLayout(recovery_group)
+        self.http400_settings = RecoverySettingsPanel(self.service, provider_resolver=self._model_list_provider)
+        self.http400_settings.changed.connect(self._on_recovery_settings_changed)
+        recovery_layout.addWidget(self.http400_settings)
+        failure_layout.addWidget(recovery_group)
+        self.register_setting_widget("http400_recovery", self.http400_settings.scope)
+        form.addRow(failure_group)
         
         # 自动重命名规则：重命名模式的唯一真实入口（导出页签仅同步展示）
         rename_group = QGroupBox("自动重命名规则")
@@ -981,12 +1019,12 @@ class SettingsView(QWidget):
         model_group = QGroupBox("档案默认模型名（可选，供路由回退）")
         model_form = QFormLayout(model_group)
 
-        self.cls_model_input = QLineEdit()
-        self.tag_model_input = QLineEdit()
-        self.desc_model_input = QLineEdit()
-        self.cls_model_input.setPlaceholderText("如 gemini-2.0-flash")
-        self.tag_model_input.setPlaceholderText("如 gemini-2.0-flash")
-        self.desc_model_input.setPlaceholderText("如 gemini-2.0-flash")
+        self.cls_model_input = ModelPicker(self._model_list_provider)
+        self.tag_model_input = ModelPicker(self._model_list_provider)
+        self.desc_model_input = ModelPicker(self._model_list_provider)
+        model_hint = QLabel("获取模型后，可输入关键词搜索并选择；也可手动填写自定义模型。获取列表不修改配置，选好后点击“保存所有设置”。列表不代表模型支持图像或音频，请按任务用途选择。")
+        model_hint.setWordWrap(True)
+        model_form.addRow(model_hint)
 
         model_form.addRow("分类默认:", self.cls_model_input)
         model_form.addRow("标签默认:", self.tag_model_input)
@@ -1011,12 +1049,13 @@ class SettingsView(QWidget):
             row.addWidget(label)
             prov_combo = QComboBox()
             prov_combo.setMinimumWidth(140)
-            model_edit = QLineEdit()
-            model_edit.setPlaceholderText("模型名")
+            model_edit = ModelPicker(lambda combo=prov_combo: self._model_list_provider(combo.currentData() or self.settings.get("current_provider_id")), compact=True)
+            model_edit.setPlaceholderText("选择或输入自定义模型")
             row.addWidget(prov_combo, 1)
             row.addWidget(model_edit, 1)
             route_layout.addLayout(row)
             prov_combo.currentIndexChanged.connect(self._on_route_widget_changed)
+            prov_combo.currentIndexChanged.connect(model_edit.refresh_connection)
             model_edit.textChanged.connect(self._on_route_widget_changed)
             self._route_widgets[key] = {"provider": prov_combo, "model": model_edit}
 
@@ -1030,10 +1069,29 @@ class SettingsView(QWidget):
         self._refresh_provider_list(select_id=self.settings.get("current_provider_id"))
         self._load_task_routes_ui()
         self._refresh_effective_config_summary()
+        self.api_key_input.textChanged.connect(self._refresh_model_pickers)
+        self.api_url_input.textChanged.connect(self._refresh_model_pickers)
         self.register_setting_widget("api_key", self.api_key_input)
         self.register_setting_widget("api_url", self.api_url_input)
         self.register_setting_widget("provider_list", self.provider_list)
         return tab
+
+    def _model_list_provider(self, provider_id=None):
+        """读取表单当前连接，支持未保存的Key/地址且不写入设置。"""
+        pid = provider_id if provider_id is not None else self._selected_provider_id()
+        provider = next((dict(p) for p in list_providers(self.settings) if p["id"] == pid), None)
+        if provider is None:
+            raise ValueError("请先添加并选择供应商。")
+        if self._provider_ui_ready and pid == self._selected_provider_id():
+            provider["api_key"] = self.api_key_input.text().strip()
+            provider["base_url"] = self.api_url_input.text().strip()
+        return provider
+
+    def _refresh_model_pickers(self, *_):
+        if self._suppress_provider_signals:
+            return
+        for picker in self.findChildren(ModelPicker):
+            picker.refresh_connection()
 
     def _refresh_effective_config_summary(self) -> None:
         """显示当前实际生效的路由和副作用开关，不显示凭据。"""
@@ -1195,6 +1253,7 @@ class SettingsView(QWidget):
             self.desc_model_input.setText(models.get("content_description") or "")
         finally:
             self._suppress_provider_signals = False
+        self._refresh_model_pickers()
 
     def _refresh_provider_list(self, select_id: str = None) -> None:
         if not hasattr(self, "provider_list"):
@@ -1562,7 +1621,7 @@ class SettingsView(QWidget):
         main_layout.addWidget(scroll)
 
         self.register_setting_widget("font_size", self.font_spin)
-        self.register_setting_widget("thumbnail_size", thumb_layout)
+        self.register_setting_widget("thumbnail_size", self.thumb_w_spin)
         self.register_setting_widget("theme", self.theme_combo)
         self.register_setting_widget("default_view", self.default_view_combo)
         self.register_setting_widget("sidebar_width", self.sidebar_spin)
@@ -1633,7 +1692,7 @@ class SettingsView(QWidget):
         scroll.setWidget(container)
         layout.addWidget(scroll)
 
-        self.register_setting_widget("rename_pattern", self.filename_tmpl)
+        self.register_setting_widget("rename_pattern", self.pattern_input)
         self.register_setting_widget("xmp_lang", self.xmp_lang_combo)
         self.register_setting_widget("xmp_hierarchical", self.xmp_hierarchical_cb)
         self.register_setting_widget("xmp_prefix_category", self.xmp_prefix_cat_cb)
@@ -1701,6 +1760,10 @@ class SettingsView(QWidget):
             self._set_save_status(f"恢复布局失败：{exc}", error=True)
             QMessageBox.critical(self, "错误", f"恢复默认界面布局失败：{exc}")
 
+    def _on_recovery_settings_changed(self):
+        self._manual_dirty = True
+        self._set_save_status("分析失败处理有改动，点击“保存所有设置”后生效")
+
     def apply_settings(self, silent=False):
         """同步 UI 数据到 settings 字典并保存（敏感配置的明确保存区）"""
         # 模型供应商：表单 → 档案 → 任务路由 → 写穿扁平 api
@@ -1708,6 +1771,14 @@ class SettingsView(QWidget):
             self._flush_provider_form_to_settings()
             self._flush_task_routes_to_settings()
             ensure_providers(self.settings)
+
+        # 先验证恢复配置，防止“保存所有设置”忽略无效备用API或只保存部分表单。
+        try:
+            recovery_policy = self.http400_settings.policy()
+        except ValueError as exc:
+            self._set_save_status(f"400 恢复设置未保存：{exc}", error=True)
+            QMessageBox.warning(self, "请检查400恢复设置", str(exc))
+            return False
         
         # Processing
         SettingsManager.update_setting(self.settings, "processing.max_workers", self.workers_spin.value())
@@ -1802,10 +1873,14 @@ class SettingsView(QWidget):
         ale_cols = [c.strip() for c in self.ale_columns_edit.text().split(",") if c.strip()]
         SettingsManager.update_setting(self.settings, "global_settings.export_schemes.ale_columns", ale_cols)
         
+        recovery_saved = False
+        previous_recovery = self.settings.get("processing", {}).get("http400_recovery")
         try:
             # 始终写回 service 持有的 settings 引用
             self.settings = self.service.settings
+            self.settings.setdefault("processing", {})["http400_recovery"] = recovery_policy
             SettingsManager.save_settings(self.settings, self.service.db)
+            recovery_saved = True
             # 立即重建 AI 客户端，使 Key / Base URL / 模型配置当场生效
             if hasattr(self.service, "reload_ai_from_settings"):
                 self.service.reload_ai_from_settings()
@@ -1820,6 +1895,10 @@ class SettingsView(QWidget):
             self.settings_applied.emit()
             return True
         except Exception as e:
+            if not recovery_saved and previous_recovery is None:
+                self.settings.get("processing", {}).pop("http400_recovery", None)
+            elif not recovery_saved:
+                self.settings["processing"]["http400_recovery"] = previous_recovery
             self._set_save_status(f"保存失败：{e}", error=True)
             QMessageBox.critical(self, "错误", f"保存设置失败: {e}")
             return False

@@ -14,6 +14,7 @@ from core.app_version import APP_VERSION, REPOSITORY
 from core.data_directory import DataDirectoryManager, DataDirectoryState
 import core.software_update as updates
 from core.software_update import ReleaseInfo, UpdateError, UpdateSession, release_candidates, verify_installer
+from core.startup_upgrade import CURRENT_DATABASE_VERSION
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def signed(tmp_path, monkeypatch):
         version=release_version, channel="stable", published_at="2026-11-07", notes="修复与优化",
         filename=name, url=f"https://github.com/{REPOSITORY}/releases/download/v{release_version}/{name}",
         size=len(payload), sha256=hashlib.sha256(payload).hexdigest(), min_client_version="1.0",
-        database_min=0, database_max=1,
+        database_min=0, database_max=CURRENT_DATABASE_VERSION,
     )
     def encode(**changes):
         raw = json.dumps(data | changes, ensure_ascii=False).encode()
@@ -246,3 +247,10 @@ def test_pending_update_blocks_corrupted_original_database_before_directory_sele
     with pytest.raises(UpdateError, match="检查失败"):
         update_runtime.pending_startup_session(tmp_path)
     assert not (tmp_path / "data").exists()
+
+
+def test_installer_requests_graceful_close_for_running_app():
+    script = Path("installer/VideoOrganizer.iss").read_text(encoding="utf-8")
+    assert "CloseApplications=yes" in script
+    assert "CloseApplicationsFilter=VideoOrganizer.exe" in script
+    assert "CloseApplications=no" not in script

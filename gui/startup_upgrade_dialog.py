@@ -124,6 +124,14 @@ class StartupUpgradeDialog(QDialog):
         self.pending_result = result
         if result.status is UpgradeStatus.NEEDS_CONFIRMATION:
             report = result.report
+            if report.get("schema_upgrade"):
+                self.title_label.setText("升级视频分析恢复记录")
+                self.summary_label.setText("确认后将先备份管理数据，再升级数据库以支持400标记、历史及专属策略。原有分析结果保留。")
+                self.confirm_button.setText("备份并升级")
+                self.progress_bar.setVisible(False)
+                self.confirm_button.setEnabled(True)
+                self.cancel_button.setEnabled(True)
+                return
             skipped = report.get("skipped_rows", 0)
             detail = (
                 f"共 {report.get('total_rows', 0)} 条，"

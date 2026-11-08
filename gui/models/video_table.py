@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import hashlib
 from collections import OrderedDict
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSize, QThreadPool, QSortFilterProxyModel
 from PySide6.QtGui import QPixmap
@@ -22,7 +23,7 @@ DEFAULT_TABLE_COLUMN_WIDTHS = {
     COL_FILENAME: 200,
     COL_CATEGORY: 100,
     COL_TAGS: 150,
-    COL_STATUS: 80,
+    COL_STATUS: 220,
 }
 
 # 表头只决定 SQL 排序；代理模型不能仅对已加载的一页重新排序。
@@ -42,8 +43,9 @@ LEGACY_COLUMN_COUNT = 8
 class VideoTableModel(QAbstractTableModel):
     """视频数据模型：列表序号 / 入库编号 / 缩略图 / 文件名 / 分类 / 标签 / 状态"""
 
-    def __init__(self, videos=None):
+    def __init__(self, videos=None, *, thumbnail_dir=None):
         super().__init__()
+        self.thumbnail_dir = thumbnail_dir
         self.videos = videos or []
         self.headers = ["#", "入库编号", "缩略图", "文件名", "分类", "标签", "状态"]
         self.thumbnail_cache = OrderedDict()
@@ -61,6 +63,16 @@ class VideoTableModel(QAbstractTableModel):
         self._list_no_by_source_row = {}
         # 分析任务行临时态 path -> 文案（不写库）
         self.temp_status_by_path = {}
+
+    def _thumbnail_path(self, video):
+        reference = video.get("thumbnail_path") or video.get("thumbnail")
+        if reference:
+            return reference
+        source = video.get("path")
+        if source and self.thumbnail_dir:
+            name = hashlib.md5(str(source).encode()).hexdigest() + ".webp"
+            return os.path.join(self.thumbnail_dir, name)
+        return None
 
     def set_temp_status_map(self, mapping: dict):
         """更新分析行临时态并刷新状态列（映射未变则不 emit，减轻大批量重绘）。"""
@@ -163,6 +175,9 @@ class VideoTableModel(QAbstractTableModel):
         col = index.column()
         row = index.row()
 
+        if role == Qt.ToolTipRole and col == COL_STATUS:
+            return str(self.data(index, Qt.DisplayRole) or "")
+
         if role == Qt.DisplayRole:
             if col == COL_LIST_NO:
                 return self._list_no_by_source_row.get(row, row + 1)
@@ -196,6 +211,13 @@ class VideoTableModel(QAbstractTableModel):
                         return temp[pk]
                 except Exception:
                     pass
+                recovery_state = row_data.get("recovery_state")
+                if recovery_state:
+                    from core.analysis_recovery import STATE_LABELS
+                    label = STATE_LABELS.get(recovery_state, recovery_state)
+                    if recovery_state != "recovered" and row_data.get("status") in ("analyzed", "renamed", "edited"):
+                        label = "重新分析失败·400 / " + label
+                    return label
                 return row_data.get("status", "")
 
         elif role == Qt.UserRole:
@@ -204,7 +226,7 @@ class VideoTableModel(QAbstractTableModel):
 
         elif role == Qt.DecorationRole:
             if col == COL_THUMB:
-                thumb_path = row_data.get("thumbnail_path") or row_data.get("thumbnail")
+                thumb_path = self._thumbnail_path(row_data)
                 if not thumb_path:
                     return None
 
@@ -213,10 +235,10 @@ class VideoTableModel(QAbstractTableModel):
                     self.thumbnail_cache[thumb_path] = pixmap
                     return pixmap
 
-                if thumb_path not in self.loading_paths and os.path.exists(thumb_path):
+                self._thumb_rows.setdefault(thumb_path, set()).add(row)
+                if thumb_path not in self.loading_paths:
                     self.loading_paths.add(thumb_path)
-                    self._thumb_rows.setdefault(thumb_path, set()).add(row)
-                    loader = ThumbnailLoader(thumb_path, QSize(320, 180))
+                    loader = ThumbnailLoader(thumb_path, QSize(320, 180), row_data.get("path"))
                     loader.signals.loaded.connect(self.on_thumbnail_loaded)
                     self.thumbnail_pool.start(loader)
 
@@ -247,7 +269,7 @@ class VideoTableModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), start, end)
         self.videos.extend(extra)
         for row, video in enumerate(self.videos[start:], start=start):
-            thumb = video.get("thumbnail_path") or video.get("thumbnail")
+            thumb = self._thumbnail_path(video)
             if thumb:
                 self._thumb_rows.setdefault(thumb, set()).add(row)
         self.endInsertRows()
@@ -257,17 +279,17 @@ class VideoTableModel(QAbstractTableModel):
         self.videos = list(new_videos or [])
         # Retain decoded thumbnails that are still present in the new query.
         valid_paths = {
-            v.get("thumbnail_path") or v.get("thumbnail")
+            self._thumbnail_path(v)
             for v in self.videos
-            if v.get("thumbnail_path") or v.get("thumbnail")
+            if self._thumbnail_path(v)
         }
         self.thumbnail_cache = OrderedDict(
-            (p, pix) for p, pix in self.thumbnail_cache.items() if p in valid_paths
+            (p, pix) for p, pix in self.thumbnail_cache.items() if p in valid_paths and not pix.isNull()
         )
         self.loading_paths.intersection_update(valid_paths)
         self._thumb_rows = {}
         for row, video in enumerate(self.videos):
-            thumb = video.get("thumbnail_path") or video.get("thumbnail")
+            thumb = self._thumbnail_path(video)
             if thumb:
                 self._thumb_rows.setdefault(thumb, set()).add(row)
         self._query_generation += 1

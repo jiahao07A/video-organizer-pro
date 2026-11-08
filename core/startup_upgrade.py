@@ -21,7 +21,7 @@ from core.storage_backup import write_json_atomic
 
 logger = logging.getLogger("VideoOrganizer.startup")
 
-CURRENT_DATABASE_VERSION = 1
+CURRENT_DATABASE_VERSION = 2
 COMPLETION_METADATA_KEY = "legacy_json_import"
 DEFAULT_BATCH_SIZE = 200
 MAX_REPORT_ITEMS = 100
@@ -168,6 +168,8 @@ def inspect_database_file(
             ).fetchall()
         }
         required = {"videos", "settings"}
+        if version >= 2:
+            required |= {"video_recovery", "video_recovery_policy", "video_recovery_rounds", "video_recovery_attempts"}
         missing = sorted(required - tables)
         if missing:
             raise DatabaseValidationError(
@@ -259,6 +261,13 @@ class StartupUpgradeCoordinator:
             return self._failure(str(exc))
 
         if database.exists:
+            if database.version < CURRENT_DATABASE_VERSION:
+                return UpgradeResult(
+                    status=UpgradeStatus.NEEDS_CONFIRMATION,
+                    database_path=self.database_path, json_path=self.json_path,
+                    message="需要备份并升级数据库，以支持视频400恢复记录。",
+                    report={"schema_upgrade": True, "database_version": database.version},
+                )
             return UpgradeResult(
                 status=UpgradeStatus.NO_MIGRATION,
                 database_path=self.database_path,
@@ -325,6 +334,20 @@ class StartupUpgradeCoordinator:
                 status=UpgradeStatus.CANCELLED,
                 message="用户取消旧 JSON 首次导入，未写入主数据。",
             )
+
+        if inspected.report.get("schema_upgrade"):
+            backup_path = ""
+            try:
+                backup_path = self._backup_manager().create_backup()
+                from core.video_organizer_service import DatabaseManager
+                DatabaseManager(self.database_path, backup_before_upgrade=False)
+                inspect_database_file(self.database_path, verify_integrity=True)
+                return UpgradeResult(status=UpgradeStatus.COMPLETED,
+                    database_path=self.database_path, json_path=self.json_path,
+                    backup_path=backup_path, message="数据库400恢复记录升级完成。",
+                    report={"database_version": CURRENT_DATABASE_VERSION})
+            except Exception as exc:
+                return self._failure(f"数据库升级失败，原数据及备份保留：{exc}", backup_path=backup_path)
 
         try:
             plan = self._load_import_plan()
@@ -640,6 +663,7 @@ class StartupUpgradeCoordinator:
         message: str,
         *,
         report: Optional[Dict[str, Any]] = None,
+        backup_path: str = "",
     ) -> UpgradeResult:
         return UpgradeResult(
             status=UpgradeStatus.FAILED,
@@ -647,6 +671,7 @@ class StartupUpgradeCoordinator:
             json_path=self.json_path,
             message=message,
             error=message,
+            backup_path=backup_path,
             report=report or {},
         )
 
