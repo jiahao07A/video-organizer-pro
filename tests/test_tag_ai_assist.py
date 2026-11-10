@@ -199,7 +199,8 @@ def test_apply_standard_skips_standard_as_alias(tmp_path):
     syns = svc.db.get_synonyms() or {}
     assert "女性" not in syns  # 不得把标准词挂成别名
     # 男士可挂
-    assert syns.get("男士") == "男性" or r.get("aliases_added", 0) >= 0
+    assert syns.get("男士") == "男性"
+    assert r["aliases_added"] == 1
 
 
 def test_synonym_merge_removes_merged_standard_from_db(tmp_path):

@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from core.data_directory import (
     DataDirectoryConflictError,

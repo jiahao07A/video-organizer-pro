@@ -4,15 +4,15 @@
 需要 Qt，使用 offscreen 平台，不依赖真实显示器。
 """
 import json
-import os
+import copy
+from pathlib import Path
 
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QMessageBox  # noqa: E402
 
 from core.video_organizer_service import (  # noqa: E402
     SettingsManager,
@@ -22,23 +22,25 @@ from gui.models import settings_catalog as catalog  # noqa: E402
 from gui.views.settings import SettingsView  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def qt_app():
-    app = QApplication.instance() or QApplication([])
-    yield app
-
-
 @pytest.fixture
-def service(tmp_path, monkeypatch):
+def service(tmp_path, monkeypatch, qt_app):
     monkeypatch.setattr("core.video_organizer_service.TAG_CONFIG_FILE", str(tmp_path / "tags.json"))
     monkeypatch.setattr("core.video_organizer_service.get_settings_file_path", lambda: str(tmp_path / "settings.json"))
-    return VideoOrganizerService(
+    svc = VideoOrganizerService(
         settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),
         results_csv=str(tmp_path / "c.csv"),
     )
+    yield svc
+    for view in qt_app.topLevelWidgets():
+        if isinstance(view, SettingsView) and view.service is svc:
+            view.prefs_controller.cancel()
+            view.close()
+            view.deleteLater()
+    from PySide6.QtCore import QCoreApplication, QEvent
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
 
 @pytest.fixture
@@ -169,19 +171,15 @@ def test_rename_pattern_has_single_editable_entry(qt_app, service):
 
 # —— 视图：预览不悄悄持久化 local_prompt ——
 
-def test_prompt_preview_does_not_persist_local_prompt(qt_app, service, tmp_path, monkeypatch):
-    tag_config_path = tmp_path / "tag_config.json"
-    monkeypatch.setattr(
-        "core.video_organizer_service.TAG_CONFIG_FILE", str(tag_config_path)
-    )
+def test_prompt_preview_does_not_persist_local_prompt(qt_app, service):
+    tag_config_path = Path(service._tag_config_path)
+    service.save_tag_config(copy.deepcopy(service.tag_config))
     view = SettingsView(service)
-    if not view._local_prompt_edits:
-        pytest.skip("无标签组可测试")
+    assert view._local_prompt_edits
+    before_memory = copy.deepcopy(service.tag_config)
+    before_disk = tag_config_path.read_bytes()
     gid = next(iter(view._local_prompt_edits))
     view._local_prompt_edits[gid].setPlainText("UNSAVED-PREVIEW-XYZ")
     view.refresh_prompt_preview()
-    for g in (service.tag_config or {}).get("tag_groups") or []:
-        if str(g.get("id") or "").strip() == gid:
-            assert (g.get("rules") or {}).get("local_prompt") in (None, "", )
-    if tag_config_path.exists():
-        assert "UNSAVED-PREVIEW-XYZ" not in tag_config_path.read_text(encoding="utf-8")
+    assert service.tag_config == before_memory
+    assert tag_config_path.read_bytes() == before_disk

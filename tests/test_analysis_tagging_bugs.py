@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """分析 / XMP 副作用 / Worker 成功语义回归（analysis-tagging-bugs 01–03）。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 from gui.workers.analysis_worker import analysis_task_succeeded
 
 
 @pytest.fixture
 def service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {}))},
+        settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),

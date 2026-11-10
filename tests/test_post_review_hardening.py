@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """post-review-hardening: 01–03, 07–09 服务层回归。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
 from core.video_organizer_service import (
-    DEFAULT_SETTINGS,
     VideoOrganizerService,
     normalize_work_path,
 )
@@ -15,9 +15,9 @@ from core.video_organizer_service import (
 def service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
         settings={
-            **DEFAULT_SETTINGS,
-            "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {})),
-            "processing": dict(DEFAULT_SETTINGS.get("processing", {})),
+            **SettingsManager.deep_copy_defaults(),
+            "ui_preferences": dict(SettingsManager.deep_copy_defaults().get("ui_preferences", {})),
+            "processing": dict(SettingsManager.deep_copy_defaults().get("processing", {})),
         },
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
@@ -127,7 +127,8 @@ def test_export_ale_path_normalize_matches_fcpx(service: VideoOrganizerService, 
     out_ale = tmp_path / "out.ale"
     out_fcpx = tmp_path / "out.fcpxml"
     # 故意用不同路径形态
-    alt = str(Path(p1))  # same resolve ideally
+    alt = str(Path(p1).parent) + "/./" + Path(p1).name
+    assert alt != p1
     ok = service.export_to_ale(str(out_ale), [alt])
     assert ok is True
     text = out_ale.read_text(encoding="utf-8-sig")
@@ -145,10 +146,11 @@ def test_export_ale_path_normalize_matches_fcpx(service: VideoOrganizerService, 
     assert ok2 is False
 
 
-def test_analysis_failure_clears_memory_cache(service: VideoOrganizerService, tmp_path: Path):
+@pytest.mark.parametrize("original_status,expected_status", [("pending", "failed"), ("analyzed", "analyzed")])
+def test_analysis_failure_updates_cache_and_retains_success(service: VideoOrganizerService, tmp_path: Path, original_status, expected_status):
     v = _touch(tmp_path / "f.mp4")
     row = {
-        "path": v, "filename": "f.mp4", "status": "analyzed",
+        "path": v, "filename": "f.mp4", "status": original_status,
         "tags": ["ok"], "category": "C", "summary": "s",
     }
     service.db.upsert_video(row)
@@ -158,7 +160,10 @@ def test_analysis_failure_clears_memory_cache(service: VideoOrganizerService, tm
     videos = service.get_all_videos()
     found = [x for x in videos if normalize_work_path(x.get("path", "")) == normalize_work_path(v)]
     assert found
-    assert found[0].get("status") == "failed"
+    assert found[0].get("status") == expected_status
+    assert service.db.get_video_by_path(v)["status"] == expected_status
+    assert found[0].get("summary") == "s"
+    assert found[0].get("tags") == ["ok"]
 
 
 def test_bulk_replace_respects_selected_paths(service: VideoOrganizerService, tmp_path: Path):

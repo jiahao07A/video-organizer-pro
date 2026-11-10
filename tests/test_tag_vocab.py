@@ -2,6 +2,7 @@
 """分析用词表子集 + 词表冷启动（ticket 03/04）。"""
 from __future__ import annotations
 
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from core.tag_vocab import (
     parse_vocab_draft_line,
     parse_vocab_group_header,
 )
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 
 
 def test_placeholder_detection():
@@ -59,7 +60,7 @@ def test_parse_vocab_group_header():
 
 def test_service_direct_load_default(tmp_path: Path):
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS},
+        settings={**SettingsManager.deep_copy_defaults()},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "c.db"),
         results_json=str(tmp_path / "r.json"),
@@ -167,17 +168,14 @@ def test_build_prompts_warns_when_thin(service_factory):
 
 def test_cold_start_draft_not_written_until_commit(tmp_path: Path):
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS},
+        settings={**SettingsManager.deep_copy_defaults()},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "c.db"),
         results_json=str(tmp_path / "r.json"),
         results_csv=str(tmp_path / "r.csv"),
     )
-    # 隔离：清掉 init 时从项目 tag_config 灌入的真实词表
-    try:
-        svc.db.execute_non_query("DELETE FROM tags_library")
-    except Exception:
-        pass
+    # 临时库只保留本场景的词表；初始化失败应直接使测试失败。
+    svc.db.execute_non_query("DELETE FROM tags_library")
     svc.tag_config = {
         "tag_groups": [
             {"id": "mood", "name": "氛围", "rules": {"ai_expandable": False, "max_count": 1}, "tags": ["测试氛围1"]},
@@ -198,7 +196,8 @@ def test_cold_start_draft_not_written_until_commit(tmp_path: Path):
     draft = svc.build_cold_start_draft(["治愈", "开心", "男", "男性", "测试xx"], cluster_fn=fake_cluster)
     # 未 commit：库中无治愈
     assert "治愈" not in svc.db.get_tags("mood")
-    assert draft.alias_map.get("开心") == "治愈" or "开心" in draft.alias_map or True
+    assert draft.alias_map.get("开心") == "治愈"
+    assert draft.alias_map.get("男") == "男性"
 
     # commit（聚类路径可仍 cap；直接加载默认不 cap）
     summary = svc.commit_cold_start_draft(
@@ -213,13 +212,14 @@ def test_cold_start_draft_not_written_until_commit(tmp_path: Path):
     # 占位清理依赖 commit 参数；至少保证治愈已写入
     assert "治愈" in svc.db.get_tags("mood")
     syns = svc.db.get_synonyms()
-    assert syns.get("开心") == "治愈" or syns.get("男") == "男性"
+    assert syns.get("开心") == "治愈"
+    assert syns.get("男") == "男性"
 
 
 def test_merge_creates_missing_groups_and_loads_vocab():
     """tag_groups 为空时，写入词表应自动创建五组并填入标准词。"""
     from pathlib import Path
-    from core.tag_vocab import build_vocab_draft_from_lines, merge_draft_into_tag_config
+    from core.tag_vocab import build_vocab_draft_from_lines
 
     path = Path(__file__).resolve().parents[1] / "词.txt"
     if not path.is_file():
@@ -241,7 +241,7 @@ def test_merge_creates_missing_groups_and_loads_vocab():
 
 def test_resolve_pending(tmp_path: Path):
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS},
+        settings={**SettingsManager.deep_copy_defaults()},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "p.db"),
         results_json=str(tmp_path / "r.json"),
@@ -280,17 +280,14 @@ def service_factory(tmp_path: Path):
                 }
             )
         svc = VideoOrganizerService(
-            settings={**DEFAULT_SETTINGS},
+            settings={**SettingsManager.deep_copy_defaults()},
             on_log=lambda _m: None,
             db_path=str(tmp_path / f"s_{id(group_tags)}.db"),
             results_json=str(tmp_path / "r.json"),
             results_csv=str(tmp_path / "r.csv"),
         )
-        # init 会从项目 tag_config 灌入真实词表；测试需隔离后重灌
-        try:
-            svc.db.execute_non_query("DELETE FROM tags_library")
-        except Exception:
-            pass
+        # 临时库只保留本场景的词表；初始化失败应直接使测试失败。
+        svc.db.execute_non_query("DELETE FROM tags_library")
         svc.tag_config = {"categories": [{"display_name": "B"}], "tag_groups": groups, "global_settings": {}}
         svc.ai.tag_config = svc.tag_config
         if hasattr(svc.ai, "init_tag_libraries"):

@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """服务层：分析目标集 + 移出范围 / 取消入库（ticket 01/03）。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService, normalize_work_path
+from core.video_organizer_service import VideoOrganizerService, normalize_work_path
 
 
 @pytest.fixture
 def service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {}))},
+        settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),

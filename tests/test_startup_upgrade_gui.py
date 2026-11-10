@@ -1,28 +1,19 @@
 # -*- coding: utf-8 -*-
 """首次升级 GUI 门禁回归测试。"""
 import json
-import os
 import time
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QThread
-from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
 
 import core.video_organizer_service as service_module
 from core.startup_upgrade import UpgradeStatus
 from core.video_organizer_service import VideoOrganizerService
 from gui.startup_upgrade_dialog import StartupUpgradeDialog
-
-
-@pytest.fixture(scope="module")
-def qt_app():
-    return QApplication.instance() or QApplication([])
 
 
 def _wait_for(app, predicate, timeout=5000):

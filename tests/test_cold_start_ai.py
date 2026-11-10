@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """冷启动 AI 分簇：解析与服务门面（可注入）。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
-import pytest
 
 from core.tag_ai_assist import parse_ai_cold_start_clusters, rule_cold_start_cluster
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 
 
 def test_parse_ai_cold_start_rejects_invented_words():
@@ -39,7 +39,7 @@ def test_cold_start_ai_paused_by_default(tmp_path: Path, monkeypatch):
 
     assert COLD_START_AI_ENABLED is False
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS},
+        settings={**SettingsManager.deep_copy_defaults()},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),
@@ -63,7 +63,7 @@ def test_cold_start_ai_paused_by_default(tmp_path: Path, monkeypatch):
 
 def test_service_cold_start_fallback_on_api_fail(tmp_path: Path, monkeypatch):
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS},
+        settings={**SettingsManager.deep_copy_defaults()},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),

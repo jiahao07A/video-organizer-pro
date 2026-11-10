@@ -1,5 +1,4 @@
 """更新网络兜底：本地双源故障注入，不依赖外网。"""
-from pathlib import Path
 
 import pytest
 from PySide6.QtNetwork import QNetworkAccessManager
@@ -7,7 +6,7 @@ from PySide6.QtNetwork import QNetworkAccessManager
 from core.app_version import REPOSITORY
 from core.software_update import UpdateError, validate_url
 from gui.services.update_network import HttpTransfer
-from tests.test_software_update_gui import app, serve, wait
+from tests.support.qt_http import serve, wait
 
 
 def test_mirror_only_accepts_fixed_repository_urls():
