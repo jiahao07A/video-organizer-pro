@@ -1,7 +1,9 @@
 # 分析失败处理中心与手动重试增强
 
-Status: claimed
-Branch: codex/analysis-failure-center
+Status: resolved
+Branch: codex/tests-audit（继承codex/analysis-failure-center）
+GitHub Issue: #65
+PR: #66
 依赖：#63；基于已提交的400恢复实现046443a（尚未进入origin/main），保留该依赖。
 
 ## 目标与范围
@@ -24,6 +26,9 @@ Branch: codex/analysis-failure-center
 数据库下一版本升级前沿用一致性备份，迁移事务失败回滚。旧程序回退前恢复升级前管理数据备份。诊断及重试增加API调用，启动前展示目标和请求上限，诊断不自动执行建议。
 
 ## Comments
+### 发布闭环（2026-11-10）
+用户明确批准提交、合并及发布。PR #66经rebase合并main，5547a6cadbe029cf104fbb3cd1012d21f9f1dba8；v0.0.1-rc6预发布已公开，4项资产公开下载、内置公钥验签及SHA256回验通过。最终全量669 passed、9 skipped；68项目模块包内源码一致，隔离主窗口启动退出通过。下方“未commit/待批准”为各阶段历史记录，已由本次授权和交付完成；人工环境边界仍见发布说明。
+
 ### UX细节循环审查（2026-11-10）
 用户继续授权UX审查修复循环。覆盖空态和按钮、验证错误恢复、长内容阅读复制、策略清除反馈及状态一致性；两位subagent只读，主Agent修复再复审。保持预览确认语义，不接触真实数据/API，不提交。
 - [x] 首审与证据复核

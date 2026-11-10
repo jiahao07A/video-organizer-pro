@@ -1,6 +1,6 @@
 # 全量测试审查与清理
 
-Status: claimed
+Status: resolved
 Branch: codex/tests-audit
 
 ## 背景与目标
@@ -18,7 +18,7 @@ Branch: codex/tests-audit
 - [x] 主Agent复核与清理修复
 - [x] 独立复审、单模块及全量回归
 - [x] 审查报告、测试运行说明及交付
-- [ ] 用户确认完成、无bug并批准commit
+- [x] 用户明确批准commit、合并和发布（2026-11-10），PR #66已合并，rc6已发布，详见release-status.md
 
 ## Comments
 ### 本地打包（2026-11-10）
