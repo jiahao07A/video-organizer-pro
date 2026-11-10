@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """Regression and performance tests for the database-backed video catalog."""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 from core.video_catalog import VideoCatalog, VideoQuery
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 
 
 def _service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {}))},
+        settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "catalog.db"),
         results_json=str(tmp_path / "results.json"),

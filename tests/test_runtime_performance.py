@@ -10,14 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 from core.ai_gateway import AiRequestGateway
 import pytest
 
-os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-
-
-@pytest.fixture
-def app():
-    from PySide6.QtWidgets import QApplication
-    return QApplication.instance() or QApplication([])
-
 
 @pytest.fixture
 def service(tmp_path):
@@ -33,7 +25,7 @@ sys.addaudithook(lambda event,args: events.append(str(args[1])) if event=='subpr
 import video_organizer_app
 print(json.dumps(events))
 '''
-    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, check=True)
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, check=True, timeout=30)
     assert json.loads(result.stdout.splitlines()[-1]) == []
 
 

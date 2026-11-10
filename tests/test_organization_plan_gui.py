@@ -1,20 +1,12 @@
-import os
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
 
 from gui.views.workstation import PhysicalMigrationPreviewDialog
-
-
-@pytest.fixture(scope="module")
-def qt_app():
-    return QApplication.instance() or QApplication([])
 
 
 def _migration_rows():

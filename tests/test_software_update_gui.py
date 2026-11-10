@@ -1,36 +1,20 @@
 """Qt 更新网络、状态机和安装门禁测试（仅隔离数据）。"""
+from tests.support.qt_http import wait, serve
 import json
-import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QTimer
-from PySide6.QtNetwork import QHostAddress, QNetworkAccessManager, QTcpServer
-from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtNetwork import QNetworkAccessManager
+from PySide6.QtWidgets import QMessageBox
 
 from core.software_update import ReleaseInfo, UpdateError, UpdateState
 from gui.services.update_controller import UpdateController
 from gui.services.update_network import HttpTransfer
-from tests.test_software_update import signed  # pytest 签名夹具；每次使用临时密钥。
-from tests.test_software_update import candidate
-
-
-@pytest.fixture(scope="module")
-def app():
-    return QApplication.instance() or QApplication([])
-
-
-def wait(app, predicate, timeout=4000):
-    end = time.monotonic() + timeout / 1000
-    while time.monotonic() < end and not predicate():
-        app.processEvents()
-        QTest.qWait(10)
-    assert predicate()
+from tests.support.updates import signed as signed  # pytest 签名夹具；每次使用临时密钥。
+from tests.support.updates import candidate
 
 
 @pytest.fixture
@@ -159,24 +143,6 @@ def test_offline_tamper_does_not_become_ready(app, controller, signed):
     wait(app, lambda: controller.state == UpdateState.FAILED)
     assert "签名" in controller.message
     assert not (controller.cache / "ready.json").exists()
-
-
-def serve(app, response):
-    server = QTcpServer()
-    assert server.listen(QHostAddress.LocalHost, 0)
-    sockets = []
-    def connected():
-        socket = server.nextPendingConnection()
-        sockets.append(socket)
-        def request():
-            socket.readAll()
-            socket.write(response)
-            socket.flush()
-            if b"Content-Length: 9999" not in response:
-                socket.disconnectFromHost()
-        socket.readyRead.connect(request)
-    server.newConnection.connect(connected)
-    return server, sockets, f"http://127.0.0.1:{server.serverPort()}/asset"
 
 
 @pytest.mark.parametrize("response,limit,expected", [

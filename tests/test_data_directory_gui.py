@@ -1,11 +1,9 @@
 """数据目录切换的 GUI 保护测试。"""
 from __future__ import annotations
 
-import os
 import threading
 import time
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 

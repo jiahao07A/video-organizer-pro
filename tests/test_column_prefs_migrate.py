@@ -6,8 +6,7 @@ from gui.models.video_table import migrate_table_column_prefs
 def test_migrate_legacy_8_col_shifts():
     legacy = {"0": False, "1": True, "2": True, "3": False, "7": True}
     out = migrate_table_column_prefs(legacy, 7)
-    assert "0" not in out or out.get("0") is True  # 旧 1 → 新 0
-    assert out.get("0") is True
+    assert out.get("0") is True  # 旧 1 → 新 0
     assert out.get("2") is False  # 旧 3 → 新 2
     assert "7" not in out
 

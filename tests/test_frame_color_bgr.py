@@ -41,12 +41,26 @@ def test_encode_after_wrong_rgb_swap_would_look_blue():
     assert b_mean > r_mean
 
 
-def test_resize_then_encode_pipeline_uses_bgr_not_rgb_swap():
-    """模拟 extract_frames 正确管线：resize(BGR) → encode，不转 RGB。"""
+def test_resize_then_encode_pipeline_uses_bgr_not_rgb_swap(tmp_path, monkeypatch):
+    """真实抽帧入口必须保留Capture提供的BGR颜色。"""
     bgr = np.zeros((64, 64, 3), dtype=np.uint8)
     bgr[:, :] = (0, 0, 255)
-    resized = VideoProcessor.resize_image(bgr, 32)
-    b64 = VideoProcessor.encode_image_to_base64(resized, quality=95)
+    class Capture:
+        released = False
+        def get(self, key): return 1
+        def set(self, key, value): return True
+        def read(self): return True, bgr.copy()
+        def release(self): self.released = True
+    capture = Capture()
+    monkeypatch.setattr(cv2, 'VideoCapture', lambda _: capture)
+    path = tmp_path / 'red.mp4'
+    path.write_bytes(b'synthetic')
+    result = VideoProcessor().extract_frames(str(path), max_frames=1, target_size=32, use_scene_detection=False)
+    assert capture.released
+    assert len(result['frames']) == 1
+    b64 = result['frames'][0]
     img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
     arr = np.asarray(img)
-    assert float(arr[:, :, 0].mean()) > float(arr[:, :, 2].mean())
+    assert img.size == (32, 32)
+    assert float(arr[:, :, 0].mean()) > 200
+    assert float(arr[:, :, 2].mean()) < 50

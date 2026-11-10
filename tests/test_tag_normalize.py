@@ -2,6 +2,7 @@
 """标签归一主接缝测试（ticket 02 / ADR-0004）。"""
 from __future__ import annotations
 
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from core.tag_normalize import (
     normalize_grouped_tags,
     resolve_to_standard,
 )
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 from gui.models.proxy_model import video_matches_filter
 
 
@@ -131,7 +132,7 @@ def service(tmp_path: Path) -> VideoOrganizerService:
         ],
     }
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {}))},
+        settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "norm.db"),
         results_json=str(tmp_path / "r.json"),

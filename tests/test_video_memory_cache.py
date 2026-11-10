@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """L1 缓存：禁止分析过程中的零散写入冒充全库。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 
 
 @pytest.fixture
 def service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": {}},
+        settings={**SettingsManager.deep_copy_defaults(), "ui_preferences": {}},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),

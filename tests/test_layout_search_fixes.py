@@ -1,10 +1,8 @@
-import os
-os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 import pytest
 from PySide6.QtCore import QObject, QEvent, QPoint, Qt
 from PySide6.QtWidgets import QWidget, QScrollArea
 from PySide6.QtTest import QTest
-from tests.test_material_display_fixes import app, service
+from tests.support.display import service as service
 from gui.views.settings import SettingsView
 from gui.views.workstation import WorkstationView
 from gui.views.material_library import MaterialLibraryView

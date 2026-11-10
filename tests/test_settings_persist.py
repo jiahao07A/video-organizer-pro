@@ -9,7 +9,6 @@ from core.video_organizer_service import (
     DEFAULT_SETTINGS,
     SettingsManager,
     VideoOrganizerService,
-    get_settings_file_path,
     get_tag_config_file_path,
 )
 from core.data_directory import LegacyLayoutDetected

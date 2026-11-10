@@ -1,10 +1,8 @@
 """离屏Qt验证继承、有效值、排序及三种手动模式。"""
-import os
 import copy
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QScrollArea
+from PySide6.QtWidgets import QDialog, QMessageBox, QPushButton, QScrollArea
 from core.analysis_recovery import RecoveryStore, DEFAULT_POLICY
 from gui.widgets.recovery_controls import RecoveryPolicyEditor, ManualRecoveryDialog, RecoverySettingsDialog, VideoRecoverySettingsDialog
 from gui.widgets.recovery_controls import RecoverySettingsPanel
@@ -13,12 +11,7 @@ from core.video_organizer_service import SettingsManager
 from gui.widgets.filter_panel import FilterPanel
 from gui.models.video_table import VideoTableModel, COL_STATUS
 from gui.models.settings_catalog import search_entries
-from tests.test_http400_recovery import service, video, fallback
-
-
-@pytest.fixture(scope="module")
-def app():
-    return QApplication.instance() or QApplication([])
+from tests.support.recovery import service as service, video, fallback
 
 
 def test_editor_inheritance_false_and_empty_list(app, service):
@@ -57,7 +50,186 @@ def test_editor_order_and_parent_updates(app, service):
 
 
 @pytest.mark.parametrize("mode", ["policy", "primary", "selected"])
-def test_manual_options_and_video_override(app, service, tmp_path, mode):
+def test_manual_route_edit_entry_is_discoverable(app, service, tmp_path, mode):
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    service.settings["processing"]["enable_audio_transcription"] = True
+    dialog.mode.setCurrentIndex(dialog.mode.findData(mode))
+    assert dialog.edit_routes.isEnabled()
+    dialog.edit_routes.click()
+    assert dialog.mode.currentData() == "selected"
+    assert dialog.provider.isEnabled() and dialog.model.isEnabled()
+    assert dialog.audio_provider.isEnabled() and dialog.audio_model.isEnabled()
+    dialog.model.setText("custom-video-model")
+    dialog.audio_model.setText("custom-audio-model")
+    dialog.mode.setCurrentIndex(dialog.mode.findData("policy"))
+    assert dialog.route_hint.text()
+    dialog.edit_routes.click()
+    assert dialog.model.text() == "custom-video-model"
+    assert dialog.audio_model.text() == "custom-audio-model"
+    dialog.close()
+
+
+def test_manual_routes_inherit_current_and_apply_suggestion(app, service, tmp_path):
+    service.settings["task_model_routing"]["video_classification"] = {"provider_id": "backup", "model": "current-video"}
+    service.settings["task_model_routing"]["content_description"] = {"provider_id": "main", "model": "ignored-audio-text-model"}
+    service.settings["processing"]["enable_audio_transcription"] = True
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    assert dialog.provider.currentData() == "backup"
+    assert dialog.model.text() == "current-video"
+    assert dialog.audio_provider.currentData() == "main"
+    assert dialog.audio_model.text() == "whisper-1"
+    dialog.apply_manual_options({"stage_routes": {"content_description": {"provider_id": "backup", "model": "custom-audio"}}, "concurrency": 1})
+    assert dialog.mode.currentData() == "selected"
+    assert dialog.model.text() == "current-video"
+    assert dialog.audio_provider.currentData() == "backup"
+    assert dialog.audio_model.text() == "custom-audio"
+    assert dialog.concurrency.value() == 1
+    dialog.close()
+
+
+def test_manual_audio_controls_explain_disabled_stage(app, service, tmp_path):
+    service.settings["processing"]["enable_audio_transcription"] = False
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    dialog.edit_routes.click()
+    assert dialog.provider.isEnabled()
+    assert not dialog.audio_provider.isEnabled()
+    assert not dialog.audio_model.isEnabled()
+    assert not dialog.audio_hint.isHidden()
+    assert "未启用" in dialog.audio_hint.text()
+    dialog.close()
+
+
+@pytest.mark.parametrize("stage", ["video", "audio"])
+def test_enter_in_model_field_does_not_open_retry_preview(app, service, tmp_path, monkeypatch, stage):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    service.settings["processing"]["enable_audio_transcription"] = True
+    calls = []
+    monkeypatch.setattr(service, "preview_manual_retry", lambda *a, **kw: calls.append(True))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.Ok)
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    dialog.edit_routes.click()
+    dialog.show()
+    picker = dialog.model if stage == "video" else dialog.audio_model
+    picker.setText("typed-model")
+    picker.combo.lineEdit().setFocus()
+    app.processEvents()
+    QTest.keyClick(picker.combo.lineEdit(), Qt.Key_Return)
+    app.processEvents()
+    assert calls == []
+    assert dialog.result() != QDialog.Accepted
+    dialog.close()
+
+
+def test_failure_filters_fit_650_pixel_work_area(app, service):
+    from gui.widgets.recovery_controls import AnalysisFailureCenterDialog
+    from gui.styles import get_main_style
+    dialog = AnalysisFailureCenterDialog(service, paths=[])
+    dialog.setStyleSheet(get_main_style(theme="light"))
+    dialog.resize(1100, 650)
+    dialog.show()
+    dialog.advanced_toggle.setChecked(True)
+    for _ in range(3): app.processEvents()
+    assert dialog.height() <= 650
+    assert dialog.table.height() >= 140
+    assert dialog.retry_btn.mapTo(dialog, dialog.retry_btn.rect().bottomRight()).y() < 650
+    dialog.close()
+
+
+def test_manual_budget_label_is_total_and_automatic_label_unchanged(app, service, tmp_path):
+    from PySide6.QtWidgets import QLabel
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    labels = [label.text() for label in dialog.editor.findChildren(QLabel)]
+    assert "单视频本轮请求总上限" in labels
+    assert "单视频最多追加请求" not in labels
+    assert "首次请求" in dialog.editor.fields["request_budget"].toolTip()
+    automatic = RecoveryPolicyEditor(service.settings)
+    assert "单视频最多追加请求" in [label.text() for label in automatic.findChildren(QLabel)]
+    dialog.close()
+
+
+def test_clear_policy_failure_then_retry_has_visible_feedback(app, service, tmp_path, monkeypatch):
+    path = video(service, tmp_path)
+    dialog = ManualRecoveryDialog(service, [path])
+    dialog.editor.inherit["request_budget"].setChecked(False)
+    dialog.editor.fields["request_budget"].setValue(3)
+    warnings, successes = [], []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a: QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: successes.append(a[2]))
+    original = service.save_recovery_override
+    def fail(*a, **kw):
+        raise OSError("database is locked")
+    monkeypatch.setattr(service, "save_recovery_override", fail)
+    dialog.clear_video_overrides()
+    assert warnings and "database is locked" in warnings[0]
+    assert dialog.editor.override() == {"request_budget": 3}
+    assert not successes
+    monkeypatch.setattr(service, "save_recovery_override", original)
+    dialog.clear_video_overrides()
+    assert dialog.editor.override() == {}
+    assert successes
+    dialog.close()
+
+
+@pytest.mark.parametrize("cancelled", [0, 1])
+def test_empty_filter_never_claims_round_completed(app, service, cancelled):
+    from gui.widgets.recovery_controls import AnalysisFailureCenterDialog
+    dialog = AnalysisFailureCenterDialog(service, paths=[])
+    dialog._receive_retry_result({"succeeded": 1-cancelled, "failed": cancelled, "cancelled_count": cancelled, "remaining_failed_paths": []})
+    dialog.keyword.setText("no-matching-record")
+    dialog.reload()
+    assert "没有匹配" in dialog.empty_label.text()
+    assert "全部处理完成" not in dialog.empty_label.text()
+    dialog.close()
+
+
+def test_keyboard_focus_on_retry_button_can_explicitly_open_preview(app, service, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    calls = []
+    monkeypatch.setattr(service, "preview_manual_retry", lambda *a, **kw: calls.append(True))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.Ok)
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    dialog.show()
+    button = next(button for button in dialog.findChildren(QPushButton) if button.text() == "开始重试")
+    button.setFocus()
+    app.processEvents()
+    QTest.keyClick(button, Qt.Key_Return)
+    assert calls == [True]
+    dialog.close()
+
+
+def test_manual_suggestion_rejects_disabled_audio_without_changing_mode(app, service, tmp_path):
+    service.settings["processing"]["enable_audio_transcription"] = False
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    with pytest.raises(ValueError, match="音频转录未启用"):
+        dialog.apply_manual_options({"stage_routes": {"content_description": {"provider_id": "backup", "model": "audio"}}})
+    assert dialog.mode.currentData() == "policy"
+    dialog.close()
+
+
+def test_manual_suggestion_attempts_reach_preview(app, service, tmp_path, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.Ok)
+    service.settings["processing"]["enable_audio_transcription"] = True
+    dialog = ManualRecoveryDialog(service, [video(service, tmp_path)])
+    routes = {"video_classification": {"provider_id": "backup", "model": "video", "attempts": 1},
+              "content_description": {"provider_id": "main", "model": "audio", "attempts": 2}}
+    dialog.apply_manual_options({"stage_routes": routes})
+    assert dialog.video_attempts.value() == 1
+    assert dialog.audio_attempts.value() == 2
+    dialog.accept()
+    assert dialog.result() == QDialog.Accepted
+    assert dialog.options["manual_options"]["stage_routes"] == routes
+    chains = dialog.preview["items"][0]["route_chains"]
+    assert chains["video_classification"][0]["attempt_limit"] == 1
+    assert chains["content_description"][0]["attempt_limit"] == min(2, dialog.preview["items"][0]["budget"])
+    dialog.close()
+
+
+@pytest.mark.parametrize("mode", ["policy", "primary", "selected"])
+def test_manual_options_and_video_override(app, service, tmp_path, mode, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.Ok)
     path = video(service, tmp_path)
     dialog = ManualRecoveryDialog(service, [path])
     dialog.mode.setCurrentIndex(dialog.mode.findData(mode))
@@ -90,7 +262,8 @@ def test_filter_emits_and_resets(app, service):
 def test_status_keeps_previous_success_visible(app):
     model = VideoTableModel()
     model.update_data([{"path": "a.mp4", "filename": "a.mp4", "status": "analyzed", "recovery_state": "exhausted"}])
-    assert "重新分析失败·400" in model.data(model.index(0, COL_STATUS))
+    assert "保留旧结果" in model.data(model.index(0, COL_STATUS))
+    assert "400" not in model.data(model.index(0, COL_STATUS))
 
 
 def test_video_policy_can_be_saved_without_starting_requests(app, service, tmp_path):

@@ -2,18 +2,19 @@
 """操作边界 + 累加 + 筛选（ticket 03–06）。"""
 from __future__ import annotations
 
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService, normalize_work_path
+from core.video_organizer_service import VideoOrganizerService, normalize_work_path
 from gui.models.proxy_model import video_matches_filter
 
 
 @pytest.fixture
 def service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {}))},
+        settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "ops.db"),
         results_json=str(tmp_path / "r.json"),

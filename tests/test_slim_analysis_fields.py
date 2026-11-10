@@ -2,11 +2,12 @@
 """分析结果字段瘦身 + 去情绪（ADR-0002/0003）— 服务层接缝。"""
 from __future__ import annotations
 
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 
 REMOVED_KEYS = (
     "composition",
@@ -22,7 +23,7 @@ KEPT_KEYS = ("category", "summary")
 @pytest.fixture
 def service(tmp_path: Path) -> VideoOrganizerService:
     return VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS, "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {}))},
+        settings=SettingsManager.deep_copy_defaults(),
         on_log=lambda _m: None,
         db_path=str(tmp_path / "slim.db"),
         results_json=str(tmp_path / "r.json"),
@@ -90,9 +91,10 @@ def test_upsert_and_read_strips_removed_fields(service: VideoOrganizerService, t
 
 def test_rename_pattern_ignores_emotion_and_composition(service: VideoOrganizerService, tmp_path: Path):
     """重命名替换不再依赖 emotion/composition；占位符残留应变成空串。"""
-    from core.video_organizer_service import FileManager
-
+    path = tmp_path / "orig.mp4"
+    path.write_bytes(b"synthetic")
     item = {
+        "path": str(path),
         "category": "A",
         "tags": ["t1"],
         "summary": "s",
@@ -101,18 +103,11 @@ def test_rename_pattern_ignores_emotion_and_composition(service: VideoOrganizerS
         "filename": "orig.mp4",
     }
     pattern = "{category}-{emotion}-{composition}-{original_name}"
-    tags_str = "_".join(item["tags"])
-    summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
-    new_fn = (
-        pattern.replace("{category}", str(item["category"]))
-        .replace("{tags}", tags_str)
-        .replace("{summary}", str(summary_safe))
-        .replace("{emotion}", "")
-        .replace("{composition}", "")
-        .replace("{original_name}", "orig.mp4")
-    )
-    assert "SHOULD_NOT_APPEAR" not in new_fn
-    assert new_fn == "A---orig.mp4"
+    service.db.upsert_video(item)
+    preview = service.batch_rename(dry_run=True, selected_paths=[str(path)], custom_pattern=pattern)
+    assert len(preview) == 1
+    assert preview[0]["new"] == "A---orig.mp4"
+    assert path.is_file()
 
 
 def test_export_ale_has_no_emotion_column(service: VideoOrganizerService, tmp_path: Path):

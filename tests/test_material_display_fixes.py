@@ -1,29 +1,19 @@
 """素材展示回归：合成帧、临时库与离屏Qt。"""
-import os
+from tests.support.display import service as service
 import time
 from pathlib import Path
 import numpy as np
 import pytest
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import Qt, QSize, QPoint
+from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication, QGroupBox, QPushButton, QHeaderView
+from PySide6.QtWidgets import QGroupBox, QPushButton, QHeaderView
 from PySide6.QtTest import QTest
-from core.video_organizer_service import VideoProcessor, VideoOrganizerService, SettingsManager
+from core.video_organizer_service import VideoProcessor, SettingsManager
 from gui.models.video_table import VideoTableModel, COL_THUMB, COL_FILENAME
 from gui.views.workstation import WorkstationView
 from gui.views.material_library import MaterialLibraryView
 from gui.views.settings import SettingsView
 
-@pytest.fixture
-def app():
-    return QApplication.instance() or QApplication([])
-
-@pytest.fixture
-def service(tmp_path, monkeypatch):
-    monkeypatch.setattr("core.video_organizer_service.TAG_CONFIG_FILE", str(tmp_path / "tags.json"))
-    monkeypatch.setattr("core.video_organizer_service.get_settings_file_path", lambda: str(tmp_path / "settings.json"))
-    return VideoOrganizerService(settings=SettingsManager.deep_copy_defaults(), db_path=str(tmp_path / "test.db"), on_log=lambda *_: None)
 
 def fake_capture(monkeypatch):
     class Capture:

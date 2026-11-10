@@ -1,15 +1,12 @@
 """模型发现、显式选择与自定义输入：使用模拟列表接口和真实Qt后台线程。"""
 import copy
-import os
 import threading
 import time
 from types import SimpleNamespace
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication
 from shiboken6 import isValid
 
 from core.ai_gateway import AiRequestGateway
@@ -18,12 +15,7 @@ from gui.services.model_catalog import ModelCatalog
 from gui.widgets.model_picker import ModelPicker
 from gui.widgets.recovery_controls import RecoveryPolicyEditor, ManualRecoveryDialog
 from gui.views.settings import SettingsView
-from tests.test_http400_recovery import service, video, fallback
-
-
-@pytest.fixture(scope="module")
-def app():
-    return QApplication.instance() or QApplication([])
+from tests.support.recovery import service as service, video, fallback
 
 
 def wait_for(app, predicate):
@@ -198,6 +190,8 @@ def test_main_settings_fetch_uses_unsaved_connection_without_saving_or_dirtying(
 
 
 def test_manual_recovery_selects_fetched_model_or_accepts_custom(app, service, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.Ok)
     path = video(service, tmp_path)
     catalog = ModelCatalog(gateway=Gateway())
     monkeypatch.setattr("gui.widgets.model_picker.model_catalog", lambda: catalog)

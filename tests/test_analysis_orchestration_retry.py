@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """分析任务编排：调用层/单条层/批次补跑/取消（ticket 02–03 + review 加固）。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from core.analysis_job_policy import ApiCallFailure
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 
 
 @pytest.fixture
 def service(tmp_path: Path) -> VideoOrganizerService:
     settings = {
-        **DEFAULT_SETTINGS,
-        "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {})),
+        **SettingsManager.deep_copy_defaults(),
+        "ui_preferences": dict(SettingsManager.deep_copy_defaults().get("ui_preferences", {})),
         "processing": {
-            **DEFAULT_SETTINGS["processing"],
+            **SettingsManager.deep_copy_defaults()["processing"],
             "analysis_retry": {
                 "call_extra_attempts": 2,
                 "item_max_attempts": 2,

@@ -6,12 +6,11 @@ from pathlib import Path
 
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtWidgets import QDialog, QMessageBox
 
 from core.video_organizer_service import SettingsManager, VideoOrganizerService
 from gui.main_window import MainWindow
@@ -25,11 +24,6 @@ from gui.views.settings import SettingsView
 from gui.views.workstation import WorkstationView
 from gui.views.workstation import PhysicalMigrationPreviewDialog
 from gui.widgets.rename_dialog import BatchRenameDialog
-
-
-@pytest.fixture(scope="module")
-def qt_app():
-    return QApplication.instance() or QApplication([])
 
 
 @pytest.fixture
@@ -188,7 +182,7 @@ def test_settings_effective_config_summary_hides_credentials(service, views):
     assert "视频分类" in text
     assert "标准词 AI 助手" in text
     assert "自动 XMP 侧车：" in text
-    assert ("自动 XMP 侧车：开启" in text) or ("自动 XMP 侧车：关闭" in text)
+    assert "自动 XMP 侧车：关闭" in text
     assert "secret-test-key" not in text
 
 

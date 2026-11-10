@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """标签组写入 / 回填修复。"""
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
-from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
+from core.video_organizer_service import VideoOrganizerService
 from core.tag_vocab import build_vocab_draft_from_lines, merge_draft_into_tag_config
 
 
 def test_heal_tag_config_from_db(tmp_path: Path):
     svc = VideoOrganizerService(
-        settings={**DEFAULT_SETTINGS},
+        settings={**SettingsManager.deep_copy_defaults()},
         on_log=lambda _m: None,
         db_path=str(tmp_path / "t.db"),
         results_json=str(tmp_path / "r.json"),

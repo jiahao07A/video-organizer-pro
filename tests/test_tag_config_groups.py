@@ -2,14 +2,11 @@
 """词表写入标签组：不因缺 version 被 v1 迁移清空。"""
 from pathlib import Path
 import json
-import copy
 
 from core.video_organizer_service import (
-    DEFAULT_SETTINGS,
     VideoOrganizerService,
     SettingsManager,
 )
-from core.tag_vocab import build_vocab_draft_from_lines
 
 
 def test_load_tag_config_keeps_groups_without_version(tmp_path: Path, monkeypatch):
@@ -36,10 +33,17 @@ def test_load_tag_config_keeps_groups_without_version(tmp_path: Path, monkeypatc
     assert "男性" in groups.get("subject", [])
     # 磁盘应被补上 version 而不丢词
     disk = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert disk.get("version") == "6.0" or any(
-        g.get("id") == "mood" and "开心" in (g.get("tags") or [])
-        for g in disk.get("tag_groups") or []
+    assert disk.get("version") == "6.0"
+    expected = {"mood": {"开心", "治愈"}, "subject": {"男性"}}
+    reopened = VideoOrganizerService(
+        settings=SettingsManager.deep_copy_defaults(), on_log=lambda _m: None,
+        db_path=str(tmp_path / "t.db"), results_json=str(tmp_path / "r.json"),
+        results_csv=str(tmp_path / "r.csv"),
     )
+    for config in (disk, reopened.tag_config):
+        by_id = {g["id"]: set(g.get("tags") or []) for g in config["tag_groups"]}
+        for gid, tags in expected.items():
+            assert by_id[gid] == tags
 
 
 def test_commit_vocab_fills_all_groups(tmp_path: Path, monkeypatch):

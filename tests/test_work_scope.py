@@ -2,13 +2,12 @@
 """工作范围服务层行为测试（ticket 02）。"""
 from __future__ import annotations
 
-import os
+from core.video_organizer_service import SettingsManager
 from pathlib import Path
 
 import pytest
 
 from core.video_organizer_service import (
-    DEFAULT_SETTINGS,
     VideoOrganizerService,
     dedupe_scope_paths,
     is_video_path_in_scope,
@@ -23,8 +22,8 @@ def service(tmp_path: Path) -> VideoOrganizerService:
     json_path = str(tmp_path / "results.json")
     csv_path = str(tmp_path / "results.csv")
     settings = {
-        **DEFAULT_SETTINGS,
-        "ui_preferences": dict(DEFAULT_SETTINGS.get("ui_preferences", {})),
+        **SettingsManager.deep_copy_defaults(),
+        "ui_preferences": dict(SettingsManager.deep_copy_defaults().get("ui_preferences", {})),
     }
     return VideoOrganizerService(
         settings=settings,
