@@ -25,6 +25,7 @@ TASK_ROUTE_KEYS = (
     "pending_tag_ai",
     "synonym_audit",
     "standard_tag_ai",
+    "error_diagnosis",
 )
 
 TASK_ROUTE_LABELS = {
@@ -34,6 +35,7 @@ TASK_ROUTE_LABELS = {
     "pending_tag_ai": "待审词 AI",
     "synonym_audit": "近义巡检",
     "standard_tag_ai": "标准词 AI 助手",
+    "error_diagnosis": "错误诊断",
 }
 
 

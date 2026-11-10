@@ -21,7 +21,7 @@ from core.storage_backup import write_json_atomic
 
 logger = logging.getLogger("VideoOrganizer.startup")
 
-CURRENT_DATABASE_VERSION = 2
+CURRENT_DATABASE_VERSION = 3
 COMPLETION_METADATA_KEY = "legacy_json_import"
 DEFAULT_BATCH_SIZE = 200
 MAX_REPORT_ITEMS = 100
@@ -170,6 +170,8 @@ def inspect_database_file(
         required = {"videos", "settings"}
         if version >= 2:
             required |= {"video_recovery", "video_recovery_policy", "video_recovery_rounds", "video_recovery_attempts"}
+        if version >= 3:
+            required |= {"analysis_failure_index", "analysis_failure_diagnoses"}
         missing = sorted(required - tables)
         if missing:
             raise DatabaseValidationError(

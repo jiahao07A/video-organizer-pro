@@ -1300,7 +1300,8 @@ class WorkstationView(QWidget):
         self.worker = AnalysisWorker(self.service, paths, force_reanalyze=bool(force))
         self.worker.progress_updated.connect(self.update_status)
         self.worker.snapshot_updated.connect(self.on_analysis_snapshot)
-        self.worker.task_finished.connect(self.on_task_finished)
+        self.worker.result_ready.connect(self._receive_analysis_result)
+        self.worker.task_finished.connect(self._analysis_finished)
         self.worker.start()
 
     def delete_selected(self):
@@ -1477,7 +1478,8 @@ class WorkstationView(QWidget):
         self.worker = AnalysisWorker(self.service, paths, force_reanalyze=bool(force))
         self.worker.progress_updated.connect(self.update_status)
         self.worker.snapshot_updated.connect(self.on_analysis_snapshot)
-        self.worker.task_finished.connect(self.on_task_finished)
+        self.worker.result_ready.connect(self._receive_analysis_result)
+        self.worker.task_finished.connect(self._analysis_finished)
         self.worker.start()
 
     def start_rename(self, dry_run=True):
@@ -1546,6 +1548,8 @@ class WorkstationView(QWidget):
             regex_replace=config["replace_str"],
             rename_date=config["preview_date"],
         )
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.worker.progress_updated.connect(self.update_status)
         self.worker.task_finished.connect(self.on_task_finished)
         self.worker.start()
@@ -1777,7 +1781,15 @@ class WorkstationView(QWidget):
             busy_message="正在物理整理…",
         )
 
-    def on_task_finished(self, success, message):
+    def _receive_analysis_result(self, result):
+        self._analysis_result = result
+
+    def _analysis_finished(self, success, message):
+        result = getattr(self, "_analysis_result", {})
+        self._analysis_result = {}
+        self.on_task_finished(success, message, analysis_result=result)
+
+    def on_task_finished(self, success, message, *, analysis_result=None):
         self.set_ui_enabled(True)
         self.cancel_analysis_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
@@ -1795,7 +1807,15 @@ class WorkstationView(QWidget):
             except Exception:
                 pass
             self.load_data()
-        if success:
+        failed_paths = tuple((analysis_result or {}).get("remaining_failed_paths", (analysis_result or {}).get("failed_paths", [])))
+        if failed_paths:
+            box = QMessageBox(QMessageBox.Warning, "分析结束", message, QMessageBox.Close, self)
+            view_failures = box.addButton(f"查看本次失败项（{len(failed_paths)}条）", QMessageBox.ActionRole)
+            box.exec()
+            if box.clickedButton() is view_failures:
+                from gui.widgets.recovery_controls import AnalysisFailureCenterDialog
+                AnalysisFailureCenterDialog(self.service, paths=failed_paths, parent=self).exec()
+        elif success:
             QMessageBox.information(self, "任务完成", message)
         else:
             QMessageBox.critical(self, "错误", message)

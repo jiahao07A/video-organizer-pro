@@ -84,7 +84,7 @@ class DetailPanel(QWidget):
         self._field_rows = {}
         self._field_rows["filename"] = form_layout.rowCount()
         form_layout.addRow("文件名:", self.filename_label)
-        self.recovery_detail_btn = QPushButton("400恢复详情与历史")
+        self.recovery_detail_btn = QPushButton("分析失败详情与历史")
         self.recovery_detail_btn.clicked.connect(self.show_recovery_history)
         form_layout.addRow("分析恢复:", self.recovery_detail_btn)
 
@@ -317,8 +317,8 @@ class DetailPanel(QWidget):
     def show_recovery_history(self):
         if not isinstance(self.current_video, dict):
             return
-        from gui.widgets.recovery_controls import show_recovery_detail
-        show_recovery_detail(self.service, self.current_video.get("path"), self)
+        from gui.widgets.recovery_controls import AnalysisFailureCenterDialog
+        AnalysisFailureCenterDialog(self.service, paths=[self.current_video.get("path")], parent=self).exec()
 
     def load_video_data(self, video_data):
         """填充数据到面板，支持单选或多选"""
@@ -348,9 +348,9 @@ class DetailPanel(QWidget):
         self.transcript_input.setEnabled(True)
         
         self.filename_label.setText(video_data.get("filename", "-"))
-        from core.analysis_recovery import STATE_LABELS
+        from core.analysis_failures import failure_state_label
         recovery_state = video_data.get("recovery_state")
-        self.recovery_detail_btn.setText(STATE_LABELS.get(recovery_state, "400恢复详情") + " · 查看历史与设置")
+        self.recovery_detail_btn.setText((failure_state_label(recovery_state) if recovery_state else "分析失败详情") + " · 查看历史与处理")
         
         # 设置分类
         cat = video_data.get("category", "Other")

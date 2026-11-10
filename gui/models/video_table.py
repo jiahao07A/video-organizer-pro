@@ -213,12 +213,13 @@ class VideoTableModel(QAbstractTableModel):
                     pass
                 recovery_state = row_data.get("recovery_state")
                 if recovery_state:
-                    from core.analysis_recovery import STATE_LABELS
-                    label = STATE_LABELS.get(recovery_state, recovery_state)
+                    from core.analysis_failures import failure_state_label
+                    label = failure_state_label(recovery_state)
                     if recovery_state != "recovered" and row_data.get("status") in ("analyzed", "renamed", "edited"):
-                        label = "重新分析失败·400 / " + label
+                        label = "保留旧结果 / " + label
                     return label
-                return row_data.get("status", "")
+                status = row_data.get("status", "")
+                return {"pending": "未分析", "analyzed": "已分析", "renamed": "已重命名", "edited": "已编辑", "failed": "分析失败", "processing": "分析中"}.get(status, status or "未分析")
 
         elif role == Qt.UserRole:
             # 卡片与其它代理可取整行数据
@@ -255,6 +256,11 @@ class VideoTableModel(QAbstractTableModel):
         return Qt.ItemIsEnabled | Qt.ItemIsSelectable
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
+            if section == COL_LIBRARY_ID:
+                return '素材的固定入库标识；不是素材总数。删除记录或历史版本可能留下空号，分析、重命名和回滚不改变已有编号。'
+            if section == COL_LIST_NO:
+                return '当前筛选和排序下的列表序号；素材总数见列表下方。'
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
             return self.headers[section]
         return None

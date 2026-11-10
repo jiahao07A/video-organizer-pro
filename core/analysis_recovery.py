@@ -34,6 +34,7 @@ STATE_LABELS = {
     "excluded": "400已排除自动重试", "disabled": "400自动重试已关闭",
     "cancelled": "400恢复已取消", "interrupted": "已中断，待手动恢复",
     "recovered": "曾遇到400，已恢复",
+    "failed": "分析失败，待处理",
 }
 ACTIVE_STATES = ("pending", "retrying", "waiting_fallback")
 
@@ -208,6 +209,8 @@ class RecoveryStore:
                          (vid, state, ctx.round_id, now(), json.dumps(detail, ensure_ascii=False)))
             if state not in ACTIVE_STATES:
                 conn.execute("UPDATE video_recovery_rounds SET ended_at=? WHERE id=?", (now(), ctx.round_id))
+            from core.analysis_failures import refresh_index
+            refresh_index(conn, vid)
         callback = getattr(ctx, "on_state", None)
         if callback:
             callback(ctx.path, state)
@@ -223,6 +226,18 @@ class RecoveryStore:
         result = dict(rows[0])
         result["detail"] = json.loads(result["detail"])
         return result
+
+    def finish_failure(self, ctx, reason, *, cancelled=False):
+        if not ctx.last_error or ctx.last_error.get("message") != reason:
+            ctx.last_error = {"message": redact(reason), "stage": ctx.stage,
+                              "task_key": ctx.stage if ctx.stage in ("video_classification", "content_description") else ""}
+        if not ctx.active:
+            self.start(ctx)
+            for detail in ctx.observations:
+                self.attempt(ctx, detail)
+            ctx.observations.clear()
+        state = "cancelled" if cancelled else ctx.state if ctx.state in ("exhausted", "disabled", "excluded") else "failed"
+        self.state(ctx, state)
 
     def detail(self, path):
         result = self.current(path)
@@ -270,6 +285,12 @@ class RecoveryContext:
     analysis_data: Any = None
     video_override: dict = field(default_factory=dict)
     temporary_override: dict = field(default_factory=dict)
+    manual_options: dict = field(default_factory=dict)
+    observations: list = field(default_factory=list)
+    total_requests: int = 0
+    ever400: bool = False
+    stage: str = "extract"
+    request_gate: Any = None
     compatibility: set = field(default_factory=set)
     auth_blocked: set = field(default_factory=set)
     random_value: Any = random.random
@@ -282,14 +303,15 @@ class RecoveryContext:
         self.limits = [int(self.policy["primary_extra_attempts"]) + 1]
         self.invalid_routes = []
         entries = self.policy["fallbacks"] if self.mode != "primary" else []
-        if self.mode == "selected" and self.task_key == self.selected_task:
-            entries = [self.selected]
+        explicit = self.manual_options.get("stage_routes", {}).get(self.task_key)
+        if explicit or (self.mode == "selected" and self.task_key == self.selected_task):
+            entries = [explicit or self.selected]
             self.routes, self.limits = [], []
         for entry in entries:
             if entry and entry.get("enabled", True):
                 try:
                     self.routes.append(route_for_fallback(self.settings, entry, self.task_key))
-                    self.limits.append(int(entry.get("attempts", self.policy["fallback_attempts"])))
+                    self.limits.append(int(entry.get("attempts", self.policy["primary_extra_attempts"] + 1 if self.manual_options else self.policy["fallback_attempts"])))
                 except ValueError as exc:
                     self.invalid_routes.append(str(exc))
         if not self.routes:
@@ -315,12 +337,16 @@ class RecoveryContext:
                 "budget": self.policy["request_budget"], "last_error": self.last_error,
                 "route_index": self.route_index, "successful_route": self.successful_route,
                 "successful_routes": self.successful_routes,
+                "attempt_count": self.total_requests, "ever400": self.ever400,
                 "invalid_routes": self.invalid_routes}
 
     def activate(self):
         if not self.active:
             self.active = True
             self.store.start(self)
+            for detail in self.observations:
+                self.store.attempt(self, detail)
+            self.observations.clear()
 
     def before_request(self):
         connection = (self.route.get("base_url"), self.route.get("api_key"))
@@ -334,9 +360,16 @@ class RecoveryContext:
             if self.used >= self.policy["request_budget"]:
                 self.store.state(self, "exhausted")
                 return False
+        if self.request_gate:
+            delay = self.request_gate()
+            if delay > 0:
+                raise RecoveryDeferred(self, delay)
+        if self.active:
             self.used += 1
             self.store.state(self, "retrying")
+        self.total_requests += 1
         self.route_attempts += 1
+        self.stage = self.task_key
         return True
 
     def record(self, error=None, *, success=False, compatibility=False):
@@ -351,6 +384,11 @@ class RecoveryContext:
                   "message": redact(error, [r.get("api_key") for r in self.routes]),
                   "request_id": redact(getattr(error, "request_id", "")),
                   "success": success, "compatibility": compatibility}
+        if error:
+            detail["exception_type"] = type(error).__name__
+            detail["stage"] = self.task_key
+            self.last_error = detail
+        self.ever400 = self.ever400 or code == 400
         if code == 400:
             if not self.active:
                 self.route_attempts = 1
@@ -358,6 +396,8 @@ class RecoveryContext:
             self.activate()
         if self.active:
             self.store.attempt(self, detail)
+        else:
+            self.observations.append(detail)
         if success:
             self.successful_route = {k: detail[k] for k in ("provider_id", "model", "task_key")}
             self.successful_routes[self.task_key] = self.successful_route
