@@ -2,6 +2,7 @@
 from PySide6.QtCore import QThread, Signal, Qt
 from core.video_organizer_service import VideoOrganizerService
 import time
+import threading
 
 
 def analysis_task_succeeded(result) -> bool:
@@ -33,6 +34,7 @@ class AnalysisWorker(QThread):
     progress_updated = Signal(int, str)  # 兼容：总进度百分比 + 文案
     snapshot_updated = Signal(dict)  # 结构化进度快照
     task_finished = Signal(bool, str)
+    result_ready = Signal(dict)
 
     def __init__(self, service: VideoOrganizerService, input_path, force_reanalyze: bool = False, recovery_options=None):
         super().__init__()
@@ -41,6 +43,7 @@ class AnalysisWorker(QThread):
         self.force_reanalyze = force_reanalyze
         self.recovery_options = recovery_options or {}
         self._cancel_requested = False
+        self.cancel_event = threading.Event()
         self._last_log_emit = 0.0
         self._last_snapshot_emit = 0.0
         self._log_interval = 0.3
@@ -50,10 +53,7 @@ class AnalysisWorker(QThread):
 
     def request_cancel(self):
         self._cancel_requested = True
-        try:
-            self.service.request_cancel_analysis()
-        except Exception:
-            pass
+        self.cancel_event.set()
 
     def handle_log(self, msg):
         # 节流：高频「正在处理」日志合并，防止 QueuedConnection 淹没 GUI 事件循环
@@ -103,7 +103,7 @@ class AnalysisWorker(QThread):
             self.service.on_analysis_snapshot = self.handle_snapshot
 
             result = self.service.run_analysis(
-                self.input_path, force_reanalyze=self.force_reanalyze, **self.recovery_options
+                self.input_path, force_reanalyze=self.force_reanalyze, cancel_event=self.cancel_event, **self.recovery_options
             )
             # 冲刷节流中的最后一条日志/快照
             if self._pending_log:
@@ -111,6 +111,7 @@ class AnalysisWorker(QThread):
             if self._pending_snap:
                 self.snapshot_updated.emit(self._pending_snap)
             if isinstance(result, dict):
+                self.result_ready.emit(result)
                 msg = result.get("message") or "分析任务已完成"
                 ok = analysis_task_succeeded(result)
                 self.task_finished.emit(ok, msg)

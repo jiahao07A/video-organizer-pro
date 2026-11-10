@@ -19,6 +19,7 @@ class RenameWorker(QThread):
         self.rename_date = rename_date
 
     def run(self):
+        previous_log = self.service.on_log
         try:
             self.service.on_log = self.handle_log
             self.service.batch_rename(
@@ -28,6 +29,8 @@ class RenameWorker(QThread):
                 regex_find=self.regex_find,
                 regex_replace=self.regex_replace,
                 date_value=self.rename_date,
+                progress_callback=lambda done, total: self.progress_updated.emit(
+                    int(done * 100 / max(1, total)), f"重命名进度：{done}/{total}"),
             )
             report = getattr(self.service, "_last_rename_result", None) or {}
             failed = int(report.get("failed_count", 0) or 0)
@@ -42,6 +45,8 @@ class RenameWorker(QThread):
             self.task_finished.emit(True, msg)
         except Exception as e:
             self.task_finished.emit(False, f"重命名出错: {str(e)}")
+        finally:
+            self.service.on_log = previous_log
 
     def handle_log(self, msg):
         self.progress_updated.emit(-1, msg)

@@ -321,12 +321,13 @@ class DatabaseManager:
     def __init__(self, db_path: str = DB_FILE, *, backup_before_upgrade: bool = True):
         self.db_path = db_path
         self.lock = threading.RLock()
+        self._connection_local = threading.local()
         if os.path.exists(self.db_path):
             # 现有文件必须先通过只读完整性/版本检查；不能让
             # CREATE TABLE 或 ALTER TABLE 把损坏库伪装成新库。
             from core.startup_upgrade import inspect_database_file
             inspection = inspect_database_file(self.db_path)
-            if inspection.version < 2 and backup_before_upgrade:
+            if inspection.version < 3 and backup_before_upgrade:
                 # 独立DatabaseManager调用也必须先留一致性快照，不能绕过备份。
                 backup_path = self.db_path + ".pre-recovery-" + datetime.now().strftime("%Y%m%d%H%M%S%f") + ".sqlite"
                 with sqlite3.connect(self.db_path) as source, sqlite3.connect(backup_path) as target:
@@ -342,11 +343,30 @@ class DatabaseManager:
     @contextmanager
     def _managed_connection(self):
         """让 SQLite 连接在事务上下文退出时明确关闭（Windows 也可安全搬迁/回滚）。"""
+        existing = getattr(self._connection_local, 'connection', None)
+        if existing is not None:
+            with existing:
+                yield existing
+            return
         conn = self._get_connection()
         try:
             with conn:
                 yield conn
         finally:
+            conn.close()
+
+    @contextmanager
+    def reuse_connection(self):
+        """批量文件操作复用本线程连接；仍保持每条操作独立提交与补偿。"""
+        if getattr(self._connection_local, 'connection', None) is not None:
+            yield
+            return
+        conn = self._get_connection()
+        self._connection_local.connection = conn
+        try:
+            yield
+        finally:
+            self._connection_local.connection = None
             conn.close()
 
     def _init_db(self):
@@ -526,8 +546,12 @@ class DatabaseManager:
                 install_schema(conn)
                 if previous_version < 2:
                     backfill_legacy(conn)
-                cursor.execute("PRAGMA user_version = 2")
-                if previous_version < 2:
+                from core.analysis_failures import install_schema as install_failures, backfill as backfill_failures
+                install_failures(conn)
+                # 既有版本即使已经是2，也可能只有普通失败文本，首次启用失败中心时补建索引。
+                backfill_failures(conn)
+                cursor.execute("PRAGMA user_version = 3")
+                if previous_version < 3:
                     if cursor.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                         raise RuntimeError("升级后的数据库完整性检查失败，已回滚事务")
                 conn.commit()
@@ -612,12 +636,12 @@ class DatabaseManager:
             return 0
         query = """
             INSERT INTO videos (
-                path, filename, file_hash, phash, category, summary, tags,
+                id, path, filename, file_hash, phash, category, summary, tags,
                 transcription, status, thumbnail, manual_override, metadata_injected,
                 raw_metadata, emotion, composition, rating, quality_score,
                 is_proxy_needed, proxy_path, face_clusters, vector_id, tag_groups, tag_weights
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ((SELECT id FROM videos WHERE path = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 filename=excluded.filename, file_hash=excluded.file_hash,
                 phash=excluded.phash, category=excluded.category,
@@ -634,7 +658,8 @@ class DatabaseManager:
         with self.lock:
             conn = self._get_connection()
             try:
-                conn.executemany(query, [self._video_upsert_params(row) for row in records])
+                # 显式复用原ID，避免SQLite在冲突更新时仍消耗AUTOINCREMENT编号。
+                conn.executemany(query, [(row.get("path"),) + self._video_upsert_params(row) for row in records])
                 conn.commit()
             finally:
                 conn.close()
@@ -644,12 +669,12 @@ class DatabaseManager:
         # 已删字段硬清：写入空值，避免旧数据残留被读出
         query = """
             INSERT INTO videos (
-                path, filename, file_hash, phash, category, summary, tags,
+                id, path, filename, file_hash, phash, category, summary, tags,
                 transcription, status, thumbnail, manual_override, metadata_injected,
                 raw_metadata, emotion, composition, rating, quality_score,
                 is_proxy_needed, proxy_path, face_clusters, vector_id, tag_groups, tag_weights
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ((SELECT id FROM videos WHERE path = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 filename=excluded.filename,
                 file_hash=excluded.file_hash,
@@ -675,7 +700,7 @@ class DatabaseManager:
                 tag_weights=excluded.tag_weights
         """
         with self.lock, self._managed_connection() as conn:
-            conn.execute(query, self._video_upsert_params(video_data))
+            conn.execute(query, (video_data.get("path"),) + self._video_upsert_params(video_data))
             if video_data.get("_analysis_side_effects"):
                 conn.executemany("UPDATE tags_library SET usage_count=usage_count+1 WHERE tag_name=?",
                                  [(tag,) for tag in video_data.get("tags", [])])
@@ -1703,6 +1728,9 @@ class AIHandler:
         *,
         task_key: Optional[str] = None,
         client=None,
+        retry_config=None,
+        cancel_event=None,
+        route_override=None,
     ) -> Optional[Dict]:
         """兼容门面：所有聊天请求委托给 AiRequestGateway。"""
         self.gateway.settings = self.settings
@@ -1715,8 +1743,9 @@ class AIHandler:
             json_mode=json_mode,
             task_key=task_key,
             client=use_client,
-            retry_config=getattr(self, "_job_retry_config", None),
-            cancel_event=getattr(self, "analysis_cancel_event", None),
+            retry_config=retry_config or getattr(self, "_job_retry_config", None),
+            cancel_event=cancel_event if cancel_event is not None else getattr(self, "analysis_cancel_event", None),
+            route_override=route_override,
             sleeper=getattr(self, "_retry_sleeper", None),
         )
         failure = self.gateway.get_last_failure()
@@ -4492,8 +4521,7 @@ class VideoOrganizerService:
     def _persist_analysis_failure(self, video_path: str, reason: str) -> None:
         try:
             existing = self.db.get_video_by_path(video_path) or {}
-            recovery = RecoveryStore(self.db).current(video_path)
-            if recovery and existing.get("status") in ("analyzed", "renamed", "edited"):
+            if existing.get("status") in ("analyzed", "renamed", "edited"):
                 return
             meta = existing.get("raw_metadata") or {}
             if not isinstance(meta, dict):
@@ -4514,17 +4542,23 @@ class VideoOrganizerService:
             logger.warning(f"写入失败状态失败 {video_path}: {e}")
 
     def run_analysis(self, input_path, *, force_reanalyze=False, recovery_mode=None,
-                     recovery_override=None, selected_fallback=None):
+                     recovery_override=None, selected_fallback=None, manual_options=None, cancel_event=None):
         lock = getattr(self, "_analysis_run_lock", None)
         if lock is None:
             self._analysis_run_lock = lock = threading.Lock()
         if not lock.acquire(blocking=False):
             raise RuntimeError("已有分析任务正在运行，请等待完成或取消后再试。")
         try:
+            # 每轮独立令牌；Worker启动前的取消不能被初始化清除。
+            self._analysis_cancel = cancel_event if cancel_event is not None else threading.Event()
             self._manual_recovery = recovery_mode is not None
             self._recovery_mode = recovery_mode or "policy"
             self._recovery_override = recovery_override or {}
             self._selected_fallback = selected_fallback
+            from core.analysis_failures import validate_manual_options
+            self._manual_options = validate_manual_options(manual_options, self.settings) if self._manual_recovery else {}
+            validate_policy_input = __import__('core.analysis_recovery', fromlist=['validate_policy']).validate_policy
+            validate_policy_input(self._recovery_override, self.settings)
             return self._run_analysis(input_path, force_reanalyze=force_reanalyze or self._manual_recovery)
         finally:
             self.ai.gateway._tls.recovery_context = None
@@ -4538,7 +4572,84 @@ class VideoOrganizerService:
                 lock.release()
 
     def get_recovery_detail(self, path):
-        return RecoveryStore(self.db).detail(path)
+        detail = RecoveryStore(self.db).detail(path)
+        if detail:
+            from core.analysis_failures import FailureStore, FailureQuery
+            rows = FailureStore(self.db).query(FailureQuery(scope_paths=(path,), state=""), limit=1)["rows"]
+            detail["failure"] = rows[0] if rows else {}
+        return detail
+
+    def query_analysis_failures(self, query=None, **kwargs):
+        from core.analysis_failures import FailureStore, FailureQuery
+        return FailureStore(self.db).query(query or FailureQuery(), **kwargs)
+
+    def preview_manual_retry(self, paths, **options):
+        from core.analysis_failures import preview_retry
+        return preview_retry(self, paths, **options)
+
+    def diagnose_analysis_failures(self, query=None, *, paths=None, force=False, cancel_event=None, on_progress=None):
+        """按规范化错误分组主动诊断；不触发分析重试。"""
+        from core.analysis_failures import FailureStore, FailureQuery, diagnostic_text, route_fingerprint, valid_diagnosis
+        store = FailureStore(self.db)
+        if paths is not None:
+            from dataclasses import replace
+            query = replace(query or FailureQuery(), scope_paths=tuple(paths))
+        result = store.query(query or FailureQuery(), groups_only=True)
+        route = self.ai.resolve_task_route("error_diagnosis")
+        route_hash = route_fingerprint({k: route.get(k, "") for k in ("provider_id", "model", "base_url")})
+        output = []
+        from core.analysis_job_policy import RetryConfig
+        for group in result:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            metadata = {key: group.get(key) for key in ("fingerprint", "category", "stage", "provider_id", "model", "status_code")}
+            metadata["count"] = group["material_count"]
+            cached = None if force else store.diagnosis(group["fingerprint"], route_hash)
+            if cached and not valid_diagnosis(cached["result"]):
+                cached = None
+            if cached:
+                diagnosis = cached["result"]
+            else:
+                prompt = (
+                    "你是视频分析故障诊断助手。只根据脱敏错误诊断，不要猜测素材内容。"
+                    "返回JSON：cause、confidence、evidence、actions、retry_options；actions为字符串数组，"
+                    "cause和evidence必须为非空字符串，无法确定时也应说明缺少的依据；"
+                    "retry_options只允许concurrency、request_interval，数值必须保守。"
+                )
+                payload = {"category": group.get("category"), "stage": group.get("stage"),
+                           "status_code": group.get("status_code"), "provider_id": group.get("provider_id"),
+                           "model": group.get("model"), "message": diagnostic_text(group.get("message"), self.settings),
+                           "evidence": diagnostic_text(group.get("evidence"), self.settings), "suggestion": group.get("suggestion")}
+                try:
+                    diagnosis = self.ai._get_api_response(route.get("model") or "", prompt,
+                        [json.dumps(payload, ensure_ascii=False)], json_mode=False, task_key="error_diagnosis",
+                        retry_config=RetryConfig(call_extra_attempts=0, item_max_attempts=1, batch_rerun_enabled=False),
+                        cancel_event=cancel_event if cancel_event is not None else threading.Event(), route_override=route)
+                except Exception:
+                    diagnosis = None
+                if diagnosis is None and cancel_event is not None and cancel_event.is_set():
+                    break
+                if isinstance(diagnosis, str):
+                    try:
+                        diagnosis = json.loads(diagnosis.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+                    except ValueError:
+                        diagnosis = None
+                if not valid_diagnosis(diagnosis):
+                    output.append({**metadata, "failed": True, "diagnosis": {"cause": "诊断失败，可稍后重新诊断", "evidence": "请求失败或AI未返回完整有效的诊断（需要原因、依据和建议列表）", "actions": [], "retry_options": {}}})
+                    if on_progress: on_progress(len(output), len(result))
+                    continue
+                diagnosis = {"cause": str(diagnosis.get("cause") or "未能确定原因"),
+                             "confidence": diagnosis.get("confidence", "未知"),
+                             "evidence": str(diagnosis.get("evidence") or ""),
+                             "actions": [str(x) for x in diagnosis.get("actions", [])][:5] if isinstance(diagnosis.get("actions"), list) else [],
+                             "retry_options": diagnosis.get("retry_options") if isinstance(diagnosis.get("retry_options"), dict) else {}}
+                store.save_diagnosis(group["fingerprint"], route_hash, diagnosis)
+            output.append({**metadata, "diagnosis": diagnosis})
+            if on_progress: on_progress(len(output), len(result))
+        failed = sum(bool(group.get("failed")) for group in output)
+        return {"route": {k: route.get(k, "") for k in ("provider_id", "model", "display_name")}, "groups": output,
+                "total": len(result), "succeeded": len(output) - failed, "failed": failed,
+                "cancelled": len(result) - len(output)}
 
     def save_recovery_override(self, paths, policy):
         RecoveryStore(self.db).save_override(paths, policy, self.settings)
@@ -4550,7 +4661,7 @@ class VideoOrganizerService:
             part = paths[start:start + 400]
             marks = ",".join("?" for _ in part)
             rows = self.db.execute_query(
-                f"SELECT v.path FROM videos v JOIN video_recovery r ON r.video_id=v.id WHERE r.state<>'recovered' AND v.path IN ({marks})", tuple(part))
+                f"SELECT v.path FROM videos v JOIN video_recovery r ON r.video_id=v.id JOIN analysis_failure_index f ON f.video_id=v.id WHERE f.ever400=1 AND r.state<>'recovered' AND v.path IN ({marks})", tuple(part))
             result.extend(row["path"] for row in rows)
         return result
 
@@ -4576,7 +4687,6 @@ class VideoOrganizerService:
             path_status_key,
         )
 
-        self.clear_analysis_cancel()
         self.ai.analysis_cancel_event = self._analysis_cancel
         self.ai._retry_sleeper = self._retry_sleeper
         self.ai.settings = self.settings
@@ -4649,10 +4759,15 @@ class VideoOrganizerService:
         for path in dict.fromkeys(videos_to_process):
             policy, _ = effective_policy(frozen_settings, video=store.override(path),
                                          temporary=self._recovery_override)
+            if self._manual_recovery:
+                from core.analysis_failures import manual_request_budget
+                budget = manual_request_budget(frozen_settings, store.override(path), self._recovery_override)
+                policy["request_budget"] = min(budget, self._manual_options.get("request_budgets", {}).get(path, budget))
             ctx = RecoveryContext(path, frozen_settings, policy, store,
                                   mode=self._recovery_mode, selected=self._selected_fallback,
                                   selected_task=((store.current(path) or {}).get("detail", {}).get("last_error", {}).get("task_key") or "video_classification") if self._manual_recovery else "video_classification",
-                                  video_override=store.override(path), temporary_override=self._recovery_override)
+                                  video_override=store.override(path), temporary_override=self._recovery_override,
+                                  manual_options=self._manual_options)
             ctx.manual = self._manual_recovery
             if ctx.manual:
                 ctx.activate()
@@ -4662,6 +4777,20 @@ class VideoOrganizerService:
         scheduler = RecoveryScheduler(contexts, self._analysis_cancel, executor_factory=ThreadPoolExecutor)
 
         retry_cfg = RetryConfig.from_settings(self.settings)
+        if self._manual_recovery:
+            from dataclasses import replace
+            retry_cfg = replace(retry_cfg, call_extra_attempts=0, item_max_attempts=1, batch_rerun_enabled=False)
+            gate_lock = threading.Lock()
+            next_request = [0.0]
+            def request_gate():
+                with gate_lock:
+                    delay = next_request[0] - time.monotonic()
+                    if delay > 0:
+                        return delay
+                    next_request[0] = time.monotonic() + self._manual_options["request_interval"]
+                    return 0
+            for ctx in contexts.values():
+                ctx.request_gate = request_gate
         # 冻结本任务配置，避免分析中途改设置搅乱 A/B 行为
         self._job_retry_config = retry_cfg
         self.ai._job_retry_config = retry_cfg
@@ -4672,6 +4801,8 @@ class VideoOrganizerService:
         )
         # 硬顶：过高并发对整机（含 GUI）是灾难；用户可按机器和服务能力调整到512
         max_workers_cfg = max(1, min(max_workers_cfg, 512))
+        if self._manual_recovery:
+            max_workers_cfg = min(max_workers_cfg, self._manual_options["concurrency"])
         # 刷新抽帧闸门（设置可能已改）
         ep = int(
             SettingsManager.get_setting(self.settings, "processing.extract_parallel", 4)
@@ -4704,7 +4835,8 @@ class VideoOrganizerService:
             from core.analysis_job_policy import normalize_progress_path
             key = normalize_progress_path(path)
             with self._progress_lock:
-                self._recovery_row_updates[key] = STATE_LABELS.get(state, state)
+                from core.analysis_failures import failure_state_label
+                self._recovery_row_updates[key] = failure_state_label(state)
                 # 独立的有界增量，不向Qt信号拷贝整个批次的行状态。
                 while len(self._recovery_row_updates) > 24:
                     self._recovery_row_updates.pop(next(iter(self._recovery_row_updates)))
@@ -4747,6 +4879,8 @@ class VideoOrganizerService:
                     result, error = self._process_single_video(
                         path, force_reanalyze or ctx.active,
                         progress_reducer=reducer, retry_cfg=retry_cfg)
+                    if not result:
+                        ctx.final_reason = error or "分析失败"
                     if result:
                         result["_successful_route"] = ctx.successful_route or {k: ctx.route.get(k, "") for k in ("provider_id", "model", "task_key")}
                     if result and ctx.active:
@@ -4760,7 +4894,8 @@ class VideoOrganizerService:
                 from core.analysis_job_policy import normalize_progress_path
                 with self._progress_lock:
                     key = normalize_progress_path(path)
-                    reducer.rows[key] = STATE_LABELS.get(ctx.state, ctx.state)
+                    from core.analysis_failures import failure_state_label
+                    reducer.rows[key] = failure_state_label(ctx.state)
                     reducer.in_flight_paths.discard(key)
                 self._emit_analysis_snapshot(reducer, force=True)
 
@@ -4775,9 +4910,17 @@ class VideoOrganizerService:
                     cancelled = True
                 if res and res.get("status") == "analyzed":
                     item_xmp_failures: List[Dict[str, str]] = []
-                    xmp_failed += self._persist_analysis_success(
-                        res, xmp_failure_sink=item_xmp_failures
-                    )
+                    try:
+                        xmp_failed += self._persist_analysis_success(res, xmp_failure_sink=item_xmp_failures)
+                    except Exception as exc:
+                        ctx = contexts[video_path]
+                        ctx.stage = "save"
+                        ctx.final_reason = str(exc) or type(exc).__name__
+                        ctx.last_error = {"message": ctx.final_reason, "stage": "save", "exception_type": type(exc).__name__}
+                        failed_paths.append(video_path)
+                        with self._progress_lock:
+                            reducer.apply("item_terminal", path=video_path, ok=False)
+                        continue
                     if contexts[video_path].active:
                         contexts[video_path].state = "recovered"
                         recovery_state_changed(video_path, "recovered")
@@ -4799,7 +4942,7 @@ class VideoOrganizerService:
                     short_name = os.path.basename(video_path)
                     if len(failure_reasons) < 8:
                         failure_reasons.append(f"{short_name}: {reason}")
-                    self._persist_analysis_failure(video_path, reason)
+                    contexts[video_path].final_reason = reason
                     failed_paths.append(video_path)
                     # 仅瞬时/可重试失败进入批次补跑；鉴权/取消/文件类跳过 C
                     from core.analysis_job_policy import is_retriable as _is_ret
@@ -4863,6 +5006,11 @@ class VideoOrganizerService:
                 store.state(ctx, "cancelled")
                 with self._progress_lock:
                     reducer.apply("item_terminal", path=ctx.path, ok=False, cancelled=True)
+        for path in dict.fromkeys(failed_paths):
+            ctx = contexts[path]
+            reason = getattr(ctx, "final_reason", None) or ctx.last_error.get("message") or "分析失败"
+            self._persist_analysis_failure(path, reason)
+            store.finish_failure(ctx, reason, cancelled="用户取消" in reason)
         # 已恢复的视频不再出现在最终失败摘要中。
         failure_reasons = [f"{os.path.basename(p)}: {contexts[p].last_error.get('message') or '分析失败'}" if contexts[p].active
                            else next((x for x in failure_reasons if x.startswith(os.path.basename(p) + ":")), os.path.basename(p) + ": 分析失败")
@@ -4928,6 +5076,9 @@ class VideoOrganizerService:
             "failure_reasons": failure_reasons,
             "batch_rerun": rerun_done,
             "cancelled": cancelled,
+            "cancelled_count": sum(contexts[p].state == "cancelled" for p in set(failed_paths)),
+            "failed_paths": list(dict.fromkeys(failed_paths)),
+            "remaining_failed_paths": [p for p in dict.fromkeys(failed_paths) if contexts[p].state != "cancelled"],
             "message": msg,
             "metrics": metrics_snap,
             "metrics_path": metrics_path,
@@ -4979,6 +5130,9 @@ class VideoOrganizerService:
                 pass
 
         def emit_phase(phase, attempt_b: int):
+            context = getattr(self.ai.gateway._tls, "recovery_context", None)
+            if context:
+                context.stage = {"ai": "video_classification"}.get(phase.value, phase.value)
             if progress_reducer is None:
                 return
             try:
@@ -5147,9 +5301,13 @@ class VideoOrganizerService:
                 ):
                     transcription = self.ai.transcribe_audio(video_path)
                     failure = self.ai.gateway.get_last_failure()
-                    if failure and failure.recovery_handled:
-                        finish_item(False, failure.message)
-                        return None, failure.message
+                    if failure or transcription.startswith("转录失败"):
+                        reason = failure.message if failure else transcription
+                        context = getattr(self.ai.gateway._tls, "recovery_context", None)
+                        if context and not failure:
+                            context.last_error = {"message": reason, "stage": "content_description", "task_key": "content_description"}
+                        finish_item(False, reason)
+                        return None, reason
 
                 # 仅在所有需恢复的AI请求完成后执行一次持久副作用。
                 ai_data = self.ai.apply_tag_normalization(ai_data, source_path=video_path, persist_pending=False)
@@ -5228,7 +5386,23 @@ class VideoOrganizerService:
 
     def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None,
                      custom_pattern: Optional[str] = None, regex_find: Optional[str] = None,
-                     regex_replace: Optional[str] = "", date_value: Optional[str] = None) -> List[Dict]:
+                     regex_replace: Optional[str] = "", date_value: Optional[str] = None,
+                     progress_callback=None) -> List[Dict]:
+        with self.db.reuse_connection():
+            return self._batch_rename(dry_run, selected_paths, custom_pattern, regex_find, regex_replace, date_value, progress_callback)
+
+    def _remap_work_scope(self, changes):
+        """原地文件操作后同步显式范围和排除集，目录范围自然保持有效。"""
+        if not changes:
+            return
+        mapping = {normalize_work_path(old): new for old, new in changes.items()}
+        self._work_scope_paths = dedupe_scope_paths([mapping.get(normalize_work_path(p), p) for p in self._work_scope_paths])
+        self._work_scope_exclusions = {normalize_work_path(mapping.get(normalize_work_path(p), p)) for p in self._work_scope_exclusions}
+        self.invalidate_video_memory_cache()
+        self.persist_work_scope_if_enabled()
+
+    def _batch_rename(self, dry_run=False, selected_paths=None, custom_pattern=None,
+                      regex_find=None, regex_replace="", date_value=None, progress_callback=None):
         """批量重命名，支持自定义模式和正则表达式"""
         logger.info(f"开始批量重命名 (模拟模式: {dry_run})")
         videos = self.db.get_all_videos()
@@ -5237,11 +5411,14 @@ class VideoOrganizerService:
             return []
 
         items_to_rename = videos
-        if selected_paths:
-            items_to_rename = [item for item in videos if item.get("path") in selected_paths]
+        if selected_paths is not None:
+            selected_set = set(selected_paths)
+            items_to_rename = [item for item in videos if item.get("path") in selected_set]
 
         # 建立当前目录索引以增加查找成功率
-        file_index = FileManager.get_file_index(os.getcwd())
+        # 大部分源路径仍存在，无需每次遍历整个程序目录。仅缺失时懒加载兼容查找索引。
+        file_index = None
+        path_changes = {}
 
         success_count = 0
         failed_items = []
@@ -5249,8 +5426,14 @@ class VideoOrganizerService:
         preview_results = []
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        for item in items_to_rename:
-            physical_path = self.find_physical_file(item, file_index)
+        last_progress = 0.0
+        for processed, item in enumerate(items_to_rename):
+            if progress_callback and time.monotonic() - last_progress >= 0.1:
+                progress_callback(processed, len(items_to_rename))
+                last_progress = time.monotonic()
+            if not os.path.exists(item.get("path") or "") and file_index is None:
+                file_index = FileManager.get_file_index(os.getcwd())
+            physical_path = self.find_physical_file(item, file_index or {})
             if not physical_path or not os.path.exists(physical_path):
                 message = f"未找到物理文件: {item.get('filename')}"
                 self.log(message)
@@ -5349,6 +5532,7 @@ class VideoOrganizerService:
                 history_recorded = True
                 original_item = dict(item)
                 self.db.update_video_path(physical_path, target_path, status="renamed")
+                path_changes[item["path"]] = target_path
                 success_count += 1
             except Exception as e:
                 # 数据库历史/路径更新失败时，立即补偿物理重命名；补偿失败则明确留下人工处理项。
@@ -5385,6 +5569,7 @@ class VideoOrganizerService:
                 self.log(f"重命名失败 {current_fn}: {e}")
 
         if not dry_run:
+            self._remap_work_scope(path_changes)
             self.file_manager.save_results_to_csv(self.db.get_all_videos())
             self.log(f"重命名完成！成功: {success_count}")
         else:
@@ -5395,6 +5580,8 @@ class VideoOrganizerService:
             "failed_count": len(failed_items),
             "failed_items": list(failed_items),
         }
+        if progress_callback:
+            progress_callback(len(items_to_rename), len(items_to_rename))
         return preview_results
 
     def rollback_last_session(self) -> bool:
@@ -5407,6 +5594,7 @@ class VideoOrganizerService:
 
         history = self.db.get_history_by_session(session_id)
         restored = 0
+        path_changes = {}
         failures = []
         for record in reversed(history):
             old_path, new_path = record["old_path"], record["new_path"]
@@ -5433,6 +5621,7 @@ class VideoOrganizerService:
                 if not rows:
                     raise ValueError("素材库中找不到目标路径记录")
                 self.db.update_video_path(new_path, old_path, status="analyzed")
+                path_changes[new_path] = old_path
                 restored += 1
                 if xmp_issue:
                     failures.append(f"{new_path}：视频已恢复，但{xmp_issue}")
@@ -5440,6 +5629,7 @@ class VideoOrganizerService:
                 failures.append(f"{new_path}：{exc}")
                 self.log(f"回滚失败 {new_path}: {exc}")
 
+        self._remap_work_scope(path_changes)
         complete = bool(history) and restored == len(history) and not failures
         self._last_rollback_result = {
             "session_id": session_id,

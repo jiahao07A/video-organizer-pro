@@ -222,7 +222,7 @@ class VideoCatalog:
 
         if query.recovery_filter in ("unresolved", "exhausted", "ever"):
             condition = {"unresolved": " AND r.state<>'recovered'", "exhausted": " AND r.state='exhausted'", "ever": ""}[query.recovery_filter]
-            clauses.append("EXISTS (SELECT 1 FROM video_recovery r WHERE r.video_id=videos.id" + condition + ")")
+            clauses.append("EXISTS (SELECT 1 FROM video_recovery r JOIN analysis_failure_index f ON f.video_id=r.video_id WHERE f.ever400=1 AND r.video_id=videos.id" + condition + ")")
 
         if query.text:
             needle = f"%{_escape_like(query.text.lower())}%"
@@ -312,24 +312,26 @@ class VideoCatalog:
         clauses: List[str] = []
         params: List[str] = []
         column = _sql_path_key()
+        files = []
         for raw in scope_paths:
             path = str(raw).strip()
             if not path:
                 continue
             absolute = _path_key(path)
             if os.path.isfile(path):
-                clauses.append(f"{column} = ?")
-                params.append(absolute)
+                files.append(absolute)
                 continue
             _, ext = os.path.splitext(path)
             if not os.path.isdir(path) and ext.lower() in VIDEO_EXTENSIONS:
-                clauses.append(f"{column} = ?")
-                params.append(absolute)
+                files.append(absolute)
             else:
                 separator = "/" if os.name == "nt" else os.sep
                 prefix = absolute.rstrip(separator) + separator
                 clauses.append(f"({column} = ? OR {column} LIKE ? ESCAPE '\\')")
                 params.extend([absolute, _escape_like(prefix) + "%"])
+        if files:
+            clauses.append(f"{column} IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(files, ensure_ascii=False))
         if not clauses:
             return "1 = 0", []
         return "(" + " OR ".join(clauses) + ")", params

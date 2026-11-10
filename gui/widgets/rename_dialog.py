@@ -211,7 +211,7 @@ class BatchRenameDialog(QDialog):
         category = item.get("category", "Other")
         tags = item.get("tags", [])
         tags_str = "_".join(tags)
-        summary_safe = FileManager.sanitize_filename(item.get("summary", ""), max_len=50)
+        summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
 
         current_fn = os.path.basename(str(item.get("path") or "")) or item.get("filename", "")
         raw_parts = current_fn.split("-")
