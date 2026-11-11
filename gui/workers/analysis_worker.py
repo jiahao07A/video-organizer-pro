@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from core.diagnostic_logging import bind_worker, worker_run, worker_exception
 from PySide6.QtCore import QThread, Signal, Qt
 from core.video_organizer_service import VideoOrganizerService
 import time
@@ -38,6 +39,7 @@ class AnalysisWorker(QThread):
 
     def __init__(self, service: VideoOrganizerService, input_path, force_reanalyze: bool = False, recovery_options=None):
         super().__init__()
+        bind_worker(self)
         self.service = service
         self.input_path = input_path
         self.force_reanalyze = force_reanalyze
@@ -95,6 +97,7 @@ class AnalysisWorker(QThread):
         msg = snap.get("message") or ""
         self.progress_updated.emit(op, msg)
 
+    @worker_run
     def run(self):
         try:
             self._saw_snapshot = False
@@ -118,4 +121,5 @@ class AnalysisWorker(QThread):
             else:
                 self.task_finished.emit(True, "分析任务已完成")
         except Exception as e:
+            worker_exception()
             self.task_finished.emit(False, f"分析出错: {str(e)}")

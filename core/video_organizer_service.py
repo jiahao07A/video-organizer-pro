@@ -16,6 +16,7 @@ import threading
 import csv
 import hashlib
 import logging
+from core.diagnostic_logging import traced, trace_item, event, register_private_path, register_settings, get_runtime, contextual, in_context
 import sys
 import numpy as np
 import subprocess
@@ -557,7 +558,7 @@ class DatabaseManager:
                 conn.commit()
 
     def execute_query(self, query: str, params: tuple = ()) -> List[Dict]:
-        logger.debug(f"执行 SQL 查询: {query[:100]}... | 参数: {params}")
+        event('database.query', statement=str(query).split()[0], parameter_count=len(params or ()))
         with self.lock:
             with self._managed_connection() as conn:
                 cursor = conn.cursor()
@@ -566,7 +567,7 @@ class DatabaseManager:
                 return [dict(row) for row in rows]
 
     def execute_non_query(self, query: str, params: tuple = ()):
-        logger.debug(f"执行 SQL 修改: {query[:100]}... | 参数: {params}")
+        event('database.write', statement=str(query).split()[0], parameter_count=len(params or ()))
         with self.lock:
             with self._managed_connection() as conn:
                 cursor = conn.cursor()
@@ -1375,6 +1376,7 @@ class SettingsManager:
         return settings
 
     @staticmethod
+    @traced('settings.save')
     def save_settings(
         settings: Dict,
         db: Optional[DatabaseManager] = None,
@@ -1382,6 +1384,7 @@ class SettingsManager:
     ):
         """保存完整嵌套配置到 settings.json，并写入数据库 settings_blob。"""
         import copy
+        register_settings(settings)
         resolved_settings_path = SettingsManager._settings_path(db, settings_path)
         if settings is not None:
             try:
@@ -1468,7 +1471,8 @@ class VideoProcessor:
     def extract_frames(self, video_path: str, max_frames: int = 10, target_size: int = 512,
                        save_thumbnail: bool = False, use_scene_detection: bool = True,
                        thumbnails_dir: Optional[str] = None) -> Dict[str, Any]:
-        logger.debug(f"开始抽取视频帧: {video_path} (最大帧数: {max_frames})")
+        item_id = register_private_path(video_path)
+        event('media.extract_start', item_id=item_id, max_frames=max_frames, target_size=target_size)
         if not os.path.exists(video_path):
             logger.warning(f"文件不存在: {video_path}")
             return {"frames": [], "thumbnail": None, "phash": ""}
@@ -1488,10 +1492,14 @@ class VideoProcessor:
                 scene_manager.detect_scenes(video)
                 scene_list = scene_manager.get_scene_list()
             except Exception:
-                pass
+                logger.debug('media.scene_detection_failed', exc_info=True)
 
         cap = cv2.VideoCapture(video_path)
         try:
+            try:
+                event('media.properties', item_id=item_id, extension=os.path.splitext(video_path)[1], size_bytes=os.path.getsize(video_path), width=cap.get(cv2.CAP_PROP_FRAME_WIDTH), height=cap.get(cv2.CAP_PROP_FRAME_HEIGHT), fps=cap.get(cv2.CAP_PROP_FPS), frame_count=cap.get(cv2.CAP_PROP_FRAME_COUNT), codec=cap.get(cv2.CAP_PROP_FOURCC), opened=cap.isOpened() if hasattr(cap, 'isOpened') else None)
+            except (OSError, AttributeError, ValueError):
+                logger.debug('media.properties_unavailable', exc_info=True)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total_frames <= 0: total_frames = 1000
             
@@ -1540,9 +1548,10 @@ class VideoProcessor:
                     if base64_str:
                         base64_frames.append(base64_str)
         except Exception:
-            pass
+            logger.warning('media.extract_failed', exc_info=True)
         finally:
             cap.release()
+        event('media.extract_end', item_id=item_id, extracted_frames=len(base64_frames))
             
         return {"frames": base64_frames, "thumbnail": thumbnail_path, "phash": phash}
 
@@ -1604,6 +1613,7 @@ class AudioTranscriber:
         except RecoveryDeferred:
             raise
         except Exception as e:
+            logger.warning('media.transcription_failed', exc_info=True)
             return f"转录失败 (请确保已安装 ffmpeg): {e}"
 
 
@@ -2963,6 +2973,7 @@ class VideoOrganizerService:
         self.persist_work_scope_if_enabled()
         return True
 
+    @traced('catalog.scan')
     def scan_and_register_work_scope(self) -> List[str]:
         """
         扫描当前工作范围内的视频文件并入库。
@@ -3038,7 +3049,11 @@ class VideoOrganizerService:
                     logger.warning(f"入库缩略图失败 {abs_path}: {e}")
 
             with ThreadPoolExecutor(max_workers=extract_workers) as executor:
-                list(executor.map(_thumb_one, to_thumb))
+                futures = [executor.submit(contextual(in_context),
+                           {"item_id": register_private_path(rec["path"])}, _thumb_one, rec)
+                           for rec in to_thumb]
+                for future in futures:
+                    future.result()
 
         if registered:
             # 新入库后让下次 get_all_videos 从 DB 刷新完整记录
@@ -3533,6 +3548,7 @@ class VideoOrganizerService:
             tag_config_payload=self.tag_config,
         )
 
+    @traced('storage.backup')
     def backup_configuration(self) -> str:
         """创建数据库与配套配置的一致性快照，不包含原始视频。"""
         try:
@@ -3544,6 +3560,7 @@ class VideoOrganizerService:
             self.log(f"备份失败: {exc}", force_ui=True)
             return ""
 
+    @traced('storage.restore')
     def restore_configuration(self, backup_folder_name: str) -> bool:
         """校验并恢复管理数据；失败时自动回滚当前数据。"""
         try:
@@ -3584,6 +3601,7 @@ class VideoOrganizerService:
             return True
         return False
 
+    @traced('media.storyboard')
     def generate_storyboard(self, video_path: str, output_path: str, max_frames: int = 12) -> bool:
         """生成视频故事板 (PDF)"""
         if not HAS_IMAGEHASH: # 借用这个判断 PIL 是否可用，或者直接 try
@@ -4359,6 +4377,7 @@ class VideoOrganizerService:
         except Exception:
             pass
 
+    @traced('catalog.update_metadata')
     def update_video_metadata(self, path: str, updates: Dict):
         """更新视频元数据并持久化到数据库"""
         videos = self.db.get_all_videos()
@@ -4541,6 +4560,7 @@ class VideoOrganizerService:
         except Exception as e:
             logger.warning(f"写入失败状态失败 {video_path}: {e}")
 
+    @traced('analysis.run')
     def run_analysis(self, input_path, *, force_reanalyze=False, recovery_mode=None,
                      recovery_override=None, selected_fallback=None, manual_options=None, cancel_event=None):
         lock = getattr(self, "_analysis_run_lock", None)
@@ -5085,6 +5105,7 @@ class VideoOrganizerService:
             "job_id": getattr(metrics, "job_id", ""),
         }
 
+    @trace_item
     def _process_single_video(
         self,
         video_path: str,
@@ -5384,6 +5405,7 @@ class VideoOrganizerService:
                 return index[sid]
         return None
 
+    @traced('files.rename')
     def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None,
                      custom_pattern: Optional[str] = None, regex_find: Optional[str] = None,
                      regex_replace: Optional[str] = "", date_value: Optional[str] = None,
@@ -5584,6 +5606,7 @@ class VideoOrganizerService:
             progress_callback(len(items_to_rename), len(items_to_rename))
         return preview_results
 
+    @traced('files.rollback')
     def rollback_last_session(self) -> bool:
         """尽力回滚上一次重命名会话，并准确报告完整或部分恢复。"""
         session_id = self.db.get_last_session_id()
@@ -5649,6 +5672,7 @@ class VideoOrganizerService:
             )
         return complete
 
+    @traced('export.fcpx')
     def export_to_fcpx_xml(self, output_path: str, selected_paths: Optional[List[str]] = None):
         """导出 FCPX XML；selected_paths 限定导出集合（None 表示调用方已筛好则应显式传入）。"""
         videos = (
@@ -5683,6 +5707,7 @@ class VideoOrganizerService:
             f.write(xml_content)
         self.log(f"已导出 FCPX XML: {output_path}")
 
+    @traced('export.ale')
     def export_to_ale(self, output_path: str, selected_paths: Optional[List[str]] = None):
         """
         导出 Avid Log Exchange (ALE) 文件，专门用于达芬奇 (DaVinci Resolve) 的元数据导入。
@@ -5733,6 +5758,7 @@ class VideoOrganizerService:
             self.log(f"导出 ALE 失败: {e}")
             return False
 
+    @traced('export.xmp')
     def sync_metadata_to_xmp(
         self,
         selected_paths: Optional[List[str]] = None,
@@ -6021,6 +6047,7 @@ class VideoOrganizerService:
             != os.path.normcase(os.path.normpath(step["new_path"]))
         ]
 
+    @traced('files.organize')
     def execute_physical_migration(
         self,
         target_root: str,

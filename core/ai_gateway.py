@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
+import uuid
+from core.diagnostic_logging import event, anonymous, register_settings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -58,6 +61,8 @@ def _error_message(error: BaseException) -> str:
             "AI 服务拒绝了本次图像输入（HTTP 400，image_url unsafe）。"
             "不能据此判定素材损坏；是否重试取决于400恢复设置。请核查服务端图像审核/接口限制。"
         )
+    if type(error).__module__.split('.')[0] in {'openai', 'httpx', 'httpcore', 'requests'}:
+        return f"AI 接口错误（HTTP {_status_code(error) or 'unavailable'}，{type(error).__name__}）"
     return message[:200] + ("…" if len(message) > 200 else "")
 
 
@@ -108,7 +113,7 @@ def _message_content(response: Any) -> Any:
     if content is None:
         refusal = message.get("refusal") if isinstance(message, dict) else getattr(message, "refusal", None)
         if refusal:
-            raise AiResponseError(f"模型拒绝返回内容: {_content_to_text(refusal)}")
+            raise AiResponseError("模型拒绝返回内容（response_refused）")
         raise AiResponseError("empty body")
     text = _content_to_text(content)
     if not text.strip():
@@ -160,6 +165,7 @@ class AiRequestGateway:
         timeout: float = DEFAULT_AI_TIMEOUT_SECONDS,
     ) -> None:
         self.settings = settings
+        register_settings(settings)
         self.timeout = float(timeout)
         self.metrics_recorder = metrics_recorder
         self._clients: Dict[Tuple[str, str, str], Any] = {}
@@ -438,6 +444,11 @@ class AiRequestGateway:
                 return None
 
             attempt += 1
+            register_settings(self.settings)
+            request_id = uuid.uuid4().hex
+            started = time.monotonic()
+            request_fields = dict(request_id=request_id, task=task_key, model=use_model, provider=anonymous(route.get('provider_id', '')), attempt=attempt, interface='chat', json_mode=include_response_format, input_parts=len(content_parts), input_chars=sum(len(str(p)) for p in content_parts))
+            event('api.request', **request_fields)
             logger.info(
                 "正在调用 AI 模型: %s (任务: %s, JSON 模式: %s, 尝试 %s)",
                 use_model,
@@ -460,6 +471,7 @@ class AiRequestGateway:
                 response = use_client.chat.completions.create(**kwargs)
                 content = _message_content(response)
                 result = _parse_json_content(content) if json_mode else content
+                event('api.success', **request_fields, elapsed_ms=round((time.monotonic() - started) * 1000), server_request_id=getattr(response, '_request_id', None), usage={k: getattr(getattr(response, 'usage', None), k, None) for k in ('prompt_tokens', 'completion_tokens', 'total_tokens')})
                 if context:
                     context.record(success=True)
                 self._set_failure(None)
@@ -471,6 +483,8 @@ class AiRequestGateway:
                 )
                 return result
             except Exception as error:
+                event('api.failed', 40, **request_fields, elapsed_ms=round((time.monotonic() - started) * 1000), status_code=_status_code(error), server_request_id=getattr(error, 'request_id', None), error_type=type(error).__name__, retryable=is_retriable(error))
+                logger.debug('api.exception', exc_info=True)
                 message = _error_message(error)
                 if context:
                     from core.analysis_recovery import redact
@@ -502,19 +516,19 @@ class AiRequestGateway:
                         model=str(use_model or ""),
                         task_key=task_key or "",
                         ok=False,
-                        error=message,
+                        error=type(error).__name__,
                         retriable=False,
                     )
                     continue
 
                 retriable = is_retriable(error)
-                logger.error("AI API 调用出错: %s", message)
+                logger.error("AI API 调用出错: %s (HTTP %s)", type(error).__name__, _status_code(error))
                 self._record_metrics(
                     attempt=attempt,
                     model=str(use_model or ""),
                     task_key=task_key or "",
                     ok=False,
-                    error=message,
+                    error=type(error).__name__,
                     retriable=retriable,
                 )
                 if context and context.handle_failure(error, manual=getattr(context, "manual", False)):
@@ -563,7 +577,7 @@ class AiRequestGateway:
                 return None
             model = route_override.get("model") or model
         elif task_key and use_client is None:
-            use_client, _ = self.client_for_task(task_key)
+            use_client, route = self.client_for_task(task_key)
         if use_client is None:
             use_client = self.default_client()
 
@@ -576,6 +590,11 @@ class AiRequestGateway:
                 self._failure_and_return("用户取消", retriable=False, cancelled=True)
                 return None
             attempt += 1
+            register_settings(self.settings)
+            request_id = uuid.uuid4().hex
+            started = time.monotonic()
+            request_fields = dict(request_id=request_id, task=task_key, model=model, provider=anonymous(route.get('provider_id', '')), attempt=attempt, interface='audio')
+            event('api.request', **request_fields)
             try:
                 with path.open("rb") as audio_file:
                     if context and not context.before_request():
@@ -590,6 +609,7 @@ class AiRequestGateway:
                 text = _content_to_text(response).strip()
                 if not text:
                     raise AiResponseError("empty transcription")
+                event('api.success', **request_fields, elapsed_ms=round((time.monotonic() - started) * 1000), output_chars=len(text))
                 if context:
                     context.record(success=True)
                 self._set_failure(None)
@@ -601,6 +621,8 @@ class AiRequestGateway:
                 )
                 return text
             except Exception as error:
+                event('api.failed', 40, **request_fields, elapsed_ms=round((time.monotonic() - started) * 1000), status_code=_status_code(error), error_type=type(error).__name__, retryable=is_retriable(error))
+                logger.debug('api.exception', exc_info=True)
                 message = _error_message(error)
                 if context:
                     from core.analysis_recovery import redact
@@ -616,7 +638,7 @@ class AiRequestGateway:
                     model=model,
                     task_key=task_key,
                     ok=False,
-                    error=message,
+                    error=type(error).__name__,
                     retriable=retriable,
                 )
                 if context and context.handle_failure(error, manual=getattr(context, "manual", False)):

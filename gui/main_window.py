@@ -225,9 +225,12 @@ class MainWindow(QMainWindow):
         preset_layout.addWidget(preset_label)
         preset_layout.addWidget(self.preset_combo)
         sidebar_layout.addLayout(preset_layout)
-        sidebar_layout.addSpacing(20)
+        sidebar_layout.addSpacing(6)
 
         footer_layout = QVBoxLayout()
+        self.feedback_btn = QPushButton("问题反馈 / 发布 Issue")
+        self.feedback_btn.clicked.connect(self.show_diagnostic_feedback)
+        footer_layout.addWidget(self.feedback_btn)
         
         self.theme_btn = QPushButton("🌓 切换主题")
         self.theme_btn.clicked.connect(self.toggle_theme)
@@ -257,6 +260,11 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("准备就绪")
+        self._diagnostic_warning = ''
+        self._diagnostic_timer = QTimer(self)
+        self._diagnostic_timer.setInterval(5000)
+        self._diagnostic_timer.timeout.connect(self._check_diagnostic_health)
+        self._diagnostic_timer.start()
 
         self.global_progress = QProgressBar()
         self.global_progress.setMaximumWidth(200)
@@ -271,6 +279,24 @@ class MainWindow(QMainWindow):
             self.settings, "ui_preferences.detail_panel_expanded", True
         )
         self.workstation_page.detail_panel.setVisible(bool(expanded))
+
+    def _check_diagnostic_health(self):
+        from core.diagnostic_logging import get_runtime
+        runtime = get_runtime()
+        if runtime and runtime.warning and runtime.warning != self._diagnostic_warning:
+            self._diagnostic_warning = runtime.warning
+            self.feedback_btn.setToolTip(runtime.warning)
+            self.status_bar.showMessage(runtime.warning)
+
+    def show_diagnostic_feedback(self):
+        from gui.widgets.diagnostic_feedback import DiagnosticFeedbackDialog
+        dialog = getattr(self, '_feedback_dialog', None)
+        if dialog is None:
+            dialog = DiagnosticFeedbackDialog(self.service, self)
+            self._feedback_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _ensure_page(self, index: int):
         """首次进入时创建页面，并保留页面实例供后续切换复用。"""

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.model_providers import list_providers, resolve_task_route
+from core.diagnostic_logging import contextual
 
 
 DEFAULT_POLICY = {
@@ -373,7 +374,7 @@ class RecoveryContext:
         return True
 
     def record(self, error=None, *, success=False, compatibility=False):
-        from core.ai_gateway import _status_code
+        from core.ai_gateway import _status_code, _error_message
         code = _status_code(error) if error else None
         body = getattr(error, "body", None)
         if isinstance(body, dict) and isinstance(body.get("error"), dict):
@@ -381,10 +382,12 @@ class RecoveryContext:
         error_code = str(body.get("code") or "") if isinstance(body, dict) else ""
         detail = {"provider_id": self.route.get("provider_id", ""), "model": self.route.get("model", ""),
                   "task_key": self.task_key, "status_code": code, "error_code": error_code,
-                  "message": redact(error, [r.get("api_key") for r in self.routes]),
+                  "message": redact(_error_message(error) if error else '', [r.get("api_key") for r in self.routes]),
                   "request_id": redact(getattr(error, "request_id", "")),
                   "success": success, "compatibility": compatibility}
         if error:
+            # 排除规则仍匹配本次原始错误；正文不进入持久历史或诊断日志。
+            self._error_match_message = str(error)
             detail["exception_type"] = type(error).__name__
             detail["stage"] = self.task_key
             self.last_error = detail
@@ -419,7 +422,7 @@ class RecoveryContext:
                 return True
             for rule in self.policy["exclusions"]:
                 if all((str(self.last_error.get(k, "")).lower() == v.lower()) if k != "keyword"
-                       else v.lower() in self.last_error.get("message", "").lower() for k, v in rule.items()):
+                       else v.lower() in getattr(self, '_error_match_message', self.last_error.get("message", "")).lower() for k, v in rule.items()):
                     self.store.state(self, "excluded")
                     return True
         if self.used >= self.policy["request_budget"]:
@@ -474,7 +477,7 @@ class RecoveryScheduler:
                         yield path, None, "用户取消"
                 while queue and len(futures) < max_workers and queue[0][0] <= self.clock() and not cancelled:
                     _, _, path = heapq.heappop(queue)
-                    futures[executor.submit(process, path)] = path
+                    futures[executor.submit(contextual(process), path)] = path
                 if not futures:
                     if queue:
                         self.cancel_event.wait(min(0.1, max(0, queue[0][0] - self.clock())))

@@ -47,7 +47,7 @@ class UpdateState(str, Enum):
 
 
 def version(value: str) -> Version:
-    if not isinstance(value, str) or not re.fullmatch(r"v?\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\d+)?", value):
+    if not isinstance(value, str) or not re.fullmatch(r"v?\d+\.\d+\.\d+(?:-?(?:rc|alpha|beta)\d+)?", value):
         raise UpdateError("版本号格式不受支持")
     try:
         return Version(value.removeprefix("v"))

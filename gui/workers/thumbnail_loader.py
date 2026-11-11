@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+from core.diagnostic_logging import bind_worker, worker_run, worker_exception
 from PySide6.QtCore import QObject, Signal, QRunnable, QSize, Qt
 from PySide6.QtGui import QImage, QImageReader
 
@@ -9,11 +10,13 @@ class ThumbnailLoaderSignals(QObject):
 class ThumbnailLoader(QRunnable):
     def __init__(self, path, target_size, video_path=None):
         super().__init__()
+        bind_worker(self)
         self.video_path = video_path
         self.path = path
         self.target_size = target_size
         self.signals = ThumbnailLoaderSignals()
 
+    @worker_run
     def run(self):
         image = QImage()
         try:
@@ -32,6 +35,7 @@ class ThumbnailLoader(QRunnable):
                         # 保持旧库引用有效，避免下一次启动反复生成。
                         image.save(self.path)
         except Exception:
+            worker_exception()
             image = QImage()
         finally:
             # 失败也必须结束loading状态，避免一直空白且无法重新加载。

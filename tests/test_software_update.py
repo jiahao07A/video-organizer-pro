@@ -12,6 +12,11 @@ import core.software_update as updates
 from core.software_update import ReleaseInfo, UpdateError, UpdateSession, release_candidates, verify_installer
 
 
+def test_compact_rc_version_matches_legacy_and_preserves_order():
+    assert updates.version('0.0.1rc7') == updates.version('v0.0.1-rc7')
+    assert updates.version('0.0.1-rc6') < updates.version('0.0.1rc7') < updates.version('0.0.1')
+
+
 def test_version_order_and_legacy_rc_flags():
     releases = [candidate("v0.0.3-rc1"), candidate("v0.0.10"), candidate("v0.0.4"),
                 candidate("v0.0.11", draft=True), candidate("v0.0.12", complete=False),

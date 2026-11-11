@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from core.diagnostic_logging import bind_worker, worker_run, worker_exception
 from PySide6.QtCore import QThread, Signal
 
 
@@ -15,13 +16,16 @@ class TagAiWorker(QThread):
 
     def __init__(self, fn: Callable[[], Any], parent=None):
         super().__init__(parent)
+        bind_worker(self)
         self._fn = fn
 
+    @worker_run
     def run(self) -> None:
         try:
             result = self._fn()
             self.finished_ok.emit(result)
         except Exception as e:
+            worker_exception()
             self.failed.emit(str(e) or e.__class__.__name__)
 
 
@@ -65,6 +69,7 @@ def run_tag_ai_job(
         try:
             w.setEnabled(False)
         except Exception:
+            worker_exception()
             pass
 
     worker = TagAiWorker(fn, parent)
@@ -74,6 +79,7 @@ def run_tag_ai_job(
         try:
             progress.close()
         except Exception:
+            worker_exception()
             pass
         for w in widgets:
             try:
