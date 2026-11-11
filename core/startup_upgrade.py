@@ -1,6 +1,8 @@
 """启动时管理数据检查与一次性旧结果导入。"""
 from __future__ import annotations
 
+from core.diagnostic_logging import traced
+
 import hashlib
 import json
 import logging
@@ -305,6 +307,7 @@ class StartupUpgradeCoordinator:
             report=plan.report(),
         )
 
+    @traced()
     def execute(
         self,
         *,

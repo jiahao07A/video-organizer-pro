@@ -114,6 +114,11 @@ class AnalysisMetricsTracker:
         return self._m.job_id
 
     def _event(self, kind: str, **kwargs: Any) -> None:
+        from core.diagnostic_logging import event, register_private_path, sanitize
+        if kwargs.get('path'):
+            kwargs['item_id'] = register_private_path(kwargs.pop('path'))
+        kwargs = sanitize(kwargs)
+        event('analysis.' + kind, job_id=self.job_id, **kwargs)
         ev = {
             "t": datetime.now().isoformat(timespec="milliseconds"),
             "kind": kind,
@@ -163,7 +168,7 @@ class AnalysisMetricsTracker:
     def record_item_start(self, path: str = "") -> None:
         with self._lock:
             self._m.item_starts += 1
-        self._event("item_start", path=os.path.basename(path) if path else "")
+        self._event("item_start", path=path if path else "")
 
     def record_item_attempt(self, attempt_b: int, path: str = "") -> None:
         with self._lock:
@@ -173,7 +178,7 @@ class AnalysisMetricsTracker:
         self._event(
             "item_attempt",
             attempt_b=attempt_b,
-            path=os.path.basename(path) if path else "",
+            path=path if path else "",
         )
 
     def record_item_result(
@@ -189,7 +194,7 @@ class AnalysisMetricsTracker:
         self._event(
             "item_result",
             ok=ok,
-            path=os.path.basename(path) if path else "",
+            path=path if path else "",
             reason=(reason or "")[:160],
             extract_fail=extract_fail,
         )
@@ -251,8 +256,12 @@ def default_log_dir() -> str:
     configured = os.environ.get("VIDEO_ORGANIZER_ANALYSIS_LOG_DIR")
     if configured:
         return os.path.abspath(configured)
-    base = os.path.abspath(".")
-    return os.path.join(base, "logs", "analysis_jobs")
+    from core.diagnostic_logging import get_runtime
+    runtime = get_runtime()
+    if runtime:
+        return str(runtime.directory / 'analysis_jobs')
+    from core.data_directory import DataDirectoryManager
+    return os.path.join(DataDirectoryManager().resolve_active_paths().root, 'logs', 'analysis_jobs')
 
 
 def persist_job_metrics(
@@ -263,7 +272,8 @@ def persist_job_metrics(
     """写入 JSON 汇总 + 追加 JSONL 事件；返回主 JSON 路径。"""
     d = log_dir or default_log_dir()
     os.makedirs(d, exist_ok=True)
-    snap = tracker.snapshot()
+    from core.diagnostic_logging import sanitize, get_runtime
+    snap = sanitize(tracker.snapshot())
     job_id = snap.get("job_id") or "unknown"
     json_path = os.path.join(d, f"job_{job_id}.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -286,13 +296,28 @@ def persist_job_metrics(
         "cancelled": snap.get("cancelled"),
         "force_reanalyze": snap.get("force_reanalyze"),
     }
+    if os.path.exists(index_path) and os.path.getsize(index_path) >= 1024 * 1024:
+        os.replace(index_path, index_path + '.1')
     with open(index_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(slim, ensure_ascii=False) + "\n")
+    runtime = get_runtime()
+    if runtime:
+        if runtime.lock.acquire(timeout=0.05):
+            try:
+                runtime.prune()
+            finally:
+                runtime.lock.release()
+        else:
+            runtime.warning = '日志清理繁忙，分析指标已保存，清理延后执行。'
     return json_path
 
 
 def setup_analysis_file_logging(log_dir: Optional[str] = None) -> str:
     """为 VideoOrganizer logger 增加 analysis 专用滚动文件（幂等）。"""
+    from core.diagnostic_logging import initialize, get_runtime
+    if not log_dir:
+        runtime = get_runtime() or initialize()
+        return str(runtime.directory / f'events-{runtime.session_id}.jsonl')
     import logging
     from logging.handlers import RotatingFileHandler
 
@@ -308,13 +333,17 @@ def setup_analysis_file_logging(log_dir: Optional[str] = None) -> str:
         log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     fh.setLevel(logging.INFO)
+    from core.diagnostic_logging import sanitize
+    class SafeFormatter(logging.Formatter):
+        def format(self, record):
+            return str(sanitize(super().format(record)))
     fh.setFormatter(
-        logging.Formatter(
+        SafeFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
     fh._analysis_job_file = True  # type: ignore[attr-defined]
     root.addHandler(fh)
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.DEBUG)
     return log_path

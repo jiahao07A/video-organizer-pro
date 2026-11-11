@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import subprocess
+from core.diagnostic_logging import event, register_private_path
 
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtWidgets import (
@@ -111,10 +112,12 @@ class MediaPreviewWidget(QWidget):
         self._player.positionChanged.connect(self._on_position)
         self._player.durationChanged.connect(self._on_duration)
         self._player.playbackStateChanged.connect(self._on_state)
+        self._player.errorOccurred.connect(lambda error, message: event('media.decode_failed', 40, item_id=register_private_path(self._path), error=str(error), message=message))
         self._set_volume(self.volume_slider.value())
         self._set_speed()
 
     def set_media(self, path: str | None):
+        event('media.select', item_id=register_private_path(path), readable=bool(path and os.path.isfile(path)))
         self.stop()
         self._path = path if path and os.path.isfile(path) else None
         self.play_btn.setEnabled(bool(self._path) and HAS_MULTIMEDIA)
@@ -132,6 +135,7 @@ class MediaPreviewWidget(QWidget):
             self.play_btn.setText("播放")
 
     def toggle_play(self):
+        event('media.toggle_play', item_id=register_private_path(self._path))
         if not HAS_MULTIMEDIA or not self._player or not self._path:
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:

@@ -17,19 +17,23 @@ from core.software_update import (
     read_signed_release, release_candidates, require_space, update_cache, verify_installer, version,
 )
 from core.storage_backup import write_json_atomic
+from core.diagnostic_logging import bind_worker, worker_run, worker_exception
 
 
 class UpdateJob(QThread):
     def __init__(self, operation, parent):
         super().__init__(parent)
+        bind_worker(self)
         self.operation = operation
         self.result = None
         self.error = ""
 
+    @worker_run
     def run(self):
         try:
             self.result = self.operation()
         except Exception as exc:
+            worker_exception()
             self.error = str(exc) or type(exc).__name__
 
 
@@ -85,6 +89,8 @@ class UpdateController(QObject):
         return self.state in (UpdateState.CHECKING, UpdateState.DOWNLOADING, UpdateState.PREPARING) or bool(self.job and self.job.isRunning())
 
     def _set(self, state, message):
+        from core.diagnostic_logging import event
+        event('update.state', state=str(state), message=message)
         self.state, self.message = state, message
         self.changed.emit()
 

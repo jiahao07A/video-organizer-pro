@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from core.diagnostic_logging import bind_worker, worker_run, worker_exception
 from PySide6.QtCore import QThread, Signal
 from core.video_organizer_service import VideoOrganizerService
 
@@ -10,6 +11,7 @@ class RenameWorker(QThread):
     def __init__(self, service: VideoOrganizerService, dry_run=True, selected_paths=None,
                  pattern=None, regex_find=None, regex_replace="", rename_date=None):
         super().__init__()
+        bind_worker(self)
         self.service = service
         self.dry_run = dry_run
         self.selected_paths = selected_paths
@@ -18,6 +20,7 @@ class RenameWorker(QThread):
         self.regex_replace = regex_replace
         self.rename_date = rename_date
 
+    @worker_run
     def run(self):
         previous_log = self.service.on_log
         try:
@@ -44,6 +47,7 @@ class RenameWorker(QThread):
             msg = "模拟重命名完成" if self.dry_run else "重命名应用完成"
             self.task_finished.emit(True, msg)
         except Exception as e:
+            worker_exception()
             self.task_finished.emit(False, f"重命名出错: {str(e)}")
         finally:
             self.service.on_log = previous_log

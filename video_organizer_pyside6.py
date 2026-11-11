@@ -11,6 +11,11 @@ import os
 # 确保当前目录在路径中
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+if __name__ == '__main__':
+    from core.diagnostic_logging import initialize, install_exception_hooks
+    initialize().enable_native_crashes()
+    install_exception_hooks()
+
 from video_organizer_app import main
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """统一管理数据目录、启动定位记录和可恢复目录搬迁。"""
 from __future__ import annotations
 
+from core.diagnostic_logging import traced
+
 import hashlib
 import json
 import os
@@ -441,6 +443,7 @@ class DataDirectoryManager:
         self.write_locator(paths.root)
         return paths
 
+    @traced()
     def migrate_legacy(self, target_root: Optional[str] = None) -> DataPaths:
         """将程序旁旧布局复制到 data/ 或指定目录，成功验证后才激活。"""
         inspection = self.inspect()
@@ -451,6 +454,7 @@ class DataDirectoryManager:
             target_root=target_root or self.default_root,
         )
 
+    @traced()
     def migrate_active(self, target_root: str) -> DataPaths:
         """复制当前活动数据目录到空目标，验证后写入定位记录。"""
         inspection = self.inspect()
@@ -463,6 +467,7 @@ class DataDirectoryManager:
             raise DataDirectoryError("当前数据目录没有可搬迁的管理数据")
         return self._copy_and_activate(source_root=source_root, target_root=target_root)
 
+    @traced()
     def migrate_root(
         self,
         source_root: str,
@@ -660,6 +665,7 @@ class DataDirectoryManager:
         except StorageBackupError as exc:
             raise DataDirectoryError(f"迁移前备份失败: {exc}") from exc
 
+    @traced()
     def open_existing(self, root: str) -> DataPaths:
         """显式打开目标已有目录；不与当前目录合并。"""
         return self.activate_existing(root)

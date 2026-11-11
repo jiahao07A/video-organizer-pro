@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from core.diagnostic_logging import bind_worker, worker_run, worker_exception
 from PySide6.QtCore import QThread, Signal
 
 
@@ -15,13 +16,16 @@ class IoWorker(QThread):
 
     def __init__(self, fn: Callable[[], Any], parent=None):
         super().__init__(parent)
+        bind_worker(self)
         self._fn = fn
 
+    @worker_run
     def run(self) -> None:
         try:
             result = self._fn()
             self.task_finished.emit(True, result)
         except Exception as e:
+            worker_exception()
             self.task_finished.emit(False, str(e) or e.__class__.__name__)
 
 
@@ -52,24 +56,14 @@ def run_io_job(
     parent._io_worker = worker
 
     def _ok(result):
-        try:
-            on_ok(result)
-        finally:
-            worker.deleteLater()
-            if getattr(parent, "_io_worker", None) is worker:
-                parent._io_worker = None
+        on_ok(result)
 
     def _err(msg):
-        try:
-            if on_fail:
-                on_fail(str(msg) if not isinstance(msg, str) else msg)
-            else:
-                from PySide6.QtWidgets import QMessageBox
-                QMessageBox.warning(parent, "任务失败", str(msg) or "未知错误")
-        finally:
-            worker.deleteLater()
-            if getattr(parent, "_io_worker", None) is worker:
-                parent._io_worker = None
+        if on_fail:
+            on_fail(str(msg) if not isinstance(msg, str) else msg)
+        else:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(parent, "任务失败", str(msg) or "未知错误")
 
     def _finished(ok, payload):
         if ok:
@@ -78,10 +72,16 @@ def run_io_job(
             _err(payload)
 
     worker.task_finished.connect(_finished)
+    def cleanup():
+        if getattr(parent, '_io_worker', None) is worker:
+            parent._io_worker = None
+        worker.deleteLater()
+    worker.finished.connect(cleanup)
     if hasattr(parent, "status_label") and busy_message:
         try:
             parent.status_label.setText(busy_message)
         except Exception:
+            worker_exception()
             pass
     worker.start()
     return worker

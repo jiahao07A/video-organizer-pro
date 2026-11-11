@@ -1,6 +1,8 @@
 """一致性管理数据快照与受控恢复。"""
 from __future__ import annotations
 
+from core.diagnostic_logging import traced
+
 import hashlib
 import json
 import logging
@@ -109,6 +111,7 @@ class StorageBackupManager:
         self.settings_payload = settings_payload
         self.tag_config_payload = tag_config_payload
 
+    @traced()
     def create_backup(self) -> str:
         """创建完整快照并返回快照目录；失败时不留下可见半成品。"""
         with self.io_lock:
@@ -170,6 +173,7 @@ class StorageBackupManager:
         backup_path = self._resolve_backup_path(backup_ref)
         return self._validate_backup_directory(backup_path)
 
+    @traced()
     def restore(self, backup_ref: str) -> str:
         """恢复快照，返回恢复前自动保护的快照目录。
 

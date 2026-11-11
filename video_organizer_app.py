@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
 import sys
+from core.diagnostic_logging import initialize, install_exception_hooks, install_qt_logging, event, bind_worker, worker_run, worker_exception, traced
+
+if __name__ == '__main__':
+    initialize().enable_native_crashes()
+    install_exception_hooks()
 
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtWidgets import (
@@ -24,13 +29,16 @@ from gui.startup_upgrade_dialog import StartupUpgradeDialog
 class _DataDirectoryWorker(QThread):
     def __init__(self, operation):
         super().__init__()
+        bind_worker(self)
         self.operation = operation
         self.error = ""
 
+    @worker_run
     def run(self) -> None:
         try:
             self.operation()
         except Exception as exc:
+            worker_exception()
             self.error = str(exc) or exc.__class__.__name__
 
 
@@ -91,6 +99,7 @@ def _choose_alternate_data_directory(manager: DataDirectoryManager) -> bool:
         return False
 
 
+@traced('startup.data_directory')
 def _prepare_data_directory() -> bool:
     """启动前处理旧布局和默认目录权限；不静默丢弃或覆盖旧管理数据。"""
     manager = DataDirectoryManager()
@@ -173,6 +182,7 @@ def _prepare_data_directory() -> bool:
         return False
 
 
+@traced('startup.upgrade')
 def _prepare_startup_upgrade(app: QApplication) -> bool:
     """在创建主窗口前完成旧结果升级确认；取消时不打开半成品服务。"""
     try:
@@ -204,7 +214,12 @@ def _prepare_startup_upgrade(app: QApplication) -> bool:
 
 
 def main():
+    runtime = initialize()
+    install_exception_hooks()
+    runtime.enable_native_crashes()
+    install_qt_logging()
     app = QApplication(sys.argv)
+    app.aboutToQuit.connect(runtime.close)
     from core.app_version import APP_VERSION
     from core.update_runtime import hold_application_mutex, pending_startup_session
     from core.software_update import UpdateError, update_cache
@@ -217,21 +232,28 @@ def main():
         return 1
 
     if not _prepare_data_directory():
+        event('startup.data_directory_failed')
         return 1
+    runtime.relocate(__import__('pathlib').Path(DataDirectoryManager().resolve_active_paths().root) / 'logs')
 
     if not _prepare_startup_upgrade(app):
+        event('startup.upgrade_failed')
         return 1
 
     # 初始化服务层；此时旧 JSON 若存在，已经完成确认、导入、验证和记录。
     try:
         service = VideoOrganizerService()
     except Exception as exc:
+        __import__('logging').getLogger('VideoOrganizer.startup').exception('startup.service_failed')
         QMessageBox.critical(None, "应用启动失败", str(exc))
         return 1
 
     # 启动主窗口
     window = MainWindow(service)
     window.show()
+    event('startup.window_ready')
+    if runtime.warning:
+        QMessageBox.warning(window, '诊断日志不可写', runtime.warning)
     if update_session and update_session.is_pending:
         try:
             message = update_session.reconcile(APP_VERSION, service._data_paths.root)
