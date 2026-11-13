@@ -110,6 +110,9 @@ class MaterialLibraryView(QWidget):
         toolbar.addWidget(self.view_switch_btn)
         toolbar.addWidget(self.delete_btn)
         toolbar.addWidget(self.add_scope_btn)
+        reviewed = QPushButton('标记已核对')
+        reviewed.clicked.connect(self.mark_selected_reviewed)
+        toolbar.addWidget(reviewed)
         from gui.widgets.recovery_controls import add_recovery_toolbar
         add_recovery_toolbar(self, toolbar, layout)
         layout.addLayout(toolbar)
@@ -440,6 +443,10 @@ class MaterialLibraryView(QWidget):
             self._list_no_refreshing = False
 
     def load_data(self):
+        from core.watch_config import normalize_watch_config
+        tasks = normalize_watch_config(self.service.settings.get('processing', {}).get('media_watch', {}))['directories']
+        self.model.watch_task_names = {task['id']: task['name'] for task in tasks}
+        self.filter_panel.refresh_watch_tasks()
         self._query_pending = True
         self._load_query_page(reset=True)
 
@@ -524,6 +531,11 @@ class MaterialLibraryView(QWidget):
     def _resolve_batch_targets(self) -> list:
         """素材库操作目标：返回当前快照中的实际路径。"""
         return list(self._resolve_batch_snapshot().target_paths)
+
+    def mark_selected_reviewed(self):
+        self.service.media_registry.mark_reviewed(self._resolve_batch_targets())
+        self.service.invalidate_video_memory_cache()
+        self.load_data()
 
     def uncatalog_selected(self):
         """素材库删除 = 取消入库（操作目标集）。"""

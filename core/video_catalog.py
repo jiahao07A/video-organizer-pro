@@ -25,6 +25,9 @@ LIST_COLUMNS = (
     "tags",
     "tag_groups",
     "status",
+    "is_missing",
+    "source_kind", "source_task_id", "source_batch_id", "review_state",
+    "duplicate_of", "duplicate_group", "duplicate_original_version", "fingerprint_state", "content_version",
     "thumbnail",
     "timestamp",
 )
@@ -151,6 +154,12 @@ class VideoQuery:
     order_by: str = "timestamp"
     descending: bool = True
     recovery_filter: str = ""
+    source_kind: str = ""
+    watch_task_id: str = ""
+    watch_batch_id: str = ""
+    review_state: str = ""
+    duplicate_role: str = ""
+    watch_stage: str = ""
 
     @classmethod
     def from_filter_params(
@@ -189,6 +198,12 @@ class VideoQuery:
             order_by=order_by,
             descending=descending,
             recovery_filter=str(p.get("recovery_filter") or ""),
+            source_kind=str(p.get('source_kind') or ''),
+            watch_task_id=str(p.get('watch_task_id') or ''),
+            watch_batch_id=str(p.get('watch_batch_id') or ''),
+            review_state=str(p.get('review_state') or ''),
+            duplicate_role=str(p.get('duplicate_role') or ''),
+            watch_stage=str(p.get('watch_stage') or ''),
         )
 
 
@@ -219,6 +234,23 @@ class VideoCatalog:
     def _where(self, query: VideoQuery) -> Tuple[str, List[Any]]:
         clauses: List[str] = []
         params: List[Any] = []
+        for field in ('source_kind', 'review_state'):
+            if getattr(query, field):
+                clauses.append(f'{field}=?')
+                params.append(getattr(query, field))
+        if query.watch_task_id:
+            clauses.append('(source_task_id=? OR EXISTS(SELECT 1 FROM media_watch_items wi WHERE wi.video_id=videos.id AND wi.task_id=?))')
+            params.extend((query.watch_task_id, query.watch_task_id))
+        if query.watch_batch_id:
+            clauses.append('EXISTS(SELECT 1 FROM media_watch_items wi WHERE wi.video_id=videos.id AND wi.batch_id=?)')
+            params.append(query.watch_batch_id)
+        if query.watch_stage:
+            clauses.append('EXISTS(SELECT 1 FROM media_watch_items wi WHERE wi.video_id=videos.id AND wi.stage=?)')
+            params.append(query.watch_stage)
+        if query.duplicate_role == 'copy':
+            clauses.append('duplicate_of IS NOT NULL')
+        elif query.duplicate_role == 'original':
+            clauses.append("duplicate_of IS NULL AND duplicate_group<>''")
 
         if query.recovery_filter in ("unresolved", "exhausted", "ever"):
             condition = {"unresolved": " AND r.state<>'recovered'", "exhausted": " AND r.state='exhausted'", "ever": ""}[query.recovery_filter]

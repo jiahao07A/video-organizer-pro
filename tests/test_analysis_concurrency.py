@@ -55,7 +55,7 @@ def test_32_analysis_jobs_reach_http_service_concurrently(tmp_path, monkeypatch)
         paths = []
         for i in range(32):
             path = tmp_path/f'{i}.mp4'
-            path.write_bytes(b'synthetic')
+            path.write_bytes(f'synthetic-{i}'.encode())
             paths.append(str(path))
         service.db.insert_videos_if_absent([{'path': p, 'filename': Path(p).name, 'status': 'pending'} for p in paths])
         monkeypatch.setattr(service.ai.gateway, '_client_for_route', lambda *_: client)

@@ -6,7 +6,7 @@ if __name__ == '__main__':
     initialize().enable_native_crashes()
     install_exception_hooks()
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -250,7 +250,19 @@ def main():
 
     # 启动主窗口
     window = MainWindow(service)
+    app.aboutToQuit.connect(lambda: window.media_monitor.stop(shutdown_analysis=True))
+    if "--background" not in sys.argv[1:]:
+        try:
+            from core.media_watch import set_windows_startup, should_start_with_windows
+            watch_settings = service.settings.get("processing", {}).get("media_watch", {}) or {}
+            set_windows_startup(should_start_with_windows(watch_settings))
+        except OSError as exc:
+            __import__('logging').getLogger('VideoOrganizer.startup').warning(
+                'Windows 登录启动设置无法写入: %s', exc
+            )
     window.show()
+    if "--background" in sys.argv[1:] and window._tray_available:
+        QTimer.singleShot(0, window.hide)
     event('startup.window_ready')
     if runtime.warning:
         QMessageBox.warning(window, '诊断日志不可写', runtime.warning)

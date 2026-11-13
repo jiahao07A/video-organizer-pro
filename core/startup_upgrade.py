@@ -23,7 +23,7 @@ from core.storage_backup import write_json_atomic
 
 logger = logging.getLogger("VideoOrganizer.startup")
 
-CURRENT_DATABASE_VERSION = 3
+CURRENT_DATABASE_VERSION = 5
 COMPLETION_METADATA_KEY = "legacy_json_import"
 DEFAULT_BATCH_SIZE = 200
 MAX_REPORT_ITEMS = 100
@@ -174,6 +174,19 @@ def inspect_database_file(
             required |= {"video_recovery", "video_recovery_policy", "video_recovery_rounds", "video_recovery_attempts"}
         if version >= 3:
             required |= {"analysis_failure_index", "analysis_failure_diagnoses"}
+        if version >= 4:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(videos)").fetchall()
+            }
+            if "is_missing" not in columns:
+                raise DatabaseValidationError("数据库 videos 表缺少 is_missing 字段")
+        if version >= 5:
+            required |= {'media_content_groups', 'media_content_versions', 'media_discoveries',
+                         'media_watch_state', 'media_watch_baseline', 'media_watch_batches', 'media_watch_items'}
+            from core.media_registry import VIDEO_COLUMNS
+            if not set(VIDEO_COLUMNS).issubset(columns):
+                raise DatabaseValidationError('数据库缺少素材内容身份和监控字段')
         missing = sorted(required - tables)
         if missing:
             raise DatabaseValidationError(
@@ -269,7 +282,7 @@ class StartupUpgradeCoordinator:
                 return UpgradeResult(
                     status=UpgradeStatus.NEEDS_CONFIRMATION,
                     database_path=self.database_path, json_path=self.json_path,
-                    message="需要备份并升级数据库，以支持视频400恢复记录。",
+                    message="需要备份并升级数据库，以支持当前素材状态与监控功能。",
                     report={"schema_upgrade": True, "database_version": database.version},
                 )
             return UpgradeResult(
@@ -349,7 +362,7 @@ class StartupUpgradeCoordinator:
                 inspect_database_file(self.database_path, verify_integrity=True)
                 return UpgradeResult(status=UpgradeStatus.COMPLETED,
                     database_path=self.database_path, json_path=self.json_path,
-                    backup_path=backup_path, message="数据库400恢复记录升级完成。",
+                    backup_path=backup_path, message="数据库素材状态升级完成。",
                     report={"database_version": CURRENT_DATABASE_VERSION})
             except Exception as exc:
                 return self._failure(f"数据库升级失败，原数据及备份保留：{exc}", backup_path=backup_path)

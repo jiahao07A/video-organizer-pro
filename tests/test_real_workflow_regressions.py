@@ -37,10 +37,13 @@ def test_updates_do_not_consume_future_library_ids(service, tmp_path, batch):
     assert service.db.get_video_by_path(str(tmp_path / 'next.mp4'))['id'] == 41
 
 def test_import_analyze_rename_rollback_then_import_keeps_ids(service, tmp_path):
+    from core.media_registry import full_hash
+    # 本用例包含改名，内容身份必须使用真实字节而非共享替身的路径字符串。
+    service.media_registry.hasher = full_hash
     paths = []
     for i in range(80):
         path = tmp_path / f'{i:04}.mp4'
-        path.write_bytes(b'synthetic')
+        path.write_bytes(f'synthetic-{i}'.encode())
         paths.append(str(path))
     # 入库缩略图回写同样经过真实upsert路径，不需要媒体解码或外网请求。
     service.processor.extract_frames = lambda *a, **kw: {'thumbnail': str(tmp_path / 'synthetic.webp')}

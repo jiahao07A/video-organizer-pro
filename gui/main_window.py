@@ -2,19 +2,25 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame,
     QLabel, QListWidget, QListWidgetItem, QStackedWidget,
-    QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox, QDialog
+    QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox, QDialog,
+    QSystemTrayIcon, QMenu, QApplication
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtWidgets import QStyle
+from PySide6.QtGui import QAction
 from .views.workstation import WorkstationView
 
 from .views.material_library import MaterialLibraryView
 from .views.tags_library import TagsView
 from .views.settings import SettingsView
+from .views.media_watch_workspace import MediaWatchWorkspace
 from .styles import get_main_style, normalize_theme
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 
 
 class MainWindow(QMainWindow):
+    media_watch_status = Signal(dict)
+
     def __init__(self, service: VideoOrganizerService):
         super().__init__()
         self.service = service
@@ -29,6 +35,16 @@ class MainWindow(QMainWindow):
         self._update_preparing = False
         self._update_exiting = False
         self._update_notice = None
+        self._allow_exit = False
+        self._close_accepted = False
+        self._monitor_paused = False
+        self.media_watch_status.connect(self._refresh_media_watch_settings)
+        from core.media_watch import MediaDirectoryMonitor
+        self.media_monitor = MediaDirectoryMonitor(
+            service, SettingsManager.get_setting(service.settings, "processing.media_watch", {}),
+            on_status=self._media_watch_status_changed,
+        )
+        self.service.media_monitor = self.media_monitor
         
         self.setWindowTitle("Video Organizer Pro (PySide6)")
         self.resize(1400, 900)
@@ -42,6 +58,8 @@ class MainWindow(QMainWindow):
             pass
 
         self.setup_ui()
+        self._setup_tray()
+        self._start_media_monitor()
         self.refresh_style()
         self.apply_sidebar_width()
         if self._pending_scope_scan:
@@ -124,9 +142,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         from gui.views.settings import _window_has_active_background_work
         if self._update_exiting:
+            self._allow_exit = True
+            self.media_monitor.stop(shutdown_analysis=True)
+            self._close_accepted = True
             event.accept()
             return
-        if self._update_preparing or _window_has_active_background_work(self):
+        if self._update_preparing or self.media_monitor.analysis_running or _window_has_active_background_work(self):
             QMessageBox.warning(self, "任务尚未结束", "请等待后台任务完成后再退出；分析可先使用“取消分析”。")
             event.ignore()
             return
@@ -145,7 +166,94 @@ class MainWindow(QMainWindow):
             return
         if self._update_notice:
             self._update_notice.close()
-        event.accept()
+        if self._allow_exit or not self._tray_available:
+            self.media_monitor.stop(shutdown_analysis=True)
+            self._close_accepted = True
+            event.accept()
+        else:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "Video Organizer Pro", "应用已最小化到托盘，素材监控仍在运行。",
+                QSystemTrayIcon.Information, 3500,
+            )
+
+    def _setup_tray(self):
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        QApplication.instance().setQuitOnLastWindowClosed(not self._tray_available)
+        if not self._tray_available:
+            self.tray_icon = None
+            return
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        self.tray_icon.setToolTip("Video Organizer Pro")
+        self.tray_icon.activated.connect(lambda reason: self._show_window() if reason == QSystemTrayIcon.DoubleClick else None)
+        menu = QMenu(self)
+        open_action = QAction("打开主窗口", self)
+        open_action.triggered.connect(self._show_window)
+        self.monitor_action = QAction("暂停素材监控", self)
+        self.monitor_action.triggered.connect(self._toggle_monitor)
+        exit_action = QAction("彻底退出", self)
+        exit_action.triggered.connect(self._exit_application)
+        menu.addAction(open_action)
+        menu.addAction(self.monitor_action)
+        menu.addSeparator()
+        menu.addAction(exit_action)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.show()
+
+    def _start_media_monitor(self):
+        if any(item["enabled"] for item in self.media_monitor.config["directories"]):
+            self.media_monitor.start()
+
+    def _reconfigure_media_monitor(self):
+        config = SettingsManager.get_setting(self.service.settings, "processing.media_watch", {}) or {}
+        self.media_monitor.reconfigure(config)
+        self._monitor_paused = False
+        if hasattr(self, "monitor_action"):
+            self.monitor_action.setText("暂停素材监控")
+        if self.settings_page and self.settings_page.media_watch_page:
+            self.settings_page.media_watch_page.refresh()
+        if self.library_page:
+            self.library_page.filter_panel.refresh_watch_tasks()
+
+    def _media_watch_status_changed(self, _status):
+        self.media_watch_status.emit(_status)
+
+    def _refresh_media_watch_settings(self, _status=None):
+        # 工作区自身按秒刷新；文件事件不得重载未保存的高级设置。
+        if _status and _status.get('notify') and self.tray_icon:
+            self.tray_icon.showMessage('素材监控', _status.get('error') or '监控批次处理完成，可在素材监控中查看结果。')
+
+    def _show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _toggle_monitor(self):
+        self._monitor_paused = not self._monitor_paused
+        if self._monitor_paused:
+            self.media_monitor.pause()
+            self.monitor_action.setText("恢复素材监控")
+        else:
+            self.media_monitor.resume()
+            self.monitor_action.setText("暂停素材监控")
+
+    def _exit_application(self):
+        if self.update_controller.busy or self._update_preparing:
+            self.status_bar.showMessage("更新处理中，请等待完成后再退出", 5000)
+            return
+        from gui.views.settings import _window_has_active_background_work
+        if _window_has_active_background_work(self):
+            QMessageBox.warning(self, "任务尚未结束", "请等待后台任务完成后再退出；分析可先使用“取消分析”。")
+            return
+        self._allow_exit = True
+        self._close_accepted = False
+        self.close()
+        if self._close_accepted:
+            QApplication.instance().quit()
+        else:
+            self._allow_exit = False
 
     def _kick_background_scope_scan(self):
         page = getattr(self, "workstation_page", None)
@@ -203,15 +311,17 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("📂 工作台", 0),
             ("📚 素材库", 1),
+            ("👁 素材监控", 4),
             ("🏷️ 标签库", 2),
             ("⚙️ 系统设置", 3),
         ]
-        for text, _ in nav_items:
+        for text, page_id in nav_items:
             item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, page_id)
             self.nav_list.addItem(item)
             
         self.nav_list.setCurrentRow(0)
-        self.nav_list.currentRowChanged.connect(self.switch_page)
+        self.nav_list.currentRowChanged.connect(lambda row: self.switch_page(self.nav_list.item(row).data(Qt.UserRole)) if row >= 0 else None)
         
         sidebar_layout.addWidget(self.nav_list)
         sidebar_layout.addStretch()
@@ -251,7 +361,8 @@ class MainWindow(QMainWindow):
         self.library_page = None
         self.tags_page = None
         self.settings_page = None
-        for _ in range(4):
+        self.media_watch_page = None
+        for _ in range(5):
             placeholder = QWidget()
             self._page_placeholders.append(placeholder)
             self.content_stack.addWidget(placeholder)
@@ -300,7 +411,7 @@ class MainWindow(QMainWindow):
 
     def _ensure_page(self, index: int):
         """首次进入时创建页面，并保留页面实例供后续切换复用。"""
-        attrs = ("workstation_page", "library_page", "tags_page", "settings_page")
+        attrs = ("workstation_page", "library_page", "tags_page", "settings_page", "media_watch_page")
         if index < 0 or index >= len(attrs):
             return None
         attr = attrs[index]
@@ -308,7 +419,7 @@ class MainWindow(QMainWindow):
         if page is not None:
             return page
 
-        factories = (WorkstationView, MaterialLibraryView, TagsView, SettingsView)
+        factories = (WorkstationView, MaterialLibraryView, TagsView, SettingsView, MediaWatchWorkspace)
         page = factories[index](self.service)
         placeholder = self._page_placeholders[index]
         self.content_stack.removeWidget(placeholder)
@@ -326,8 +437,14 @@ class MainWindow(QMainWindow):
             page.work_scope_changed.connect(self.workstation_page.load_data)
         elif index == 3:
             page.settings_applied.connect(self.on_settings_applied)
+            page.media_watch_changed.connect(self._reconfigure_media_monitor)
             page.ui_preferences_applied.connect(self.apply_ui_preferences)
             page.interface_layout_reset.connect(self.reset_open_list_column_widths)
+        elif index == 4:
+            page.changed.connect(self._reconfigure_media_monitor)
+            page.open_advanced.connect(self._open_watch_advanced)
+            page.work_scope_changed.connect(self.workstation_page.load_data)
+            page.status_message.connect(self.status_bar.showMessage)
 
         if hasattr(page, "apply_default_view"):
             page.apply_default_view()
@@ -341,6 +458,13 @@ class MainWindow(QMainWindow):
                 SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
             ))
         return page
+
+    def _open_watch_advanced(self, task_id=''):
+        settings = self._ensure_page(3)
+        self.nav_list.setCurrentRow(4)
+        settings.tabs.setCurrentWidget(settings.media_watch_page)
+        settings.media_watch_page.refresh()
+        settings.media_watch_page.target.setCurrentIndex(max(0, settings.media_watch_page.target.findData(task_id)))
 
     def refresh_presets(self):
         self.preset_combo.blockSignals(True)

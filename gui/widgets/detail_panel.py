@@ -84,6 +84,10 @@ class DetailPanel(QWidget):
         self._field_rows = {}
         self._field_rows["filename"] = form_layout.rowCount()
         form_layout.addRow("文件名:", self.filename_label)
+        self.management_label = QLabel()
+        self.management_label.setWordWrap(True)
+        self.management_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form_layout.addRow('入库信息:', self.management_label)
         self.recovery_detail_btn = QPushButton("分析失败详情与历史")
         self.recovery_detail_btn.clicked.connect(self.show_recovery_history)
         form_layout.addRow("分析恢复:", self.recovery_detail_btn)
@@ -192,7 +196,7 @@ class DetailPanel(QWidget):
 
     def export_tag_cloud(self):
         """导出标签统计报告 (标签云入口)"""
-        videos = self.service.get_all_videos()
+        videos = self.service.filter_processable_rows(self.service.get_all_videos())
         if not videos:
             QMessageBox.warning(self, "警告", "没有视频数据可导出。")
             return
@@ -234,6 +238,8 @@ class DetailPanel(QWidget):
     def run_ai_recommendation(self):
         """运行 AI 标签推荐"""
         if not self.current_video or isinstance(self.current_video, list):
+            return
+        if self.current_video.get('duplicate_of') or self.current_video.get('fingerprint_state') == 'review':
             return
             
         current_tags = self.tags_widget.tags
@@ -323,6 +329,7 @@ class DetailPanel(QWidget):
     def load_video_data(self, video_data):
         """填充数据到面板，支持单选或多选"""
         if isinstance(video_data, list):
+            self.management_label.clear()
             self.current_video = video_data
             count = len(video_data)
             self.batch_info.setText(f"正在批量编辑 {count} 个视频")
@@ -348,6 +355,19 @@ class DetailPanel(QWidget):
         self.transcript_input.setEnabled(True)
         
         self.filename_label.setText(video_data.get("filename", "-"))
+        from core.media_registry import management_label
+        from core.watch_config import normalize_watch_config
+        task_names = {task['id']: task['name'] for task in normalize_watch_config(self.service.settings.get('processing', {}).get('media_watch', {}))['directories']}
+        self.management_label.setText(management_label(video_data, task_names) + '\n任务：' + str(task_names.get(video_data.get('source_task_id'), video_data.get('source_task_id')) or '—') + '\n批次：' + str(video_data.get('source_batch_id') or '—'))
+        if video_data.get('duplicate_group'):
+            members = self.service.db.execute_query('SELECT id,path,content_version FROM videos WHERE file_hash=? ORDER BY id', (video_data['duplicate_group'],))
+            self.management_label.setToolTip('\n'.join(f"入库 #{row['id']} · 内容版本 {row['content_version']} · {row['path']}" for row in members))
+        else:
+            self.management_label.setToolTip('')
+        if video_data.get('duplicate_of'):
+            originals = self.service.db.execute_query('SELECT path FROM videos WHERE id=?', (video_data['duplicate_of'],))
+            self.management_label.setText(self.management_label.text() + '\n原记录：' + (originals[0]['path'] if originals else '原记录已取消入库'))
+        self.save_btn.setEnabled(not video_data.get('duplicate_of'))
         from core.analysis_failures import failure_state_label
         recovery_state = video_data.get("recovery_state")
         self.recovery_detail_btn.setText((failure_state_label(recovery_state) if recovery_state else "分析失败详情") + " · 查看历史与处理")
@@ -440,8 +460,9 @@ class DetailPanel(QWidget):
         self.summary_input.setPlainText(video_data.get("summary", ""))
         self.transcript_input.setPlainText(video_data.get("transcription", ""))
         
-        self.ai_rec_btn.setEnabled(True)
-        self.storyboard_btn.setEnabled(True)
+        processable = not video_data.get('duplicate_of') and video_data.get('fingerprint_state') != 'review'
+        self.ai_rec_btn.setEnabled(processable)
+        self.storyboard_btn.setEnabled(processable)
 
         # 素材预览
         path = video_data.get("path")

@@ -101,12 +101,10 @@ class AnalysisWorker(QThread):
     def run(self):
         try:
             self._saw_snapshot = False
-            self.service.on_log = self.handle_log
-            self.service.on_progress = self.handle_progress
-            self.service.on_analysis_snapshot = self.handle_snapshot
-
             result = self.service.run_analysis(
-                self.input_path, force_reanalyze=self.force_reanalyze, cancel_event=self.cancel_event, **self.recovery_options
+                self.input_path, force_reanalyze=self.force_reanalyze, cancel_event=self.cancel_event,
+                priority='manual', callbacks={'log': self.handle_log, 'progress': self.handle_progress,
+                                             'snapshot': self.handle_snapshot}, **self.recovery_options
             )
             # 冲刷节流中的最后一条日志/快照
             if self._pending_log:

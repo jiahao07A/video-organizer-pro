@@ -65,17 +65,20 @@ def run_io_job(
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(parent, "任务失败", str(msg) or "未知错误")
 
+    outcome = []
     def _finished(ok, payload):
-        if ok:
-            _ok(payload)
-        else:
-            _err(payload)
+        outcome[:] = [ok, payload]
 
     worker.task_finished.connect(_finished)
     def cleanup():
         if getattr(parent, '_io_worker', None) is worker:
             parent._io_worker = None
         worker.deleteLater()
+        if outcome:
+            if outcome[0]:
+                _ok(outcome[1])
+            else:
+                _err(outcome[1])
     worker.finished.connect(cleanup)
     if hasattr(parent, "status_label") and busy_message:
         try:

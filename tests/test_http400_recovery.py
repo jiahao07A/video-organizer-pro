@@ -206,7 +206,7 @@ def test_schema_upgrade_backs_up_and_preserves_data(tmp_path):
     assert result.status == UpgradeStatus.COMPLETED and result.backup_path
     assert db.get_video_by_path("v.mp4")["summary"] == "保留"
     with sqlite3.connect(db.db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_redaction_and_no_plaintext_credentials_in_history(service, tmp_path, monkeypatch):

@@ -208,32 +208,10 @@ class BatchRenameDialog(QDialog):
         return QColor(self._colors["secondary_text"])
 
     def get_preview_filename(self, item, pattern, find_regex, replace_str):
-        category = item.get("category", "Other")
-        tags = item.get("tags", [])
-        tags_str = "_".join(tags)
-        summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
-
-        current_fn = os.path.basename(str(item.get("path") or "")) or item.get("filename", "")
-        raw_parts = current_fn.split("-")
-        original_suffix = raw_parts[-1] if len(raw_parts) > 1 else current_fn
-
-        new_fn = (
-            pattern.replace("{category}", str(category))
-            .replace("{tags}", str(tags_str))
-            .replace("{summary}", str(summary_safe))
-            .replace("{emotion}", "")
-            .replace("{composition}", "")
-            .replace("{date}", self._preview_date)
-            .replace("{original_name}", str(original_suffix))
-        )
-
-        if find_regex:
-            try:
-                new_fn = re.sub(find_regex, replace_str, new_fn)
-            except re.error:
-                pass
-
-        return FileManager.sanitize_filename(new_fn, max_len=200)
+        try:
+            return self.service.rename_filename(item, pattern, find_regex, replace_str, self._preview_date)
+        except re.error:
+            return self.service.rename_filename(item, pattern, date_value=self._preview_date)
 
     def update_preview(self):
         pattern = self.pattern_input.text()

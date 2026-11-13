@@ -15,6 +15,10 @@ all_hiddenimports = [
     'PySide6.QtXml',
     'PySide6.QtMultimedia',
     'PySide6.QtMultimediaWidgets',
+    'watchdog.observers',
+    'watchdog.observers.read_directory_changes',
+    'watchdog.observers.winapi',
+    'watchdog.events',
 ]
 
 a = Analysis(

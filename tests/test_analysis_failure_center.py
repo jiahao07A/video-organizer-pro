@@ -109,7 +109,7 @@ def test_version_two_upgrade_backfills_non400_without_inventing_attempts(service
     assert not row["ever400"]
     assert service.recovery_target_paths([path]) == []
     assert list(tmp_path.glob("*.pre-recovery-*.sqlite"))
-    assert db.execute_query("PRAGMA user_version")[0]["user_version"] == 3
+    assert db.execute_query("PRAGMA user_version")[0]["user_version"] == 5
 
 
 def test_failure_center_pages_and_preserves_empty_scope(service):

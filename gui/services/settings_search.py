@@ -20,7 +20,7 @@ def build_search_index(view):
         key = key or "ui_search_" + str(len(entries))
         view._search_widget_map[key] = widget
         view._search_tab_by_key[key] = tab
-        category = category or {0:"analysis",1:"ai",2:"prompts",3:"everyday",4:"naming",5:"everyday"}[tab]
+        category = category or {0:"analysis",1:"ai",2:"prompts",3:"everyday",4:"naming",5:"everyday",6:"everyday"}[tab]
         entries.append(SettingsEntry(key,key,label,category,tuple(keywords),MANUAL,"",tab))
 
     for entry in SETTINGS_ENTRIES:

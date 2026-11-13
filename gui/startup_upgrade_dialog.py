@@ -125,8 +125,8 @@ class StartupUpgradeDialog(QDialog):
         if result.status is UpgradeStatus.NEEDS_CONFIRMATION:
             report = result.report
             if report.get("schema_upgrade"):
-                self.title_label.setText("升级视频分析恢复记录")
-                self.summary_label.setText("确认后将先备份管理数据，再升级数据库以支持400标记、历史及专属策略。原有分析结果保留。")
+                self.title_label.setText("升级素材库")
+                self.summary_label.setText("确认后将先备份管理数据，再升级素材库状态以支持素材目录监控。原有素材与分析结果保留。")
                 self.confirm_button.setText("备份并升级")
                 self.progress_bar.setVisible(False)
                 self.confirm_button.setEnabled(True)
