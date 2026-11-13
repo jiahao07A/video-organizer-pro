@@ -1,9 +1,11 @@
 # 素材目录监控与自动分析
 
-Status: awaiting-user-confirmation
+Status: resolved
 GitHub Issue: #72
 Branch: feat/72-media-watch
-PR: 待创建
+PR: https://github.com/jiahao07A/video-organizer-pro/pull/74
+
+最新权威范围见 workspace-plan.md 与 ADR-0013；下方初版方案保留作历史记录。用户于2026-11-13明确批准提交、合并与发布，最终结果见 rc8-release.md。
 
 ## 背景与目标
 
