@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QLabel, QDateEdit, QCheckBox, QPushButton, QComboBox,
+    QLineEdit,
 )
 from PySide6.QtCore import Qt, Signal, QDate
 from .checkable_combo_box import CheckableComboBox
@@ -104,6 +105,47 @@ class FilterPanel(QFrame):
         layout.addWidget(self.recovery_combo, 3, 1, 1, 2)
         reset_btn.clicked.connect(self.reset_filter)
         layout.addWidget(reset_btn, 3, 4)
+        self.source_combo = QComboBox()
+        for label, value in [('来源：全部',''), ('监控入库','watch'), ('手动入库','manual'), ('历史来源未知','unknown')]:
+            self.source_combo.addItem(label, value)
+        self.watch_task_combo = QComboBox()
+        self.watch_task_combo.addItem('全部监控任务', '')
+        if self.service:
+            from core.watch_config import normalize_watch_config
+            for task in normalize_watch_config(self.settings.get('processing', {}).get('media_watch', {}))['directories']:
+                self.watch_task_combo.addItem(task['name'], task['id'])
+        self.review_combo = QComboBox()
+        for label, value in [('核对：全部',''), ('未核对','unreviewed'), ('已核对','reviewed')]:
+            self.review_combo.addItem(label, value)
+        self.duplicate_role_combo = QComboBox()
+        for label, value in [('重复身份：全部',''), ('重复组原记录','original'), ('重复副本','copy')]:
+            self.duplicate_role_combo.addItem(label, value)
+        self.watch_stage_combo = QComboBox()
+        self.watch_stage_combo.addItem('全部监控阶段', '')
+        from gui.views.media_watch_workspace import STAGES
+        for value, label in STAGES.items():
+            self.watch_stage_combo.addItem(label, value)
+        for column, widget in enumerate((self.source_combo,self.watch_task_combo,self.review_combo,self.duplicate_role_combo,self.watch_stage_combo)):
+            widget.currentIndexChanged.connect(self.emit_filter)
+            layout.addWidget(widget, 4, column)
+        self.batch_input = QLineEdit()
+        self.batch_input.setPlaceholderText('按完整监控批次编号筛选')
+        self.batch_input.textChanged.connect(self.emit_filter)
+        layout.addWidget(self.batch_input, 5, 0, 1, 5)
+
+    def refresh_watch_tasks(self):
+        from core.watch_config import normalize_watch_config
+        selected = self.watch_task_combo.currentData()
+        self.watch_task_combo.blockSignals(True)
+        self.watch_task_combo.clear()
+        self.watch_task_combo.addItem('全部监控任务', '')
+        tasks = normalize_watch_config(self.service.settings.get('processing', {}).get('media_watch', {}))['directories'] if self.service else []
+        for task in tasks:
+            self.watch_task_combo.addItem(task['name'], task['id'])
+        if selected and self.watch_task_combo.findData(selected) < 0:
+            self.watch_task_combo.addItem('已移除任务 ' + selected[:8], selected)
+        self.watch_task_combo.setCurrentIndex(max(0, self.watch_task_combo.findData(selected)))
+        self.watch_task_combo.blockSignals(False)
 
     def apply_theme(self, theme=None):
         if theme is None:
@@ -156,6 +198,11 @@ class FilterPanel(QFrame):
         self.emit_filter()
 
     def reset_filter(self):
+        for name in ('source_combo','watch_task_combo','review_combo','duplicate_role_combo','watch_stage_combo'):
+            if hasattr(self, name):
+                getattr(self, name).setCurrentIndex(0)
+        if hasattr(self, 'batch_input'):
+            self.batch_input.clear()
         self.cat_combo.clear_items()
         for cat in self.settings.get("categories", []):
             self.cat_combo.add_item(cat)
@@ -201,5 +248,11 @@ class FilterPanel(QFrame):
             "date_end": self.date_end.date() if self.date_check.isChecked() else None,
             "alias_map": alias_map,
             "recovery_filter": self.recovery_combo.currentData() or "",
+            'source_kind': self.source_combo.currentData() if hasattr(self, 'source_combo') else '',
+            'watch_task_id': self.watch_task_combo.currentData() if hasattr(self, 'watch_task_combo') else '',
+            'review_state': self.review_combo.currentData() if hasattr(self, 'review_combo') else '',
+            'duplicate_role': self.duplicate_role_combo.currentData() if hasattr(self, 'duplicate_role_combo') else '',
+            'watch_stage': self.watch_stage_combo.currentData() if hasattr(self, 'watch_stage_combo') else '',
+            'watch_batch_id': self.batch_input.text().strip() if hasattr(self, 'batch_input') else '',
         }
         self.filterChanged.emit(params)

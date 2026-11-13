@@ -15,6 +15,7 @@ import time
 import threading
 import csv
 import hashlib
+import copy
 import logging
 from core.diagnostic_logging import traced, trace_item, event, register_private_path, register_settings, get_runtime, contextual, in_context
 import sys
@@ -27,6 +28,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Set, Union, Any, Callable
 from core.ai_gateway import AiRequestGateway
+from core.watch_config import DEFAULTS as WATCH_DEFAULTS
 from core.analysis_recovery import (RecoveryContext, RecoveryDeferred, RecoveryScheduler, RecoveryStore, effective_policy, STATE_LABELS, route_fingerprint)
 from core.background_process import hidden_process_options, quiet_ffmpeg_probe
 from core.storage_backup import (
@@ -293,6 +295,7 @@ DEFAULT_SETTINGS = {
         "enable_metadata_injection": False,
         # 分析成功后是否自动写 XMP 侧车（默认关，避免分析阶段静默改盘）
         "auto_sync_xmp_after_analysis": False,
+        "media_watch": {**WATCH_DEFAULTS, 'directories': []},
         # 分析任务重试（ADR-0005）
         "analysis_retry": {
             "call_extra_attempts": 2,
@@ -328,7 +331,7 @@ class DatabaseManager:
             # CREATE TABLE 或 ALTER TABLE 把损坏库伪装成新库。
             from core.startup_upgrade import inspect_database_file
             inspection = inspect_database_file(self.db_path)
-            if inspection.version < 3 and backup_before_upgrade:
+            if inspection.version < 5 and backup_before_upgrade:
                 # 独立DatabaseManager调用也必须先留一致性快照，不能绕过备份。
                 backup_path = self.db_path + ".pre-recovery-" + datetime.now().strftime("%Y%m%d%H%M%S%f") + ".sqlite"
                 with sqlite3.connect(self.db_path) as source, sqlite3.connect(backup_path) as target:
@@ -412,6 +415,7 @@ class DatabaseManager:
 
                 # 升级视频表 (V4.0/V5.0/V6.0 增量字段)
                 columns = [
+                    ("is_missing", "INTEGER NOT NULL DEFAULT 0"),
                     ("emotion", "TEXT"),
                     ("composition", "TEXT"),
                     ("rating", "INTEGER DEFAULT 0"),
@@ -541,6 +545,7 @@ class DatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_category_timestamp ON videos(category, timestamp DESC, id DESC)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_path ON videos(path)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_file_hash ON videos(file_hash)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_missing_hash ON videos(is_missing, file_hash)")
                 # user_version is a SQLite primitive, so startup can reject a
                 # newer database before DatabaseManager attempts any writes.
                 from core.analysis_recovery import install_schema, backfill_legacy
@@ -551,8 +556,10 @@ class DatabaseManager:
                 install_failures(conn)
                 # 既有版本即使已经是2，也可能只有普通失败文本，首次启用失败中心时补建索引。
                 backfill_failures(conn)
-                cursor.execute("PRAGMA user_version = 3")
-                if previous_version < 3:
+                from core.media_registry import install_schema as install_media_schema
+                install_media_schema(conn)
+                cursor.execute("PRAGMA user_version = 5")
+                if previous_version < 5:
                     if cursor.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                         raise RuntimeError("升级后的数据库完整性检查失败，已回滚事务")
                 conn.commit()
@@ -725,7 +732,7 @@ class DatabaseManager:
 
     def update_video_path(self, old_path: str, new_path: str, status: Optional[str] = None) -> None:
         """原地更新素材路径，避免路径变化被当成新素材再次入库。"""
-        assignments = ["path = ?", "filename = ?"]
+        assignments = ["path = ?", "filename = ?", "is_missing = 0"]
         params = [new_path, os.path.basename(new_path)]
         if status is not None:
             assignments.append("status = ?")
@@ -740,7 +747,102 @@ class DatabaseManager:
                 )
                 if cursor.rowcount != 1:
                     raise ValueError("素材库源路径记录已不存在，无法更新路径")
+                conn.execute('UPDATE media_watch_items SET path=? WHERE video_id=(SELECT id FROM videos WHERE path=?)', (new_path, new_path))
                 conn.commit()
+
+    def reconcile_monitored_paths(self, root: str, present_paths: List[str], *, recursive: bool = True,
+                                  excluded_roots: Optional[List[str]] = None, path_filter=None) -> bool:
+        """仅对一次完整扫描覆盖的目录更新素材可用状态，并返回是否有变更。"""
+        present = {self._normalized_lookup_path(path) for path in present_paths}
+        root_key = self._normalized_lookup_path(root).rstrip("/")
+        escaped_root = root_key.replace("%", "\\%").replace("_", "\\_")
+        rows = self.execute_query(
+            "SELECT path,is_missing FROM videos WHERE "
+            "lower(replace(path,char(92),'/'))=? OR "
+            "lower(replace(path,char(92),'/')) LIKE ? ESCAPE '\\'",
+            (root_key, escaped_root + "/%"),
+        )
+        exclusions = [self._normalized_lookup_path(path).rstrip("/") for path in excluded_roots or []]
+        updates = []
+        for row in rows:
+            path = row.get("path") or ""
+            key = self._normalized_lookup_path(path)
+            relative = key[len(root_key):].lstrip("/")
+            if not recursive and "/" in relative:
+                continue
+            if any(key == excluded or key.startswith(excluded + "/") for excluded in exclusions):
+                continue
+            # 被过滤规则排除的素材不属于本次扫描的可用性核对范围。
+            if path_filter is not None and not path_filter(path):
+                continue
+            missing = 0 if key in present else 1
+            if missing != int(row.get("is_missing") or 0):
+                updates.append((missing, path, 1 - missing))
+        if updates:
+            with self.lock, self._managed_connection() as conn:
+                conn.executemany("UPDATE videos SET is_missing=? WHERE path=? AND is_missing=?", updates)
+            return True
+        return False
+
+    def monitored_status_counts(self, root: str) -> Dict[str, int]:
+        root_key = self._normalized_lookup_path(root).rstrip("/")
+        escaped_root = root_key.replace("%", "\\%").replace("_", "\\_")
+        rows = self.execute_query(
+            "SELECT status,is_missing,COUNT(*) AS count FROM videos WHERE "
+            "lower(replace(path,char(92),'/'))=? OR "
+            "lower(replace(path,char(92),'/')) LIKE ? ESCAPE '\\' "
+            "GROUP BY status,is_missing",
+            (root_key, escaped_root + "/%"),
+        )
+        result = {"待处理": 0, "分析中": 0, "成功": 0, "失败": 0, "缺失": 0}
+        for row in rows:
+            if row.get("is_missing"):
+                result["缺失"] += row["count"]
+            elif row.get("status") == "pending":
+                result["待处理"] += row["count"]
+            elif row.get("status") == "processing":
+                result["分析中"] += row["count"]
+            elif row.get("status") == "failed":
+                result["失败"] += row["count"]
+            else:
+                result["成功"] += row["count"]
+        return result
+
+    def find_missing_videos_by_hash(self, file_hash: str) -> List[Dict]:
+        if not file_hash:
+            return []
+        rows = self.execute_query(
+            "SELECT * FROM videos WHERE file_hash=? AND is_missing=1", (file_hash,)
+        )
+        return [self._row_to_video_dict(row) for row in rows]
+
+    def is_path_cataloged(self, path: str) -> bool:
+        normalized = self._normalized_lookup_path(path)
+        return bool(self.execute_query(
+            "SELECT 1 FROM videos WHERE path=? OR "
+            "lower(replace(path, char(92), '/'))=? LIMIT 1",
+            (path, normalized),
+        ))
+
+    def set_video_missing(self, path: str, missing: bool) -> bool:
+        """按规范化路径更新素材缺失状态，返回是否命中记录。"""
+        normalized = self._normalized_lookup_path(path)
+        with self.lock, self._managed_connection() as conn:
+            cursor = conn.cursor()
+            target = int(missing)
+            cursor.execute(
+                "UPDATE videos SET is_missing=? WHERE path=? AND is_missing<>?",
+                (target, path, target),
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    "UPDATE videos SET is_missing=? WHERE "
+                    "lower(replace(path, char(92), '/'))=? AND is_missing<>?",
+                    (target, normalized, target),
+                )
+            changed = cursor.rowcount > 0
+            conn.commit()
+            return changed
 
     def delete_video(self, path: str):
         self.execute_non_query("DELETE FROM videos WHERE path = ?", (path,))
@@ -815,7 +917,12 @@ class DatabaseManager:
 
     def get_video_by_path(self, path: str) -> Optional[Dict]:
         """按路径取单条视频记录；不存在则返回 None。"""
-        rows = self.execute_query("SELECT * FROM videos WHERE path = ?", (path,))
+        normalized = self._normalized_lookup_path(path)
+        rows = self.execute_query(
+            "SELECT * FROM videos WHERE path = ? OR "
+            "lower(replace(path, char(92), '/')) = ? LIMIT 1",
+            (path, normalized),
+        )
         if not rows:
             return None
         return self._row_to_video_dict(rows[0])
@@ -834,7 +941,7 @@ class DatabaseManager:
             normalized = [self._normalized_lookup_path(path) for path in chunk]
             rows.extend(
                 self.execute_query(
-                    f"SELECT path, status FROM videos "
+                    f"SELECT path, status, is_missing FROM videos "
                     f"WHERE path IN ({placeholders}) OR "
                     f"lower(replace(path, char(92), '/')) IN ({placeholders})",
                     tuple(chunk) + tuple(normalized),
@@ -1637,6 +1744,15 @@ class MetadataInjector:
 
 class AIHandler:
     """AI 业务门面；具体请求传输统一由 AiRequestGateway 完成。"""
+
+    @property
+    def settings(self):
+        context = getattr(getattr(getattr(self, 'gateway', None), '_tls', None), 'recovery_context', None)
+        return context.settings if context is not None else self._settings
+
+    @settings.setter
+    def settings(self, value):
+        self._settings = value
 
     def __init__(self, settings: Dict, db: Optional[DatabaseManager] = None, tag_config: Optional[Dict] = None):
         self.settings = settings
@@ -2516,6 +2632,16 @@ def dedupe_scope_paths(paths: List[str]) -> List[str]:
 
 
 class VideoOrganizerService:
+    @property
+    def settings(self):
+        return getattr(getattr(self, '_analysis_local', None), 'settings', self._settings)
+
+    @settings.setter
+    def settings(self, value):
+        self._settings = value
+        if not hasattr(self, '_analysis_local'):
+            self._analysis_local = threading.local()
+
     """Core Service Layer: 处理所有业务逻辑"""
 
     def data_directory_inspection(self):
@@ -2716,6 +2842,11 @@ class VideoOrganizerService:
         # 测试可注入：跳过真实 sleep
         self._retry_sleeper: Optional[Callable[[float], None]] = None
         self.processor = VideoProcessor(self._thumbnail_dir)
+        from core.media_registry import MediaRegistry
+        from core.processing_queue import ProcessingQueue
+        self.media_registry = MediaRegistry(self.db, hasher=lambda path: self.processor.get_file_hash(path))
+        self.processing_queue = ProcessingQueue()
+        self._file_operation_lock = threading.RLock()
         self.ai = AIHandler(self.settings, self.db, self.tag_config)
         self.ai.analysis_cancel_event = self._analysis_cancel
         self.tag_processor = TagProcessor(self.settings, self.db)
@@ -3007,8 +3138,18 @@ class VideoOrganizerService:
                     }
                 )
 
-        to_thumb = self.db.insert_videos_if_absent(candidates)
-        registered = [row["path"] for row in to_thumb]
+        to_thumb = []
+        for path in dict.fromkeys(row['path'] for row in candidates):
+            existing = self.db.get_video_by_path(path)
+            try:
+                row = self.media_registry.register(path, source='manual')
+            except OSError as exc:
+                self.log(f"入库等待文件可读取：{path}：{exc}")
+                continue
+            if existing is None:
+                registered.append(path)
+                if not row.get('duplicate_of'):
+                    to_thumb.append(row)
 
         if to_thumb:
             extract_workers = int(
@@ -3038,13 +3179,9 @@ class VideoOrganizerService:
                     )
                     thumb = proc.get("thumbnail")
                     if thumb:
-                        self.db.upsert_video(
-                            {
-                                **rec,
-                                "thumbnail": thumb,
-                                "thumbnail_path": thumb,
-                            }
-                        )
+                        # 抽帧期间可能已改名或替换，禁止用旧路径和整行快照重新插入。
+                        self.db.execute_non_query('UPDATE videos SET thumbnail=? WHERE id=? AND content_version=? AND duplicate_of IS NULL',
+                            (self.db._thumbnail_storage_reference(thumb), rec['id'], rec['content_version']))
                 except Exception as e:
                     logger.warning(f"入库缩略图失败 {abs_path}: {e}")
 
@@ -3060,6 +3197,26 @@ class VideoOrganizerService:
             self.invalidate_video_memory_cache()
             self.log(f"工作范围扫盘：新登记 {len(registered)} 个未分析视频。")
         return registered
+
+    def filter_processable_paths(self, paths, *, record_discovery=False):
+        """所有内容处理入口共用的全库去重门禁，强制分析也不能绕过。"""
+        paths = list(dict.fromkeys(path for path in paths if path))
+        if record_discovery:
+            for path in paths:
+                if os.path.isfile(path):
+                    try:
+                        self.media_registry.register(path, source='manual')
+                    except OSError:
+                        pass
+        result = self.media_registry.eligible_paths(paths)
+        self._last_duplicate_skipped = len(paths) - len(result)
+        if self._last_duplicate_skipped:
+            self.log(f"去重检查：跳过 {self._last_duplicate_skipped} 项重复副本或内容变化待核对素材。")
+        return result
+
+    def filter_processable_rows(self, rows):
+        allowed = set(self.filter_processable_paths([row['path'] for row in rows if row.get('path')]))
+        return [row for row in rows if row.get('path') in allowed]
 
     def query_video_page(
         self,
@@ -3604,6 +3761,8 @@ class VideoOrganizerService:
     @traced('media.storyboard')
     def generate_storyboard(self, video_path: str, output_path: str, max_frames: int = 12) -> bool:
         """生成视频故事板 (PDF)"""
+        if not self.filter_processable_paths([video_path]):
+            return False
         if not HAS_IMAGEHASH: # 借用这个判断 PIL 是否可用，或者直接 try
             self.log("无法生成故事板: 未安装 PIL (Pillow)")
             return False
@@ -4380,12 +4539,15 @@ class VideoOrganizerService:
     @traced('catalog.update_metadata')
     def update_video_metadata(self, path: str, updates: Dict):
         """更新视频元数据并持久化到数据库"""
-        videos = self.db.get_all_videos()
-        for item in videos:
-            if item.get("path") == path:
-                item.update(updates)
-                self.db.upsert_video(item)
-                break
+        if not self.filter_processable_paths([path]):
+            raise ValueError('重复副本或内容变化待核对，不能修改内容标签或分析字段。')
+        item = self.db.get_video_by_path(path)
+        if item:
+            item.update(updates)
+            item['timestamp'] = datetime.now().isoformat()
+            item['manual_override'] = True
+            self.db.upsert_video(item)
+            self.invalidate_video_memory_cache()
 
     def delete_videos(self, paths: List[str]):
         """取消入库：从数据库中删除视频记录（不删磁盘文件）。"""
@@ -4431,6 +4593,8 @@ class VideoOrganizerService:
         selected_paths: Optional[List[str]] = None,
     ):
         """批量替换标签；selected_paths 限定操作目标集（None=全库，兼容旧调用）。"""
+        selected_paths = self.filter_processable_paths(selected_paths if selected_paths is not None
+            else [row['path'] for row in self.db.get_all_videos()])
         self.db.bulk_replace_tags(old_tag, new_tag, selected_paths=selected_paths)
         self.db.refresh_tag_usage_counts()
         self.invalidate_video_memory_cache()
@@ -4508,7 +4672,26 @@ class VideoOrganizerService:
         *,
         xmp_failure_sink: Optional[List[Dict[str, str]]] = None,
     ) -> int:
+        with self._file_operation_lock:
+            return self._persist_current_analysis(res, xmp_failure_sink=xmp_failure_sink)
+
+    def _persist_current_analysis(self, res, *, xmp_failure_sink=None):
         """入库；可选自动写 XMP，返回自动 XMP 失败条数。"""
+        if res.get('_content_version') is not None:
+            current = self.media_registry.register(res['path'], record_event=False)
+            if (current.get('content_version') != res['_content_version'] or current.get('duplicate_of')
+                    or current.get('fingerprint_state') == 'review'
+                    or current.get('timestamp') != res.get('_initial_timestamp')):
+                raise ValueError('分析期间素材内容或人工成果发生变化，结果未覆盖，等待人工核对。')
+        if res.pop('_inject_metadata', False):
+            res['metadata_injected'] = MetadataInjector.inject_tags(res['path'], res.get('tags', []), res.get('summary', ''))
+            if res['metadata_injected']:
+                owned = self.media_registry.register(res['path'], record_event=False, owned_content_update=True)
+                if owned.get('duplicate_of'):
+                    raise ValueError('写入内嵌元数据后内容属于重复组，停止后续处理。')
+                res['file_hash'] = owned['file_hash']
+                res['content_version'] = owned['content_version']
+                res['_content_version'] = owned['content_version']
         self.db.upsert_video(res)
         # 仅在完整缓存上按路径对齐更新，禁止写破缓存
         self._cache_put_video_row(res.get("path") or "", res)
@@ -4562,12 +4745,35 @@ class VideoOrganizerService:
 
     @traced('analysis.run')
     def run_analysis(self, input_path, *, force_reanalyze=False, recovery_mode=None,
-                     recovery_override=None, selected_fallback=None, manual_options=None, cancel_event=None):
+                     recovery_override=None, selected_fallback=None, manual_options=None, cancel_event=None,
+                     priority=None, callbacks=None, execution_options=None):
+        if priority is not None:
+            try:
+                with self.processing_queue.claim(priority, cancel_event):
+                    return self.run_analysis(input_path, force_reanalyze=force_reanalyze,
+                        recovery_mode=recovery_mode, recovery_override=recovery_override,
+                        selected_fallback=selected_fallback, manual_options=manual_options,
+                        cancel_event=cancel_event, callbacks=callbacks, execution_options=execution_options)
+            except InterruptedError:
+                count = len(input_path) if isinstance(input_path, list) else len(self.file_manager.scan_videos(input_path))
+                return {'attempted': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0,
+                        'cancelled': True, 'cancelled_count': count, 'remaining_failed_paths': [],
+                        'message': f'任务在等待执行期间已取消，共 {count} 项未派发。'}
         lock = getattr(self, "_analysis_run_lock", None)
         if lock is None:
             self._analysis_run_lock = lock = threading.Lock()
         if not lock.acquire(blocking=False):
             raise RuntimeError("已有分析任务正在运行，请等待完成或取消后再试。")
+        previous_callbacks = (self.on_log, self.on_progress, getattr(self, 'on_analysis_snapshot', None))
+        previous_settings = self.settings
+        if callbacks:
+            self.on_log = callbacks.get('log', self.on_log)
+            self.on_progress = callbacks.get('progress', self.on_progress)
+            self.on_analysis_snapshot = callbacks.get('snapshot', previous_callbacks[2])
+        self._analysis_local.settings = copy.deepcopy(previous_settings)
+        self._analysis_local.item_started = callbacks.get('item_started') if callbacks else None
+        if execution_options:
+            self.settings.setdefault('processing', {}).update(execution_options)
         try:
             # 每轮独立令牌；Worker启动前的取消不能被初始化清除。
             self._analysis_cancel = cancel_event if cancel_event is not None else threading.Event()
@@ -4589,6 +4795,11 @@ class VideoOrganizerService:
                         context.store.state(context, "interrupted")
             finally:
                 self._recovery_contexts = {}
+                self.on_log, self.on_progress, self.on_analysis_snapshot = previous_callbacks
+                if hasattr(self._analysis_local, 'settings'):
+                    del self._analysis_local.settings
+                if hasattr(self._analysis_local, 'item_started'):
+                    del self._analysis_local.item_started
                 lock.release()
 
     def get_recovery_detail(self, path):
@@ -4709,8 +4920,6 @@ class VideoOrganizerService:
 
         self.ai.analysis_cancel_event = self._analysis_cancel
         self.ai._retry_sleeper = self._retry_sleeper
-        self.ai.settings = self.settings
-
         from core.analysis_job_metrics import (
             new_job_metrics,
             persist_job_metrics,
@@ -4741,6 +4950,9 @@ class VideoOrganizerService:
             return empty
 
         all_videos = [os.path.abspath(p) for p in all_videos if p]
+        candidate_count = len(all_videos)
+        all_videos = self.filter_processable_paths(all_videos, record_discovery=True)
+        duplicate_skipped = candidate_count - len(all_videos)
         status_rows = self.db.get_video_statuses_by_paths(all_videos)
         status_map = build_path_status_map(status_rows)
         status_map_norm: Dict[str, str] = {}
@@ -4754,14 +4966,14 @@ class VideoOrganizerService:
         videos_to_process = resolve_analysis_target_paths(
             all_videos, status_map_norm, force=force_reanalyze
         )
-        skipped = len(all_videos) - len(videos_to_process)
+        skipped = candidate_count - len(videos_to_process)
 
         self.log(
             f"候选: {len(all_videos)}, 待分析: {len(videos_to_process)}, "
             f"跳过(已分析): {skipped}, 强制: {force_reanalyze}"
         )
         if not videos_to_process:
-            msg = "没有待分析视频（已分析项已跳过；可勾选「强制重新分析」）。"
+            msg = f"没有待分析视频；已跳过 {duplicate_skipped} 项重复副本或待核对素材。" if duplicate_skipped else "没有待分析视频（已分析项已跳过；可勾选「强制重新分析」）。"
             self.log(msg)
             self.on_progress(0, 0)
             return {
@@ -4769,6 +4981,7 @@ class VideoOrganizerService:
                 "succeeded": 0,
                 "failed": 0,
                 "skipped": skipped,
+                "duplicate_skipped": duplicate_skipped,
                 "message": msg,
             }
 
@@ -4800,6 +5013,9 @@ class VideoOrganizerService:
         if self._manual_recovery:
             from dataclasses import replace
             retry_cfg = replace(retry_cfg, call_extra_attempts=0, item_max_attempts=1, batch_rerun_enabled=False)
+        interval = (self._manual_options['request_interval'] if self._manual_recovery
+                    else float(self.settings.get('processing', {}).get('request_interval') or 0))
+        if interval > 0:
             gate_lock = threading.Lock()
             next_request = [0.0]
             def request_gate():
@@ -4807,7 +5023,7 @@ class VideoOrganizerService:
                     delay = next_request[0] - time.monotonic()
                     if delay > 0:
                         return delay
-                    next_request[0] = time.monotonic() + self._manual_options["request_interval"]
+                    next_request[0] = time.monotonic() + interval
                     return 0
             for ctx in contexts.values():
                 ctx.request_gate = request_gate
@@ -4872,6 +5088,7 @@ class VideoOrganizerService:
         xmp_failure_items: List[Dict[str, str]] = []
         failure_reasons: List[str] = []
         cancelled = False
+        on_item_started = getattr(self._analysis_local, 'item_started', None)
 
         def run_round(paths: List[str], *, kind: RoundKind, fallback_round=False) -> List[str]:
             """处理一轮；返回本轮仍失败的路径。"""
@@ -4892,10 +5109,15 @@ class VideoOrganizerService:
             pending = list(paths)
             def process(path):
                 ctx = contexts[path]
+                self._analysis_local.settings = ctx.settings
                 self.ai.gateway._tls.recovery_context = ctx
                 self.ai.gateway._set_failure(None)
                 self.ai._tls.last_api_failure = None
                 try:
+                    if self._analysis_cancel.is_set():
+                        return None, '用户取消'
+                    if on_item_started and on_item_started(path) is False:
+                        return None, '任务已由其他入口接管'
                     result, error = self._process_single_video(
                         path, force_reanalyze or ctx.active,
                         progress_reducer=reducer, retry_cfg=retry_cfg)
@@ -4909,6 +5131,8 @@ class VideoOrganizerService:
                     return result, error
                 finally:
                     self.ai.gateway._tls.recovery_context = None
+                    if hasattr(self._analysis_local, 'settings'):
+                        del self._analysis_local.settings
 
             def on_wait(path, ctx):
                 from core.analysis_job_policy import normalize_progress_path
@@ -5045,9 +5269,7 @@ class VideoOrganizerService:
             reducer.apply("job_cancelled")
             self._emit_analysis_snapshot(reducer, force=True)
 
-        self._save_l3_backup()
-        self.file_manager.save_results_to_csv(self.get_all_videos())
-        msg = f"分析完成：成功 {succeeded}，失败 {failed}，跳过 {skipped}。"
+        msg = f"分析完成：成功 {succeeded}，失败 {failed}，跳过 {skipped}（重复／待核对 {duplicate_skipped}）。"
         if rerun_done:
             msg += " 已执行批次补跑。"
         if cancelled:
@@ -5088,6 +5310,7 @@ class VideoOrganizerService:
         self._xmp_ctx_cache = None
         return {
             "attempted": total_target,
+            "duplicate_skipped": duplicate_skipped,
             "succeeded": succeeded,
             "failed": failed,
             "skipped": skipped,
@@ -5124,6 +5347,7 @@ class VideoOrganizerService:
             should_retry_item,
         )
 
+        initial = self.db.get_video_by_path(video_path) or {}
         cfg = retry_cfg or getattr(self, "_job_retry_config", None) or RetryConfig.from_settings(
             self.settings
         )
@@ -5288,6 +5512,11 @@ class VideoOrganizerService:
                     finish_item(False, last_reason)
                     return None, last_reason
 
+                current = self.media_registry.register(video_path, record_event=False)
+                if current.get('content_version') != initial.get('content_version') or current.get('duplicate_of') or current.get('timestamp') != initial.get('timestamp'):
+                    self.db.execute_non_query("UPDATE videos SET fingerprint_state='review' WHERE id=?", (current['id'],))
+                    finish_item(False, '分析期间内容或人工成果发生变化')
+                    return None, '分析期间内容或人工成果发生变化，等待人工核对'
                 emit_phase(AnalysisPhase.NORMALIZE, attempt_b)
                 pending_tags = list(ai_data.get("_pending_tags") or [])
                 processed_tags = ai_data.get("tags", [])
@@ -5338,19 +5567,12 @@ class VideoOrganizerService:
                                   for item in pending_tags + list(ai_data.get("_pending_tags") or []) if isinstance(item, dict)}
                 ai_data["_pending_tags"] = list(pending_by_key.values())
 
-                metadata_injected = False
-                if SettingsManager.get_setting(
-                    self.settings, "processing.enable_metadata_injection"
-                ):
-                    metadata_injected = MetadataInjector.inject_tags(
-                        video_path,
-                        ai_data.get("tags", []),
-                        ai_data.get("summary", ""),
-                    )
-
                 finish_item(True)
                 return {
                     "_analysis_side_effects": True,
+                    "_inject_metadata": bool(SettingsManager.get_setting(self.settings, 'processing.enable_metadata_injection', False)),
+                    "_content_version": current['content_version'],
+                    "_initial_timestamp": initial.get('timestamp'),
                     "path": video_path,
                     "filename": filename,
                     "file_hash": file_hash,
@@ -5362,7 +5584,7 @@ class VideoOrganizerService:
                     "timestamp": datetime.now().isoformat(),
                     "status": "analyzed",
                     "manual_override": False,
-                    "metadata_injected": metadata_injected,
+                    "metadata_injected": False,
                     "thumbnail_path": thumbnail_path,
                     "raw_metadata": ai_data,
                     "face_clusters": ai_data.get("characters", []),
@@ -5405,13 +5627,35 @@ class VideoOrganizerService:
                 return index[sid]
         return None
 
+    def rename_filename(self, item, pattern, regex_find=None, regex_replace='', date_value=None):
+        current = os.path.basename(item.get('path') or '') or item.get('filename') or ''
+        values = {
+            'category': item.get('category') or 'Other',
+            'tags': '_'.join(item.get('tags') or []),
+            'summary': FileManager.sanitize_filename(item.get('summary') or '', max_len=50),
+            'original_name': item.get('original_filename') or current,
+            'date': date_value or datetime.now().strftime('%Y%m%d'),
+            'emotion': '', 'composition': '',
+        }
+        result = pattern
+        for key, value in values.items():
+            result = result.replace('{' + key + '}', str(value))
+        if regex_find:
+            result = re.sub(regex_find, regex_replace, result)
+        result = FileManager.sanitize_filename(result, max_len=200)
+        extension = os.path.splitext(current)[1]
+        if extension and not result.lower().endswith(extension.lower()):
+            result += extension
+        return result
+
     @traced('files.rename')
     def batch_rename(self, dry_run: bool = False, selected_paths: Optional[List[str]] = None,
                      custom_pattern: Optional[str] = None, regex_find: Optional[str] = None,
                      regex_replace: Optional[str] = "", date_value: Optional[str] = None,
-                     progress_callback=None) -> List[Dict]:
-        with self.db.reuse_connection():
-            return self._batch_rename(dry_run, selected_paths, custom_pattern, regex_find, regex_replace, date_value, progress_callback)
+                     progress_callback=None, session_id=None, conflict_policy="suffix") -> List[Dict]:
+        with self._file_operation_lock, self.db.reuse_connection():
+            selected_paths = self.filter_processable_paths(selected_paths if selected_paths is not None else [r['path'] for r in self.db.get_all_videos()])
+            return self._batch_rename(dry_run, selected_paths, custom_pattern, regex_find, regex_replace, date_value, progress_callback, session_id, conflict_policy)
 
     def _remap_work_scope(self, changes):
         """原地文件操作后同步显式范围和排除集，目录范围自然保持有效。"""
@@ -5424,10 +5668,10 @@ class VideoOrganizerService:
         self.persist_work_scope_if_enabled()
 
     def _batch_rename(self, dry_run=False, selected_paths=None, custom_pattern=None,
-                      regex_find=None, regex_replace="", date_value=None, progress_callback=None):
+                      regex_find=None, regex_replace="", date_value=None, progress_callback=None, session_id=None, conflict_policy="suffix"):
         """批量重命名，支持自定义模式和正则表达式"""
         logger.info(f"开始批量重命名 (模拟模式: {dry_run})")
-        videos = self.db.get_all_videos()
+        videos = self.db.get_videos_by_paths(selected_paths) if selected_paths is not None else self.db.get_all_videos()
         if not videos:
             self.log("没有可重命名的分析结果。")
             return []
@@ -5446,16 +5690,15 @@ class VideoOrganizerService:
         failed_items = []
         self._last_rename_result = None
         preview_results = []
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
         last_progress = 0.0
         for processed, item in enumerate(items_to_rename):
             if progress_callback and time.monotonic() - last_progress >= 0.1:
                 progress_callback(processed, len(items_to_rename))
                 last_progress = time.monotonic()
-            if not os.path.exists(item.get("path") or "") and file_index is None:
-                file_index = FileManager.get_file_index(os.getcwd())
-            physical_path = self.find_physical_file(item, file_index or {})
+            # 只操作已登记的精确路径；外部同名/同内容文件保留各自身份。
+            physical_path = item.get('path')
             if not physical_path or not os.path.exists(physical_path):
                 message = f"未找到物理文件: {item.get('filename')}"
                 self.log(message)
@@ -5471,8 +5714,7 @@ class VideoOrganizerService:
             current_fn = os.path.basename(physical_path)
             
             # 提取原始文件名后缀（处理可能已经重命名过的情况）
-            raw_parts = current_fn.split("-")
-            original_suffix = raw_parts[-1] if len(raw_parts) > 1 else current_fn
+            original_suffix = item.get('original_filename') or current_fn
             
             category = item.get("category", "Other")
             tags = item.get("tags", ["无"]*5)
@@ -5488,32 +5730,7 @@ class VideoOrganizerService:
             if not pattern:
                 pattern = SettingsManager.get_setting(self.settings, "rename_pattern", "{category}-{tags}-{summary}-{original_name}")
             
-            summary_safe = FileManager.sanitize_filename(item.get("summary") or "", max_len=50)
-            
-            # V6.0: 新增日期变量
-            current_date = date_value or datetime.now().strftime("%Y%m%d")
-
-            # {emotion}/{composition} 已下线：替换为空，避免旧模板残留脏值
-            new_fn = pattern.replace("{category}", str(category))\
-                            .replace("{tags}", str(tags_str))\
-                            .replace("{summary}", str(summary_safe))\
-                            .replace("{emotion}", "")\
-                            .replace("{composition}", "")\
-                            .replace("{date}", current_date)\
-                            .replace("{original_name}", str(original_suffix))
-            
-            # 应用正则替换 (V6.0 新增)
-            if regex_find:
-                try:
-                    new_fn = re.sub(regex_find, regex_replace, new_fn)
-                except re.error as ree:
-                    logger.warning(f"正则表达式错误: {ree}")
-            
-            new_fn = FileManager.sanitize_filename(new_fn, max_len=200)
-            # 模板可能没有显式包含 original_name；扩展名属于文件格式，必须始终保留。
-            source_ext = os.path.splitext(current_fn)[1]
-            if source_ext and not new_fn.lower().endswith(source_ext.lower()):
-                new_fn = f"{new_fn}{source_ext}"
+            new_fn = self.rename_filename(item, pattern, regex_find, regex_replace, date_value)
             target_path = os.path.join(dir_name, new_fn)
             
             if os.path.normpath(physical_path) == os.path.normpath(target_path):
@@ -5532,8 +5749,13 @@ class VideoOrganizerService:
                 old_xmp = os.path.splitext(physical_path)[0] + ".xmp"
                 new_xmp = os.path.splitext(target_path)[0] + ".xmp"
                 if os.path.exists(target_path):
+                    if conflict_policy == 'review':
+                        raise FileExistsError('目标名称已存在，未执行重命名')
                     base, ext = os.path.splitext(new_fn)
-                    target_path = os.path.join(dir_name, f"{base}_dup_{int(time.time()) % 1000}{ext}")
+                    suffix = 1
+                    while os.path.exists(target_path):
+                        target_path = os.path.join(dir_name, f'{base}_dup_{suffix}{ext}')
+                        suffix += 1
                 
                 os.rename(physical_path, target_path)
                 renamed = True
@@ -5592,11 +5814,12 @@ class VideoOrganizerService:
 
         if not dry_run:
             self._remap_work_scope(path_changes)
-            self.file_manager.save_results_to_csv(self.db.get_all_videos())
             self.log(f"重命名完成！成功: {success_count}")
         else:
             self.log(f"预览完成！拟重命名: {success_count}")
         self._last_rename_result = {
+            "session_id": session_id,
+            "path_changes": dict(path_changes),
             "planned_count": len(preview_results) if dry_run else success_count + len(failed_items),
             "success_count": success_count,
             "failed_count": len(failed_items),
@@ -5607,9 +5830,13 @@ class VideoOrganizerService:
         return preview_results
 
     @traced('files.rollback')
-    def rollback_last_session(self) -> bool:
+    def rollback_last_session(self, session_id=None) -> bool:
+        with self._file_operation_lock:
+            return self._rollback_session(session_id)
+
+    def _rollback_session(self, session_id=None):
         """尽力回滚上一次重命名会话，并准确报告完整或部分恢复。"""
-        session_id = self.db.get_last_session_id()
+        session_id = session_id or self.db.get_last_session_id()
         self._last_rollback_result = None
         if not session_id:
             self.log("没有可回滚的历史记录。")
@@ -5622,6 +5849,8 @@ class VideoOrganizerService:
         for record in reversed(history):
             old_path, new_path = record["old_path"], record["new_path"]
             try:
+                if not self.filter_processable_paths([new_path]):
+                    raise ValueError('重复副本或内容变化待核对，跳过回滚')
                 if not os.path.exists(new_path):
                     raise FileNotFoundError(f"目标文件不存在：{new_path}")
                 if os.path.exists(old_path):
@@ -5680,6 +5909,10 @@ class VideoOrganizerService:
             if selected_paths is None
             else self.db.get_videos_by_paths(selected_paths)
         )
+        videos = self.filter_processable_rows(videos)
+        if not videos:
+            self.log('没有可导出的素材；重复副本和待核对素材已跳过。')
+            return False
         xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
 <fcpxml version="1.8">
@@ -5719,6 +5952,7 @@ class VideoOrganizerService:
             if selected_paths is None
             else self.db.get_videos_by_paths(selected_paths)
         )
+        videos = self.filter_processable_rows(videos)
             
         if not videos:
             self.log("没有可导出的视频数据。")
@@ -5766,6 +6000,10 @@ class VideoOrganizerService:
         video_rows: Optional[List[Dict]] = None,
         return_details: bool = False,
     ):
+        with self._file_operation_lock:
+            return self._sync_metadata_to_xmp(selected_paths, video_rows=video_rows, return_details=return_details)
+
+    def _sync_metadata_to_xmp(self, selected_paths=None, *, video_rows=None, return_details=False):
         """
         为视频生成 XMP 侧边文件，优化了达芬奇与 PR 的双重兼容性。
         V6.0: 增加对全局导出方案的支持，并支持数据库驱动的层级标签。
@@ -5780,6 +6018,7 @@ class VideoOrganizerService:
             videos = self.db.get_videos_by_paths(selected_paths)
         else:
             videos = self.db.get_all_videos()
+        videos = self.filter_processable_rows(videos)
             
         # 获取全局导出设置
         global_settings = self.tag_config.get("global_settings", {}) if self.tag_config else {}

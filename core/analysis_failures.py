@@ -322,6 +322,8 @@ def preview_retry(service, paths, *, recovery_mode="policy", recovery_override=N
     store = RecoveryStore(service.db)
     for path in dict.fromkeys(paths):
         try:
+            if hasattr(service, 'filter_processable_paths') and not service.filter_processable_paths([path]):
+                raise ValueError('重复副本或内容变化待核对，跳过重试')
             if not os.path.isfile(path) or not os.access(path, os.R_OK):
                 raise ValueError("文件不存在或不可读取")
             tasks = ["video_classification"]

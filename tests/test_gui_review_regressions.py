@@ -301,7 +301,7 @@ def test_switching_to_settings_does_not_force_window_beyond_current_height(servi
     qt_app.processEvents()
     initial_height = window.height()
 
-    window.nav_list.setCurrentRow(3)
+    window.nav_list.setCurrentRow(4)
     qt_app.processEvents()
 
     settings = window.settings_page
@@ -657,3 +657,39 @@ def test_physical_migration_preview_exclusion_uses_source_path_snapshot(
     assert [row["old_path"] for row in dialog.selected_plan()] == [second]
     assert dialog.confirm_button.isEnabled()
     dialog.close()
+
+
+def test_close_hides_to_tray_and_exit_stops_monitor(service, views, qt_app):
+    class Tray:
+        def __init__(self):
+            self.messages = []
+        def showMessage(self, *args):
+            self.messages.append(args)
+
+    window = MainWindow(service)
+    views.append(window)
+    window.show()
+    window._tray_available = True
+    window.tray_icon = Tray()
+
+    assert not window.close()
+    assert not window.isVisible()
+    assert window.tray_icon.messages
+    window._show_window()
+    assert window.isVisible()
+
+    window._allow_exit = True
+    assert window.close()
+    assert not window.media_monitor.running
+
+
+def test_main_window_starts_monitor_for_string_directory_config(service, views, tmp_path):
+    root = tmp_path / "media"
+    root.mkdir()
+    service.settings["processing"]["media_watch"]["directories"] = [str(root)]
+
+    window = MainWindow(service)
+    views.append(window)
+
+    assert window.media_monitor.running
+    window.media_monitor.stop(shutdown_analysis=True)

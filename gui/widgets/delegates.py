@@ -164,7 +164,7 @@ class CardDelegate(QStyledItemDelegate):
         super().__init__(parent)
 
     def sizeHint(self, option, index):
-        return QSize(230, 280)
+        return QSize(230, 316)
 
     def paint(self, painter, option, index):
         if not index.isValid():
@@ -172,6 +172,7 @@ class CardDelegate(QStyledItemDelegate):
 
         from gui.models.video_table import (
             COL_CATEGORY,
+            COL_MANAGEMENT,
             COL_FILENAME,
             COL_LIBRARY_ID,
             COL_LIST_NO,
@@ -262,6 +263,10 @@ class CardDelegate(QStyledItemDelegate):
             f"{category}  ·  {status}",
         )
         y += 20
+        management = index.sibling(index.row(), COL_MANAGEMENT).data(Qt.DisplayRole) or ''
+        painter.drawText(QRect(rect.left() + 15, y, rect.width() - 30, 34),
+                         Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, str(management))
+        y += 36
         if tag_parts:
             theme = _theme_from_palette(palette)
             paint_material_tag_chips(

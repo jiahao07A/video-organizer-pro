@@ -452,7 +452,7 @@ def test_sdk_failure_summary_and_metrics_do_not_contain_body(runtime, tmp_path):
 
 def test_caught_export_failure_contains_stack(runtime, tmp_path):
     from core.video_organizer_service import VideoOrganizerService
-    service = SimpleNamespace(settings={}, db=SimpleNamespace(get_all_videos=lambda: [{'filename': 'synthetic.mp4'}]), log=lambda message: logging.getLogger('VideoOrganizer').info(message))
+    service = SimpleNamespace(settings={}, db=SimpleNamespace(get_all_videos=lambda: [{'filename': 'synthetic.mp4'}]), filter_processable_rows=lambda rows: rows, log=lambda message: logging.getLogger('VideoOrganizer').info(message))
     assert VideoOrganizerService.export_to_ale(service, str(tmp_path / 'missing' / 'output.ale')) is False
     events = read_events(runtime)
     assert any(e.get('exception', {}).get('type') == 'FileNotFoundError' for e in events)
@@ -581,7 +581,8 @@ def test_real_catalog_scan_propagates_context_to_thumbnail_pool(runtime, tmp_pat
     service = SimpleNamespace(
         settings={'processing': {'extract_workers': 4}}, _work_scope_paths=[str(tmp_path)],
         file_manager=SimpleNamespace(scan_videos=lambda path: sources),
-        db=SimpleNamespace(insert_videos_if_absent=lambda rows: rows),
+        db=SimpleNamespace(get_video_by_path=lambda path: None),
+        media_registry=SimpleNamespace(register=lambda path, **_: {'path': path, 'filename': path}),
         processor=SimpleNamespace(extract_frames=extract), _thumbnail_dir=str(tmp_path),
         log=lambda message: None, invalidate_video_memory_cache=lambda: None)
     assert VideoOrganizerService.scan_and_register_work_scope(service) == sources

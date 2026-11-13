@@ -163,7 +163,7 @@ def test_application_32_workers_512_jobs(tmp_path, monkeypatch, round_index):
             paths = []
             for i in range(512):
                 path = tmp_path / f"{i}.mp4"
-                path.write_bytes(b"synthetic-only")
+                path.write_bytes(f"synthetic-only-{i}".encode())
                 paths.append(str(path))
             service.db.insert_videos_if_absent([{"path": p, "filename": Path(p).name, "status": "pending"} for p in paths])
             monkeypatch.setattr(service.processor, "extract_frames", lambda *_a, **_kw: {"frames": ["synthetic"], "thumbnail": None, "phash": ""})

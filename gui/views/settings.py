@@ -78,6 +78,7 @@ class SettingsView(QWidget):
     settings_applied = Signal()
     ui_preferences_applied = Signal()  # 普通偏好应用不触发 AI 客户端重建。
     interface_layout_reset = Signal()  # 完整布局重置成功后通知主窗口刷新现存列表列宽。
+    media_watch_changed = Signal()
 
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
@@ -191,6 +192,10 @@ class SettingsView(QWidget):
         # 5. 导出模板 (V6.0 MEGA UPDATE)
         self.tabs.addTab(self.create_export_tab(), "导出模板")
         self.tabs.addTab(self.create_update_tab(), "软件更新")
+        from .media_watch_settings import MediaWatchSettingsView
+        self.media_watch_page = MediaWatchSettingsView(self.service, self)
+        self.media_watch_page.changed.connect(self._media_watch_changed)
+        self.tabs.addTab(self.media_watch_page, "素材监控")
 
         # 所有页签建立后，为普通界面偏好绑定防抖自动保存
         self.register_autosave_widgets()
@@ -1764,6 +1769,10 @@ class SettingsView(QWidget):
         self._manual_dirty = True
         self._set_save_status("分析失败处理有改动，点击“保存所有设置”后生效")
 
+    def _media_watch_changed(self):
+        self.media_watch_page.refresh()
+        self.media_watch_changed.emit()
+
     def apply_settings(self, silent=False):
         """同步 UI 数据到 settings 字典并保存（敏感配置的明确保存区）"""
         # 模型供应商：表单 → 档案 → 任务路由 → 写穿扁平 api
@@ -1880,6 +1889,10 @@ class SettingsView(QWidget):
             self.settings = self.service.settings
             self.settings.setdefault("processing", {})["http400_recovery"] = recovery_policy
             SettingsManager.save_settings(self.settings, self.service.db)
+            from core.media_watch import set_windows_startup, should_start_with_windows
+            watch = SettingsManager.get_setting(self.settings, "processing.media_watch", {}) or {}
+            set_windows_startup(should_start_with_windows(watch))
+            self.media_watch_changed.emit()
             recovery_saved = True
             # 立即重建 AI 客户端，使 Key / Base URL / 模型配置当场生效
             if hasattr(self.service, "reload_ai_from_settings"):
@@ -1930,6 +1943,10 @@ class SettingsView(QWidget):
             self.tabs.addTab(self.create_interface_tab(), "界面")
             self.tabs.addTab(self.create_export_tab(), "导出模板")
             self.tabs.addTab(self.create_update_tab(), "软件更新")
+            from .media_watch_settings import MediaWatchSettingsView
+            self.media_watch_page = MediaWatchSettingsView(self.service, self)
+            self.media_watch_page.changed.connect(self._media_watch_changed)
+            self.tabs.addTab(self.media_watch_page, "素材监控")
             self.register_autosave_widgets()
             self._bind_manual_dirty()
             self._manual_dirty = True

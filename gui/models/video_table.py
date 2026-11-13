@@ -15,6 +15,7 @@ COL_FILENAME = 3
 COL_CATEGORY = 4
 COL_TAGS = 5
 COL_STATUS = 6
+COL_MANAGEMENT = 7
 
 DEFAULT_TABLE_COLUMN_WIDTHS = {
     COL_LIST_NO: 40,
@@ -24,6 +25,7 @@ DEFAULT_TABLE_COLUMN_WIDTHS = {
     COL_CATEGORY: 100,
     COL_TAGS: 150,
     COL_STATUS: 220,
+    COL_MANAGEMENT: 280,
 }
 
 # 表头只决定 SQL 排序；代理模型不能仅对已加载的一页重新排序。
@@ -46,8 +48,9 @@ class VideoTableModel(QAbstractTableModel):
     def __init__(self, videos=None, *, thumbnail_dir=None):
         super().__init__()
         self.thumbnail_dir = thumbnail_dir
+        self.watch_task_names = {}
         self.videos = videos or []
-        self.headers = ["#", "入库编号", "缩略图", "文件名", "分类", "标签", "状态"]
+        self.headers = ["#", "入库编号", "缩略图", "文件名", "分类", "标签", "状态", "来源 / 核对"]
         self.thumbnail_cache = OrderedDict()
         self.thumbnail_cache_limit = 256
         self.thumbnail_pool = QThreadPool()
@@ -175,10 +178,13 @@ class VideoTableModel(QAbstractTableModel):
         col = index.column()
         row = index.row()
 
-        if role == Qt.ToolTipRole and col == COL_STATUS:
+        if role == Qt.ToolTipRole and col in (COL_STATUS, COL_MANAGEMENT):
             return str(self.data(index, Qt.DisplayRole) or "")
 
         if role == Qt.DisplayRole:
+            if col == COL_MANAGEMENT:
+                from core.media_registry import management_label
+                return management_label(row_data, self.watch_task_names)
             if col == COL_LIST_NO:
                 return self._list_no_by_source_row.get(row, row + 1)
             if col == COL_LIBRARY_ID:
@@ -199,7 +205,16 @@ class VideoTableModel(QAbstractTableModel):
                         tags = []
                 return ", ".join(tags)
             if col == COL_STATUS:
+                if row_data.get('duplicate_of'):
+                    return f"重复跳过 → #{row_data['duplicate_of']}"
+                if row_data.get('fingerprint_state') == 'review':
+                    return '内容变化待核对'
                 path = row_data.get("path") or ""
+                if row_data.get("is_missing"):
+                    return "文件缺失 · " + {
+                        "pending": "未分析", "analyzed": "已分析", "renamed": "已重命名",
+                        "edited": "已编辑", "failed": "分析失败", "processing": "分析中",
+                    }.get(row_data.get("status"), row_data.get("status") or "未分析")
                 temp = getattr(self, "temp_status_by_path", None) or {}
                 if path and path in temp:
                     return temp[path]
@@ -239,7 +254,8 @@ class VideoTableModel(QAbstractTableModel):
                 self._thumb_rows.setdefault(thumb_path, set()).add(row)
                 if thumb_path not in self.loading_paths:
                     self.loading_paths.add(thumb_path)
-                    loader = ThumbnailLoader(thumb_path, QSize(320, 180), row_data.get("path"))
+                    source = None if row_data.get('duplicate_of') or row_data.get('fingerprint_state') == 'review' else row_data.get('path')
+                    loader = ThumbnailLoader(thumb_path, QSize(320, 180), source)
                     loader.signals.loaded.connect(self.on_thumbnail_loaded)
                     self.thumbnail_pool.start(loader)
 
