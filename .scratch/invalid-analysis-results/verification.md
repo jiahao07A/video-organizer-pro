@@ -83,6 +83,14 @@
 
 对本轮隔离安装器再次完整运行 `tools/smoke_installer_update.py`：首次安装成功，启动更新核对 `completed`，正式退出码 0；二次覆盖安装后合成记录 1 条、设置标记保留。递归检查 onedir 未发现 `.env`、`settings.json`、`tag_config.json`、SQLite/数据库文件或视频素材。没有生成签名更新清单，没有发布或安装至正式目录。
 
+## RC9 发布验证
+
+RC9 已通过 PR #76 以 Rebase and merge 合入 `main`，合并提交为 `ed2744b407a9d9dccf74d119a886effedd31957d`；GitHub Release [v0.0.1-rc9](https://github.com/jiahao07A/video-organizer-pro/releases/tag/v0.0.1-rc9) 于 2026-11-14 发布为预发布版本，标签指向该合并提交。
+
+最终 RC9 隔离安装冒烟首次因系统中已有 Video Organizer Pro 进程而被安装器拒绝，退出码为 1；未结束该进程。用户正常退出旧实例后，在全新 `.release-build/rc9-release-20261114/smoke-retry-20261114/` 目录完整复测通过：安装版本 `0.0.1-rc9`，启动更新会话 `completed`，应用退出码 0，二次覆盖安装成功，合成数据库记录数为 1，设置标记 `preserve-me` 保留。
+
+使用仓库外 Ed25519 私钥生成 `update.json` 和 `update.json.sig`。从 Draft Release 下载全部四项资产后，以客户端验签和安装包验证逻辑检查通过；安装包 SHA-256 为 `d70328db2addcaa2842a887f46441a47dcd4e5723579945fd4ddae5de784f292`。公开 Release 中资产摘要与本地结果一致。该清单签名不代表 Windows Authenticode 签名。
+
 ## RC9 提交前回归
 
 将唯一版本源更新为 `0.0.1-rc9` 后，重新运行 `python -X utf8 -m pytest -q --tb=short --show-capture=no --junitxml=.scratch/invalid-analysis-results/release-tests.xml`，结果 **881 passed、9 skipped、25 warnings**，503.98 秒。9 项跳过为需显式开启的本地压力测试；25 项为 `gui/models/tag_model.py` 的既有 Qt 弃用警告。`ruff check core/analysis_result.py tests/test_analysis_result_validation.py tests/test_smoke_exit.py`、`python -X utf8 -m compileall -q core gui tests video_organizer_app.py tools/smoke_installer_update.py` 及 `git diff --cached --check` 通过。全量 Ruff 扫描旧模块另报 28 项历史 lint 问题，不纳入本次修改；新增校验模块与测试 lint 清洁。
