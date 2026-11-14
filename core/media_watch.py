@@ -725,15 +725,22 @@ class MediaDirectoryMonitor:
         pattern = options['rename_pattern'] or None
         from datetime import datetime
         date_value = datetime.fromisoformat(batch['created_at']).astimezone().strftime('%Y%m%d')
-        previews = self.service.batch_rename(dry_run=True, selected_paths=[path], custom_pattern=pattern, regex_find=options['regex_find'], regex_replace=options['regex_replace'], date_value=date_value)
+        # 调用和读取报告必须在同一临界区，防止手动改名覆盖本批次结果。
+        with self.service._file_operation_lock:
+            previews = self.service.batch_rename(dry_run=True, selected_paths=[path], custom_pattern=pattern, regex_find=options['regex_find'], regex_replace=options['regex_replace'], date_value=date_value)
+            preview_report = dict(self.service._last_rename_result or {})
+        if preview_report.get('failed_count'):
+            self.registry.update_item(item['id'], 'review', str(preview_report.get('failed_items')))
+            return False
         target = os.path.join(os.path.dirname(path), previews[0]['new']) if previews else path
         if target != path and os.path.exists(target) and options['rename_conflict'] == 'review':
             self.registry.update_item(item['id'], 'review', '目标名称冲突，等待人工处理')
             return False
         if target != path:
             self.registry.update_item(item['id'], 'renaming')
-            self.service.batch_rename(selected_paths=[path], custom_pattern=pattern, regex_find=options['regex_find'], regex_replace=options['regex_replace'], session_id=batch['id'], conflict_policy=options['rename_conflict'], date_value=date_value)
-            report = self.service._last_rename_result or {}
+            with self.service._file_operation_lock:
+                self.service.batch_rename(selected_paths=[path], custom_pattern=pattern, regex_find=options['regex_find'], regex_replace=options['regex_replace'], session_id=batch['id'], conflict_policy=options['rename_conflict'], date_value=date_value)
+                report = dict(self.service._last_rename_result or {})
             if report.get('failed_count'):
                 self.registry.update_item(item['id'], 'review', str(report.get('failed_items')))
                 return False

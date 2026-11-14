@@ -3,7 +3,6 @@
 不写生产卸载注册项或快捷方式，不删除测试目录；输出证据保留供审查。
 """
 import argparse
-import ctypes
 import json
 import os
 import subprocess
@@ -18,31 +17,16 @@ from core.software_update import UpdateSession, update_cache
 from core.video_organizer_service import SettingsManager, VideoOrganizerService
 
 
-def close_test_window(process):
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
-    user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
-    user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
-    windows = []
-    @callback_type
-    def visit(hwnd, _):
-        pid = ctypes.c_ulong()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == process.pid:
-            title = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(hwnd, title, 512)
-            if "Video Organizer" in title.value:
-                windows.append(hwnd)
-        return True
-    user32.EnumWindows(visit, 0)
-    if not windows:
-        raise RuntimeError(f"未发现测试进程 {process.pid} 的主窗口，保留进程供诊断")
-    for hwnd in windows:
-        user32.PostMessageW(hwnd, 0x0010, None, None)  # WM_CLOSE，走正常退出门禁。
-    process.wait(timeout=20)
-    if process.returncode != 0:
-        raise RuntimeError(f"应用退出码：{process.returncode}")
+def _wait_for_startup(process, cache: Path, timeout: float = 45) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        # 快速正常退出也可能早于父进程轮询；先读取已落盘的启动核对结果。
+        if UpdateSession.load(cache).phase == "completed":
+            return
+        if process.poll() is not None:
+            raise RuntimeError(f"程序启动中退出：{process.returncode}")
+        time.sleep(0.2)
+    raise RuntimeError(f"更新核对超时；测试进程 {process.pid} 保留供诊断")
 
 
 def run(installer: Path, output: Path):
@@ -74,17 +58,11 @@ def run(installer: Path, output: Path):
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
-    process = subprocess.Popen([str(installation / "VideoOrganizer.exe")], cwd=str(installation), startupinfo=startup)
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"程序启动中退出：{process.returncode}")
-        if UpdateSession.load(cache).phase == "completed":
-            break
-        time.sleep(0.2)
-    else:
-        raise RuntimeError(f"更新核对超时；测试进程 {process.pid} 保留供诊断")
-    close_test_window(process)
+    process = subprocess.Popen([str(installation / "VideoOrganizer.exe"), "--background", "--smoke-exit"], cwd=str(installation), startupinfo=startup)
+    _wait_for_startup(process, cache)
+    process.wait(timeout=45)
+    if process.returncode != 0:
+        raise RuntimeError(f"应用退出码：{process.returncode}")
     install(2)
     assert json.loads((data / "settings.json").read_text(encoding="utf-8"))["ui_preferences"]["update_smoke_marker"] == "preserve-me"
     with service.db._managed_connection() as connection:

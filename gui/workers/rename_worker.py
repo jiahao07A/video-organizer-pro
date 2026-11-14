@@ -25,17 +25,18 @@ class RenameWorker(QThread):
         previous_log = self.service.on_log
         try:
             self.service.on_log = self.handle_log
-            self.service.batch_rename(
-                dry_run=self.dry_run, 
-                selected_paths=self.selected_paths,
-                custom_pattern=self.pattern,
-                regex_find=self.regex_find,
-                regex_replace=self.regex_replace,
-                date_value=self.rename_date,
-                progress_callback=lambda done, total: self.progress_updated.emit(
-                    int(done * 100 / max(1, total)), f"重命名进度：{done}/{total}"),
-            )
-            report = getattr(self.service, "_last_rename_result", None) or {}
+            with self.service._file_operation_lock:
+                self.service.batch_rename(
+                    dry_run=self.dry_run,
+                    selected_paths=self.selected_paths,
+                    custom_pattern=self.pattern,
+                    regex_find=self.regex_find,
+                    regex_replace=self.regex_replace,
+                    date_value=self.rename_date,
+                    progress_callback=lambda done, total: self.progress_updated.emit(
+                        int(done * 100 / max(1, total)), f"重命名进度：{done}/{total}"),
+                )
+                report = dict(getattr(self.service, "_last_rename_result", None) or {})
             failed = int(report.get("failed_count", 0) or 0)
             if failed:
                 self.task_finished.emit(

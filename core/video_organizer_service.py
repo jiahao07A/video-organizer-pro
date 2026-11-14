@@ -28,6 +28,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Set, Union, Any, Callable
 from core.ai_gateway import AiRequestGateway
+from core.analysis_result import InvalidAnalysisResult, validate_analysis_result, ensure_rename_analysis
 from core.watch_config import DEFAULTS as WATCH_DEFAULTS
 from core.analysis_recovery import (RecoveryContext, RecoveryDeferred, RecoveryScheduler, RecoveryStore, effective_policy, STATE_LABELS, route_fingerprint)
 from core.background_process import hidden_process_options, quiet_ffmpeg_probe
@@ -1136,6 +1137,10 @@ class DatabaseManager:
         res_str = json.dumps(response, ensure_ascii=False)
         self.execute_non_query("INSERT OR REPLACE INTO api_cache (cache_key, response) VALUES (?, ?)", (key, res_str))
 
+    def delete_cache(self, key: str) -> None:
+        """只移除已验证无效的单个响应缓存。"""
+        self.execute_non_query("DELETE FROM api_cache WHERE cache_key = ?", (key,))
+
     def add_rename_record(self, session_id: str, old_path: str, new_path: str):
         self.execute_non_query("INSERT INTO rename_history (session_id, old_path, new_path) VALUES (?, ?, ?)", (session_id, old_path, new_path))
 
@@ -1857,6 +1862,7 @@ class AIHandler:
         retry_config=None,
         cancel_event=None,
         route_override=None,
+        result_validator=None,
     ) -> Optional[Dict]:
         """兼容门面：所有聊天请求委托给 AiRequestGateway。"""
         self.gateway.settings = self.settings
@@ -1873,6 +1879,7 @@ class AIHandler:
             cancel_event=cancel_event if cancel_event is not None else getattr(self, "analysis_cancel_event", None),
             route_override=route_override,
             sleeper=getattr(self, "_retry_sleeper", None),
+            result_validator=result_validator,
         )
         failure = self.gateway.get_last_failure()
         self._last_api_failure = failure
@@ -2042,6 +2049,7 @@ class AIHandler:
 2. 对于禁止新增标签的封闭组：必须且只能从给定预设库中精确选择；若无一匹配则该组留空，禁止编造近义词或猜测最接近项。
 3. 摘要需客观描述画面，避免主观臆断。
 4. 不要输出构图、星级、质量分、代理建议、标签权重或独立情绪字段。
+5. 如果不能读取或分析提供的图片，返回 {{"success": false, "error": "无法分析所提供的图像"}}；不要把错误说明作为正常摘要。
 """
         return {
             "system_prompt": system_prompt,
@@ -2144,6 +2152,11 @@ class AIHandler:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
+    def validate_video_analysis_result(self, data):
+        """业务复核与网关共用配置，避免动态组在下游被误当作协议字段。"""
+        group_ids = (group.get('id') for group in (self.tag_config or {}).get('tag_groups', []) if group.get('id'))
+        return validate_analysis_result(data, group_ids=group_ids)
+
     def analyze_video(
         self,
         base64_frames: List[str],
@@ -2154,11 +2167,16 @@ class AIHandler:
         if not base64_frames:
             return None
 
+        validate = self.validate_video_analysis_result
+
         # use_cache=False：强制重新分析时跳过读缓存，但仍可写回新结果
         context = getattr(self.gateway._tls, "recovery_context", None)
         if context and context.analysis_data is not None:
-            import copy
-            return copy.deepcopy(context.analysis_data)
+            try:
+                return validate(context.analysis_data)
+            except InvalidAnalysisResult:
+                context.analysis_data = None
+                event('analysis.invalid_cache', source='recovery_context')
         if context:
             route = context.route
             prompts = self.build_analysis_prompts()
@@ -2166,8 +2184,15 @@ class AIHandler:
             cache_key = f"{cache_key}_{route_fingerprint(route)}_{prompt_fp}"
             use_cache = use_cache and not context.active
         if use_cache and self.db and cache_key:
-            cached = self.db.get_cache(cache_key)
-            if cached:
+            try:
+                cached = self.db.get_cache(cache_key)
+                if cached is not None:
+                    cached = validate(cached)
+            except (InvalidAnalysisResult, ValueError, TypeError):
+                self.db.delete_cache(cache_key)
+                cached = None
+                event('analysis.invalid_cache', source='database')
+            if cached is not None:
                 logger.info("使用 API 响应缓存（按当前词表再归一）")
                 tr = getattr(self, "_job_metrics", None)
                 if tr is not None:
@@ -2210,10 +2235,12 @@ class AIHandler:
 
         # 执行分析
         data = self._get_api_response(
-            model_name, system_prompt, content_parts, task_key="video_classification"
+            model_name, system_prompt, content_parts, task_key="video_classification",
+            result_validator=validate,
         )
         
         if data:
+            data = validate(data)
             # 归一不在此处写待审：由 _process_single_video 最终路径统一 persist，避免 B 重试重复
             data = self.apply_tag_normalization(data, persist_pending=False)
             if context:
@@ -4677,6 +4704,8 @@ class VideoOrganizerService:
 
     def _persist_current_analysis(self, res, *, xmp_failure_sink=None):
         """入库；可选自动写 XMP，返回自动 XMP 失败条数。"""
+        if res.get('_analysis_side_effects'):
+            validate_analysis_result(res)
         if res.get('_content_version') is not None:
             current = self.media_registry.register(res['path'], record_event=False)
             if (current.get('content_version') != res['_content_version'] or current.get('duplicate_of')
@@ -5512,6 +5541,7 @@ class VideoOrganizerService:
                     finish_item(False, last_reason)
                     return None, last_reason
 
+                ai_data = self.ai.validate_video_analysis_result(ai_data)
                 current = self.media_registry.register(video_path, record_event=False)
                 if current.get('content_version') != initial.get('content_version') or current.get('duplicate_of') or current.get('timestamp') != initial.get('timestamp'):
                     self.db.execute_non_query("UPDATE videos SET fingerprint_state='review' WHERE id=?", (current['id'],))
@@ -5628,6 +5658,7 @@ class VideoOrganizerService:
         return None
 
     def rename_filename(self, item, pattern, regex_find=None, regex_replace='', date_value=None):
+        ensure_rename_analysis(item, pattern)
         current = os.path.basename(item.get('path') or '') or item.get('filename') or ''
         values = {
             'category': item.get('category') or 'Other',
@@ -5644,6 +5675,9 @@ class VideoOrganizerService:
             result = re.sub(regex_find, regex_replace, result)
         result = FileManager.sanitize_filename(result, max_len=200)
         extension = os.path.splitext(current)[1]
+        stem = result[:-len(extension)] if extension and result.lower().endswith(extension.lower()) else result
+        if not stem.strip(' .-_'):
+            raise InvalidAnalysisResult('命名规则未生成有效文件名，请补充摘要或修改命名规则')
         if extension and not result.lower().endswith(extension.lower()):
             result += extension
         return result
@@ -5671,6 +5705,10 @@ class VideoOrganizerService:
                       regex_find=None, regex_replace="", date_value=None, progress_callback=None, session_id=None, conflict_policy="suffix"):
         """批量重命名，支持自定义模式和正则表达式"""
         logger.info(f"开始批量重命名 (模拟模式: {dry_run})")
+        self._last_rename_result = {
+            'session_id': session_id, 'path_changes': {}, 'planned_count': 0,
+            'success_count': 0, 'failed_count': 0, 'failed_items': [],
+        }
         videos = self.db.get_videos_by_paths(selected_paths) if selected_paths is not None else self.db.get_all_videos()
         if not videos:
             self.log("没有可重命名的分析结果。")
@@ -5688,7 +5726,6 @@ class VideoOrganizerService:
 
         success_count = 0
         failed_items = []
-        self._last_rename_result = None
         preview_results = []
         session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
@@ -5730,7 +5767,12 @@ class VideoOrganizerService:
             if not pattern:
                 pattern = SettingsManager.get_setting(self.settings, "rename_pattern", "{category}-{tags}-{summary}-{original_name}")
             
-            new_fn = self.rename_filename(item, pattern, regex_find, regex_replace, date_value)
+            try:
+                new_fn = self.rename_filename(item, pattern, regex_find, regex_replace, date_value)
+            except InvalidAnalysisResult as exc:
+                failed_items.append({'path': physical_path, 'target_path': '', 'reason': str(exc)})
+                self.log(f"重命名已跳过 {current_fn}: {exc}")
+                continue
             target_path = os.path.join(dir_name, new_fn)
             
             if os.path.normpath(physical_path) == os.path.normpath(target_path):

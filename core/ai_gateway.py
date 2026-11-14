@@ -401,6 +401,7 @@ class AiRequestGateway:
         sleeper: Optional[Callable[[float], None]] = None,
         route_override: Optional[Dict[str, Any]] = None,
         call_context: Any = None,
+        result_validator: Optional[Callable[[Any], Any]] = None,
     ) -> Any:
         """请求聊天补全，返回 JSON 对象或文本；失败统一返回 None。"""
         use_client = client
@@ -471,6 +472,8 @@ class AiRequestGateway:
                 response = use_client.chat.completions.create(**kwargs)
                 content = _message_content(response)
                 result = _parse_json_content(content) if json_mode else content
+                if result_validator is not None:
+                    result = result_validator(result)
                 event('api.success', **request_fields, elapsed_ms=round((time.monotonic() - started) * 1000), server_request_id=getattr(response, '_request_id', None), usage={k: getattr(getattr(response, 'usage', None), k, None) for k in ('prompt_tokens', 'completion_tokens', 'total_tokens')})
                 if context:
                     context.record(success=True)

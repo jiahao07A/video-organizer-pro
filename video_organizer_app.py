@@ -213,6 +213,17 @@ def _prepare_startup_upgrade(app: QApplication) -> bool:
     return True
 
 
+def _schedule_smoke_exit(window: MainWindow) -> None:
+    """让安装冒烟走正式退出入口，避开托盘模式下的普通关闭语义。"""
+    def exit_when_idle() -> None:
+        if window.update_controller.busy or window._update_preparing:
+            QTimer.singleShot(250, exit_when_idle)
+            return
+        window._exit_application()
+
+    QTimer.singleShot(0, exit_when_idle)
+
+
 def main():
     runtime = initialize()
     install_exception_hooks()
@@ -277,6 +288,9 @@ def main():
         if message:
             window.status_bar.showMessage(message, 30000)
             window.update_controller.message = message
+
+    if "--smoke-exit" in sys.argv[1:]:
+        _schedule_smoke_exit(window)
 
     return app.exec()
 
