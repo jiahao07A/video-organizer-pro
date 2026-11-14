@@ -12,6 +12,8 @@ all_datas = [
 all_hiddenimports = [
     'sqlite3',
     'PIL.Image',
+    # imagehash.phash 在运行时加载 DCT；保留 scipy 官方 hook 所需入口。
+    'scipy.fftpack',
     'PySide6.QtXml',
     'PySide6.QtMultimedia',
     'PySide6.QtMultimediaWidgets',
@@ -38,7 +40,6 @@ a = Analysis(
         'transformers',
         'sklearn',
         'pandas',
-        'scipy',
         'matplotlib',
         'sympy',
         'sqlalchemy',

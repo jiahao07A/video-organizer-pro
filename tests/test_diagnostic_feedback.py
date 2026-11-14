@@ -573,20 +573,35 @@ def test_sidecar_and_supported_video_names_redacted_on_disk_and_export(runtime, 
 
 
 def test_real_catalog_scan_propagates_context_to_thumbnail_pool(runtime, tmp_path):
-    from core.video_organizer_service import VideoOrganizerService
+    from pathlib import Path
+    from core.media_registry import MediaRegistry
+    from core.video_organizer_service import DatabaseManager, FileManager, VideoOrganizerService
     sources = [str(tmp_path / f'synthetic-{number}.mp4') for number in range(4)]
+    for number, path in enumerate(sources):
+        Path(path).write_bytes(f'full synthetic video content {number}'.encode())
+    db = DatabaseManager(str(tmp_path / 'catalog.db'))
+    registry = MediaRegistry(db)
+    rendezvous = threading.Barrier(4)
+    thumbnail_threads = set()
+    caller_thread = threading.get_ident()
+
     def extract(path, **kwargs):
+        thumbnail_threads.add(threading.get_ident())
+        rendezvous.wait(timeout=5)
         dl.event('synthetic.thumbnail', expected_item=dl.anonymous(path))
         raise ValueError('synthetic decode failure')
     service = SimpleNamespace(
         settings={'processing': {'extract_workers': 4}}, _work_scope_paths=[str(tmp_path)],
-        file_manager=SimpleNamespace(scan_videos=lambda path: sources),
-        db=SimpleNamespace(get_video_by_path=lambda path: None),
-        media_registry=SimpleNamespace(register=lambda path, **_: {'path': path, 'filename': path}),
-        processor=SimpleNamespace(extract_frames=extract), _thumbnail_dir=str(tmp_path),
+        file_manager=FileManager(db), db=db, media_registry=registry,
+        processor=SimpleNamespace(extract_thumbnail=extract), _thumbnail_dir=str(tmp_path),
         log=lambda message: None, invalidate_video_memory_cache=lambda: None,
-        refresh_pending_media_fingerprints=lambda: None)
-    assert VideoOrganizerService.scan_and_register_work_scope(service) == sources
+        refresh_pending_media_fingerprints=lambda progress=None: registry.index_existing(progress=progress, force=True))
+    assert set(VideoOrganizerService.scan_and_register_work_scope(service)) == set(sources)
+    assert len(thumbnail_threads) == 4 and caller_thread not in thumbnail_threads
+    assert service._last_scan_result['error_count'] == 4
+    assert len(db.get_all_videos()) == 4
+    assert all(row['file_hash'] and row['file_size'] and row['thumbnail'] is None
+               for row in db.get_all_videos())
     events = read_events(runtime)
     operation = next(e for e in events if e.get('operation') == 'catalog.scan' and e['event'] == 'operation.start')
     pool = [e for e in events if e['event'] == 'synthetic.thumbnail']
@@ -596,6 +611,8 @@ def test_real_catalog_scan_propagates_context_to_thumbnail_pool(runtime, tmp_pat
     failures = [e for e in events if e.get('exception', {}).get('type') == 'ValueError']
     assert len(failures) == 4
     assert all(e['operation_id'] == operation['operation_id'] and e['item_id'] for e in failures)
+    assert {e['item_id'] for e in failures} == {e['expected_item'] for e in pool}
+    assert len({e['item_id'] for e in failures}) == 4
 
 
 def test_metrics_persistence_does_not_wait_for_busy_log_lock(runtime, tmp_path):

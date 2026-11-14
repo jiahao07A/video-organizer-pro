@@ -7,8 +7,10 @@ from PySide6.QtWidgets import (
     QToolButton, QSizePolicy, QInputDialog, QTabWidget,
 )
 from PySide6.QtGui import QColor, QAction, QIcon, QDragEnterEvent, QDropEvent, QPalette
-from PySide6.QtCore import Qt, QSize, Slot
+from PySide6.QtCore import Qt, QSize, Slot, QObject, Signal, QTimer
 import json
+import logging
+import threading
 from core.video_organizer_service import VideoOrganizerService, SettingsManager
 from core.tag_import_service import TagImportService
 from gui.models.tag_model import TagListModel, TagFilterProxyModel
@@ -687,11 +689,35 @@ class PendingReviewView(QWidget):
         )
 
 
+class _UsageRefreshBridge(QObject):
+    finished = Signal(bool)
+
+
+def _refresh_tag_usage_counts(db, bridge):
+    """工作线程仅持有数据库和独立信号桥，页面销毁不会使回传访问失效。"""
+    succeeded = False
+    try:
+        db.refresh_tag_usage_counts()
+        succeeded = True
+    except Exception as exc:
+        logging.getLogger("VideoOrganizer.tags").warning("标签使用统计刷新失败: %s", type(exc).__name__)
+    finally:
+        bridge.finished.emit(succeeded)
+
+
 class TagsView(QWidget):
     """标签库：默认「待审审核」工作视图 + 「标准词管理」工作视图（无中转池）。"""
     def __init__(self, service: VideoOrganizerService, parent=None):
         super().__init__(parent)
         self.service = service
+        self._usage_refresh_thread = None
+        # 无 Qt parent；运行中的 Python 线程持有强引用，避免随页面提前销毁。
+        self._usage_refresh_bridge = _UsageRefreshBridge()
+        self._usage_refresh_bridge.finished.connect(self._usage_refresh_finished, Qt.QueuedConnection)
+        self._usage_refresh_timer = QTimer(self)
+        self._usage_refresh_timer.setSingleShot(True)
+        self._usage_refresh_timer.setInterval(500)
+        self._usage_refresh_timer.timeout.connect(self.async_refresh_usage_counts)
         self.import_service = TagImportService(
             service.ai,
             tag_config_path=getattr(service, "_tag_config_path", None),
@@ -1166,22 +1192,25 @@ class TagsView(QWidget):
         if hasattr(self, "pending_panel") and self.pending_panel is not None:
             self.pending_panel.reload()
 
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(500, self.async_refresh_usage_counts)
+        self._usage_refresh_timer.start()
 
+    @Slot()
     def async_refresh_usage_counts(self):
-        """异步刷新统计数据以提高性能"""
-        import threading
-        def run():
-            try:
-                self.service.db.refresh_tag_usage_counts()
-                from PySide6.QtCore import QMetaObject, Qt
-                QMetaObject.invokeMethod(self, "load_data_silent", Qt.QueuedConnection)
-            finally:
-                self._usage_refresh_thread = None
-            
-        self._usage_refresh_thread = threading.Thread(target=run, daemon=True)
+        """合并刷新请求；保留活跃线程引用，让退出等待能持续观察它。"""
+        if self._usage_refresh_thread is not None and self._usage_refresh_thread.is_alive():
+            self._usage_refresh_timer.start()
+            return
+        self._usage_refresh_timer.stop()
+        self._usage_refresh_thread = threading.Thread(
+            target=_refresh_tag_usage_counts,
+            args=(self.service.db, self._usage_refresh_bridge), daemon=True,
+        )
         self._usage_refresh_thread.start()
+
+    @Slot(bool)
+    def _usage_refresh_finished(self, succeeded):
+        if succeeded:
+            self.load_data_silent()
 
     @Slot()
     def load_data_silent(self):

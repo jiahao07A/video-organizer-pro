@@ -302,7 +302,7 @@ class StorageBackupManager:
     @classmethod
     def _read_json_object(cls, path: str, label: str) -> Dict[str, Any]:
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with open(path, "r", encoding="utf-8-sig") as handle:
                 payload = json.load(handle)
         except Exception as exc:
             raise StorageBackupError(f"{label} 配置不是有效 JSON: {exc}") from exc

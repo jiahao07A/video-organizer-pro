@@ -23,6 +23,8 @@ import numpy as np
 import subprocess
 import tempfile
 from contextlib import contextmanager
+from pathlib import Path
+import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1535,11 +1537,8 @@ class VideoProcessor:
     def get_file_hash(file_path: str) -> str:
         """计算文件 MD5 哈希"""
         logger.debug(f"正在计算文件哈希: {file_path}")
-        hash_md5 = hashlib.md5()
         with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+            return hashlib.file_digest(f, 'md5').hexdigest()
 
     @staticmethod
     def calculate_phash(image: np.ndarray) -> str:
@@ -1579,6 +1578,61 @@ class VideoProcessor:
             return base64.b64encode(buffer).decode('utf-8')
         except Exception:
             return ""
+
+    def extract_thumbnail(self, video_path: str, *, target_size=512, thumbnails_dir=None):
+        """入库专用：只解首帧和保存缩略图，避免AI编码及感知哈希的额外工作。"""
+        frame = None
+        try:
+            import av
+            # PyAV 每任务独立容器，避免 OpenCV 的全局 open 锁；关闭容器后再编码。
+            with av.open(video_path, metadata_errors='replace') as container:
+                stream = container.streams.video[0]
+                stream.codec_context.thread_count = 1
+                decoded = next(container.decode(stream))
+                scale = min(1.0, target_size / max(decoded.width, decoded.height))
+                frame = decoded.to_ndarray(format='bgr24',
+                    width=max(1, int(decoded.width * scale)),
+                    height=max(1, int(decoded.height * scale)))
+                rotation = decoded.rotation
+                if rotation in (90, -270):
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rotation in (-90, 270):
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                elif abs(rotation) == 180:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+        except Exception:
+            # 保留 OpenCV 后端覆盖 PyAV 不支持的容器；不修改全局解码器锁设置。
+            cap = cv2.VideoCapture()
+            try:
+                try:
+                    opened = cap.open(video_path, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 1])
+                except (AttributeError, cv2.error):
+                    opened = False
+                if not opened:
+                    cap.release()
+                    cap = cv2.VideoCapture(video_path)
+                ok, frame = cap.read()
+                if not ok:
+                    return None
+                frame = self.resize_image(frame, target_size)
+            finally:
+                cap.release()
+        if frame is not None:
+            thumbnail_root = thumbnails_dir or self.thumbnails_dir
+            os.makedirs(thumbnail_root, exist_ok=True)
+            key = hashlib.md5(video_path.encode()).hexdigest()
+            for suffix, quality in (('.webp', cv2.IMWRITE_WEBP_QUALITY),
+                                    ('.jpg', cv2.IMWRITE_JPEG_QUALITY)):
+                try:
+                    success, encoded = cv2.imencode(suffix, frame, [quality, 80])
+                    if success:
+                        destination = os.path.join(thumbnail_root, key + suffix)
+                        with open(destination, 'wb') as stream:
+                            stream.write(encoded.tobytes())
+                        return destination
+                except (OSError, cv2.error):
+                    continue
+            return None
 
     def extract_frames(self, video_path: str, max_frames: int = 10, target_size: int = 512,
                        save_thumbnail: bool = False, use_scene_detection: bool = True,
@@ -1733,9 +1787,14 @@ class MetadataInjector:
     """元数据注入逻辑 (XMP/FFmpeg)"""
     @staticmethod
     def inject_tags(video_path: str, tags: List[str], summary: str):
+        temp_path = None
         try:
             tags_str = ",".join(tags)
-            temp_path = video_path + ".tmp.mp4"
+            descriptor, temp_path = tempfile.mkstemp(
+                prefix='.video-organizer-metadata-', suffix='.mp4',
+                dir=os.path.dirname(os.path.abspath(video_path)),
+            )
+            os.close(descriptor)
             cmd = [
                 "ffmpeg", "-y", "-i", video_path, 
                 "-metadata", f"comment={summary} | Tags: {tags_str}", 
@@ -1746,6 +1805,14 @@ class MetadataInjector:
             return True
         except Exception:
             return False
+        finally:
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning('media.metadata_temp_cleanup_failed', exc_info=True)
 
 class AIHandler:
     """AI 业务门面；具体请求传输统一由 AiRequestGateway 完成。"""
@@ -2550,7 +2617,7 @@ class FileManager:
         self.csv_path = csv_path
         self.lock = threading.Lock()
 
-    def scan_videos(self, path: str) -> List[str]:
+    def scan_videos(self, path: str, progress_callback=None) -> List[str]:
         video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.flv', '.wmv')
         files_to_process = []
         
@@ -2562,6 +2629,8 @@ class FileManager:
                 for file in files:
                     if file.lower().endswith(video_extensions):
                         files_to_process.append(os.path.abspath(os.path.join(root, file)))
+                if progress_callback:
+                    progress_callback(len(files_to_process))
         
         return files_to_process
 
@@ -3132,25 +3201,35 @@ class VideoOrganizerService:
         return True
 
     @traced('catalog.scan')
-    def scan_and_register_work_scope(self) -> List[str]:
+    def scan_and_register_work_scope(self, progress_callback=None) -> List[str]:
         """
         扫描当前工作范围内的视频文件并入库。
         - 尚不在库：登记为 status=pending（未分析）
         - 已在库：保留既有分析结果，不覆盖
         返回本次新登记的路径列表。
-        新入库轻量缩略图抽帧使用 extract_workers 高并发（默认 100）。
+        完整指纹有界并行、批量登记，缩略图独立有界解码。
         """
+        from core.scan_progress import ScanProgress
+        progress = ScanProgress(progress_callback)
+        progress.emit('discovery', force=True)
         registered: List[str] = []
-        self.refresh_pending_media_fingerprints()
         if not self._work_scope_paths:
+            progress.emit('complete', percent=1000, force=True)
+            self._last_scan_result = dict(progress.snapshot)
             return registered
 
         candidates: List[Dict] = []
         for scope_path in self._work_scope_paths:
             try:
-                found = self.file_manager.scan_videos(scope_path)
+                if progress_callback:
+                    base_count = len(candidates)
+                    found = self.file_manager.scan_videos(scope_path, progress_callback=lambda count:
+                        progress.emit('discovery', base_count + count, files_found=base_count + count))
+                else:
+                    found = self.file_manager.scan_videos(scope_path)
             except Exception as e:
                 logger.warning(f"扫描工作范围失败 {scope_path}: {e}")
+                progress.counts['error_count'] += 1
                 continue
             for video_path in found:
                 abs_path = os.path.abspath(video_path)
@@ -3166,69 +3245,102 @@ class VideoOrganizerService:
                     }
                 )
 
-        to_thumb = []
-        for path in dict.fromkeys(row['path'] for row in candidates):
-            existing = self.db.get_video_by_path(path)
+        paths = list(dict.fromkeys(row['path'] for row in candidates))
+        total = len(paths)
+        progress.emit('history', percent=50, force=True, files_found=total)
+        self.refresh_pending_media_fingerprints(progress=lambda done, count:
+            progress.emit('history', done, count))
+        completed_work = {'fingerprint': 0, 'register': 0}
+        def registration_progress(phase, done, count):
+            completed_work[phase] = done
+            progress.emit(phase, done, count,
+                percent=50 + 700 * sum(completed_work.values()) / max(1, 2 * total))
+
+        extract_workers = max(1, min(int(SettingsManager.get_setting(
+            self.settings, 'processing.extract_workers', 100) or 100), 16))
+        target_size = SettingsManager.get_setting(self.settings, 'processing.target_size', 512)
+
+        def verify_snapshot(rec):
+            stat = os.stat(rec['path'])
+            if (stat.st_size, stat.st_mtime_ns) != (rec['file_size'], rec['file_mtime_ns']):
+                raise OSError('缩略图生成期间素材发生变化，等待重新扫描')
+
+        def _thumb_one(rec):
             try:
-                row = self.media_registry.register(path, source='manual')
-            except OSError as exc:
-                self.log(f"入库等待文件可读取：{path}：{exc}")
-                continue
-            if existing is None:
-                registered.append(path)
-                if not row.get('duplicate_of'):
-                    to_thumb.append(row)
+                verify_snapshot(rec)
+                thumb = self.processor.extract_thumbnail(rec['path'], target_size=target_size,
+                    thumbnails_dir=self._thumbnail_dir)
+                verify_snapshot(rec)
+                return rec, thumb
+            except Exception as exc:
+                logger.warning(f"入库缩略图失败 {rec['path']}: {exc}")
+                return rec, None
 
-        if to_thumb:
-            extract_workers = int(
-                SettingsManager.get_setting(
-                    self.settings, "processing.extract_workers", 100
-                )
-                or 100
-            )
-            extract_workers = max(1, min(extract_workers, 512))
-            target_size = SettingsManager.get_setting(
-                self.settings, "processing.target_size", 512
-            )
-            self.log(
-                f"入库轻量抽帧：{len(to_thumb)} 条，并发 {extract_workers}"
-            )
+        with ThreadPoolExecutor(max_workers=extract_workers) as executor:
+            futures = []
 
-            def _thumb_one(rec: Dict):
-                abs_path = rec["path"]
-                try:
-                    proc = self.processor.extract_frames(
-                        abs_path,
-                        max_frames=1,
-                        target_size=target_size,
-                        save_thumbnail=True,
-                        thumbnails_dir=self._thumbnail_dir,
-                        use_scene_detection=False,
-                    )
-                    thumb = proc.get("thumbnail")
-                    if thumb:
-                        # 抽帧期间可能已改名或替换，禁止用旧路径和整行快照重新插入。
-                        self.db.execute_non_query('UPDATE videos SET thumbnail=? WHERE id=? AND content_version=? AND duplicate_of IS NULL',
-                            (self.db._thumbnail_storage_reference(thumb), rec['id'], rec['content_version']))
-                except Exception as e:
-                    logger.warning(f"入库缩略图失败 {abs_path}: {e}")
+            def committed_batch(items):
+                # 此处事务已经提交；下一批完整哈希与本批独立解码重叠。
+                self.invalidate_video_memory_cache()
+                for rec, is_new in items:
+                    progress.counts['new_count'] += int(is_new)
+                    progress.counts['duplicate_count'] += int(bool(rec.get('duplicate_of')))
+                    if not rec.get('duplicate_of') and rec.get('fingerprint_state') == 'verified' \
+                            and not rec.get('thumbnail'):
+                        futures.append(executor.submit(contextual(in_context),
+                            {'item_id': register_private_path(rec['path'])}, _thumb_one, rec))
 
-            with ThreadPoolExecutor(max_workers=extract_workers) as executor:
-                futures = [executor.submit(contextual(in_context),
-                           {"item_id": register_private_path(rec["path"])}, _thumb_one, rec)
-                           for rec in to_thumb]
-                for future in futures:
-                    future.result()
+            batch = self.media_registry.register_many(paths, source='manual',
+                progress=registration_progress, on_batch=committed_batch)
+            registered = [row['path'] for row, is_new in batch['items'] if is_new]
+            for error in batch['errors']:
+                self.log(f"入库等待文件可读取：{error['path']}：{error['reason']}")
+            progress.counts.update(new_count=len(registered),
+                duplicate_count=sum(bool(row.get('duplicate_of')) for row, _ in batch['items']),
+                error_count=progress.counts['error_count'] + len(batch['errors']))
+            progress.emit('thumbnail', 0, len(futures), percent=750, force=True)
+            writes = []
+            for done, future in enumerate(as_completed(futures), 1):
+                rec, thumb = future.result()
+                if thumb:
+                    try:
+                        verify_snapshot(rec)
+                    except OSError:
+                        thumb = None
+                if thumb:
+                    writes.append((rec, thumb))
+                else:
+                    progress.counts['error_count'] += 1
+                if len(writes) >= 64 or done == len(futures):
+                    with self.db.lock, self.db._managed_connection() as conn:
+                        # 先取得 SQLite 写锁，再核实素材；不能在等待其它进程提交前核实。
+                        conn.execute('BEGIN IMMEDIATE')
+                        updates = []
+                        for record, thumbnail in writes:
+                            try:
+                                verify_snapshot(record)
+                            except OSError:
+                                progress.counts['error_count'] += 1
+                                continue
+                            updates.append((self.db._thumbnail_storage_reference(thumbnail),
+                                record['id'], record['content_version'], record['path']))
+                        conn.executemany('UPDATE videos SET thumbnail=? WHERE id=? AND content_version=? '
+                            'AND path=? AND duplicate_of IS NULL', updates)
+                    writes.clear()
+                progress.emit('thumbnail', done, len(futures),
+                    percent=750 + 240 * done / len(futures), force=done == len(futures))
 
         if registered:
             # 新入库后让下次 get_all_videos 从 DB 刷新完整记录
             self.invalidate_video_memory_cache()
             self.log(f"工作范围扫盘：新登记 {len(registered)} 个未分析视频。")
+        progress.emit('complete', total, total, percent=1000, force=True)
+        self._last_scan_result = dict(progress.snapshot)
         return registered
 
-    def refresh_pending_media_fingerprints(self):
+    def refresh_pending_media_fingerprints(self, progress=None):
         """在批次边界补齐历史指纹，并同步失效可能过期的全库缓存。"""
-        changed = self.media_registry.index_existing(force=True)
+        changed = self.media_registry.index_existing(progress=progress, force=True)
         if changed:
             self.invalidate_video_memory_cache()
         return changed
@@ -4897,7 +5009,7 @@ class VideoOrganizerService:
                            "evidence": diagnostic_text(group.get("evidence"), self.settings), "suggestion": group.get("suggestion")}
                 try:
                     diagnosis = self.ai._get_api_response(route.get("model") or "", prompt,
-                        [json.dumps(payload, ensure_ascii=False)], json_mode=False, task_key="error_diagnosis",
+                        [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], json_mode=False, task_key="error_diagnosis",
                         retry_config=RetryConfig(call_extra_attempts=0, item_max_attempts=1, batch_rerun_enabled=False),
                         cancel_event=cancel_event if cancel_event is not None else threading.Event(), route_override=route)
                 except Exception:
@@ -5734,9 +5846,7 @@ class VideoOrganizerService:
             return []
 
         items_to_rename = videos
-        if selected_paths is not None:
-            selected_set = set(selected_paths)
-            items_to_rename = [item for item in videos if item.get("path") in selected_set]
+        # 查询已按数据库的规范化路径限定目标；不得再用原始字符串排除 Windows 等价路径。
 
         # 建立当前目录索引以增加查找成功率
         # 大部分源路径仍存在，无需每次遍历整个程序目录。仅缺失时懒加载兼容查找索引。
@@ -5909,37 +6019,91 @@ class VideoOrganizerService:
         failures = []
         for record in reversed(history):
             old_path, new_path = record["old_path"], record["new_path"]
+            video_moved = False
+            xmp_moved = False
+            update_attempted = False
+            original_row = None
+            new_xmp = os.path.splitext(new_path)[0] + ".xmp"
+            old_xmp = os.path.splitext(old_path)[0] + ".xmp"
             try:
+                # 在门禁可能登记文件以及任何物理改动之前，核对真正的历史目标记录。
+                rows = self.db.execute_query("SELECT * FROM videos WHERE path = ?", (new_path,))
+                if not rows:
+                    raise ValueError("素材库中找不到目标路径记录")
+                original_row = rows[0]
                 if not self.filter_processable_paths([new_path]):
                     raise ValueError('重复副本或内容变化待核对，跳过回滚')
                 if not os.path.exists(new_path):
                     raise FileNotFoundError(f"目标文件不存在：{new_path}")
                 if os.path.exists(old_path):
                     raise FileExistsError(f"源路径已有文件：{old_path}")
+                if self.db.get_video_by_path(old_path) is not None:
+                    raise ValueError("素材库源路径已有其他记录，未执行回滚")
+                if os.path.exists(new_xmp) and os.path.exists(old_xmp):
+                    raise FileExistsError("源路径已有 XMP 侧车，未覆盖；视频和目标侧车保持原位置")
                 os.rename(new_path, old_path)
-
-                new_xmp = os.path.splitext(new_path)[0] + ".xmp"
-                old_xmp = os.path.splitext(old_path)[0] + ".xmp"
-                xmp_issue = None
+                video_moved = True
                 if os.path.exists(new_xmp):
-                    if os.path.exists(old_xmp):
-                        xmp_issue = "源路径已有 XMP 侧车，未覆盖；目标侧车仍留在原目标路径"
-                    else:
-                        try:
-                            os.rename(new_xmp, old_xmp)
-                        except Exception as exc:
-                            xmp_issue = f"XMP 侧车恢复失败：{exc}"
+                    try:
+                        os.rename(new_xmp, old_xmp)
+                        xmp_moved = True
+                    except Exception as exc:
+                        raise OSError(f"XMP 侧车恢复失败：{exc}") from exc
 
-                rows = self.db.execute_query("SELECT * FROM videos WHERE path = ?", (new_path,))
-                if not rows:
-                    raise ValueError("素材库中找不到目标路径记录")
-                self.db.update_video_path(new_path, old_path, status="analyzed")
+                update_attempted = True
+                try:
+                    self.db.update_video_path(new_path, old_path, status="analyzed")
+                except Exception:
+                    # 调用方可能在事务实际提交后抛错；以同一入库编号的实际路径判定。
+                    actual = self.db.execute_query("SELECT path FROM videos WHERE id=?", (original_row['id'],))
+                    if not actual or actual[0]['path'] != old_path:
+                        raise
+                try:
+                    # 成功项逐条清除历史，后续重试只处理仍未恢复的条目。
+                    self.db.delete_rename_record(session_id, old_path, new_path)
+                except Exception:
+                    remaining = self.db.execute_query(
+                        "SELECT 1 FROM rename_history WHERE session_id=? AND old_path=? AND new_path=?",
+                        (session_id, old_path, new_path),
+                    )
+                    if remaining:
+                        raise
                 path_changes[new_path] = old_path
                 restored += 1
-                if xmp_issue:
-                    failures.append(f"{new_path}：视频已恢复，但{xmp_issue}")
             except Exception as exc:
-                failures.append(f"{new_path}：{exc}")
+                compensation_errors = []
+                compensate_files = video_moved
+                if video_moved and update_attempted:
+                    try:
+                        actual = self.db.execute_query("SELECT path FROM videos WHERE id=?", (original_row['id'],))
+                        if actual and actual[0]['path'] == old_path:
+                            try:
+                                self.db.update_video_path(old_path, new_path, status=original_row.get('status'))
+                            except Exception:
+                                actual = self.db.execute_query("SELECT path FROM videos WHERE id=?", (original_row['id'],))
+                                if not actual or actual[0]['path'] != new_path:
+                                    raise
+                        elif not actual or actual[0]['path'] != new_path:
+                            raise ValueError("无法确认原素材当前数据库路径")
+                    except Exception as db_exc:
+                        # 数据库路径无法核实时不盲目反向移动，保留所有文件和历史供核对。
+                        compensate_files = False
+                        compensation_errors.append(f"数据库补偿失败：{db_exc}；文件保持现状，请人工核对")
+                if compensate_files:
+                    if xmp_moved:
+                        try:
+                            if os.path.exists(new_xmp):
+                                raise FileExistsError("目标 XMP 路径已出现文件，未覆盖")
+                            os.rename(old_xmp, new_xmp)
+                        except Exception as xmp_exc:
+                            compensation_errors.append(f"XMP 补偿失败：{xmp_exc}")
+                    try:
+                        if os.path.exists(new_path):
+                            raise FileExistsError("目标视频路径已出现文件，未覆盖")
+                        os.rename(old_path, new_path)
+                    except Exception as file_exc:
+                        compensation_errors.append(f"视频补偿失败：{file_exc}")
+                failures.append(f"{new_path}：{exc}" + ("；" + "；".join(compensation_errors) if compensation_errors else ""))
                 self.log(f"回滚失败 {new_path}: {exc}")
 
         self._remap_work_scope(path_changes)
@@ -5953,7 +6117,6 @@ class VideoOrganizerService:
             "complete": complete,
         }
         if complete:
-            self.db.delete_session(session_id)
             self.log(f"回滚完成，还原了 {restored} 个文件。")
         else:
             self.log(
@@ -5964,7 +6127,7 @@ class VideoOrganizerService:
 
     @traced('export.fcpx')
     def export_to_fcpx_xml(self, output_path: str, selected_paths: Optional[List[str]] = None):
-        """导出 FCPX XML；selected_paths 限定导出集合（None 表示调用方已筛好则应显式传入）。"""
+        """导出符合 FCPXML 1.7 的资源与事件；None=全库，[]=空集合。"""
         videos = (
             self.db.get_all_videos()
             if selected_paths is None
@@ -5974,31 +6137,29 @@ class VideoOrganizerService:
         if not videos:
             self.log('没有可导出的素材；重复副本和待核对素材已跳过。')
             return False
-        xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE fcpxml>
-<fcpxml version="1.8">
-    <library>
-        <event name="AI_Organized_Videos">
-"""
-        for item in videos:
+        root = ET.Element("fcpxml", version="1.7")
+        resources = ET.SubElement(root, "resources")
+        library = ET.SubElement(root, "library")
+        event = ET.SubElement(library, "event", name="AI_Organized_Videos")
+        collections = {}
+        for index, item in enumerate(videos, start=1):
             path = item.get("path", "")
-            name = item.get("filename", "")
-            category = item.get("category", "")
-            tags_list = item.get("tags", [])
-            tags = ",".join(tags_list)
-            summary = item.get("summary", "")
-            
-            xml_content += f"""            <asset id="{hashlib.md5(path.encode()).hexdigest()}" name="{name}" src="file://{path}">
-                <keyword-collection name="{category}"/>
-                <keyword-collection name="{tags}"/>
-                <note>{summary}</note>
-            </asset>
-"""
-        xml_content += """        </event>
-    </library>
-</fcpxml>"""
+            name = str(item.get("filename") or "")
+            resource_id = f"r{index}"
+            ET.SubElement(resources, "asset", id=resource_id, name=name,
+                          src=Path(os.path.abspath(path)).as_uri())
+            clip = ET.SubElement(event, "asset-clip", name=name, ref=resource_id)
+            ET.SubElement(clip, "note").text = str(item.get("summary") or "")
+            keywords = [item.get("category"), *(item.get("tags") or [])]
+            for keyword in dict.fromkeys(str(value) for value in keywords if value):
+                ET.SubElement(clip, "keyword", value=keyword)
+                collections[keyword] = None
+        for keyword in collections:
+            ET.SubElement(event, "keyword-collection", name=keyword)
+        ET.indent(root)
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(xml_content)
+            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n')
+            f.write(ET.tostring(root, encoding="unicode"))
         self.log(f"已导出 FCPX XML: {output_path}")
 
     @traced('export.ale')
@@ -6661,6 +6822,11 @@ class VideoOrganizerService:
                 self.log(f"迁移过程出错 {filename}: {exc}")
             result["items"].append(item_result)
 
+        self._remap_work_scope({
+            item['source_path']: item['target_path']
+            for item in result['items']
+            if item['status'] in ('success', 'success_with_warning')
+        })
         self.invalidate_video_memory_cache()
         self.log(f"物理整理完成，成功迁移: {result['success_count']}")
         if return_details:

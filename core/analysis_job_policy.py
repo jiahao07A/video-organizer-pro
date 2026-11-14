@@ -106,7 +106,7 @@ def is_retriable(error: Any) -> bool:
         if code is not None:
             try:
                 c = int(code)
-                if c in (429, 502, 503, 504):
+                if c in (408, 429, 500, 502, 503, 504):
                     return True
                 if 400 <= c < 500:
                     return False
@@ -122,7 +122,7 @@ def is_retriable(error: Any) -> bool:
         if code is not None:
             try:
                 c = int(code)
-                if c in (429, 502, 503, 504):
+                if c in (408, 429, 500, 502, 503, 504):
                     return True
                 if 400 <= c < 500:
                     return False

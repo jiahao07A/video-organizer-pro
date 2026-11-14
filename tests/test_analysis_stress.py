@@ -223,8 +223,10 @@ def test_gateway_faults_preserve_retry_policy(monkeypatch, status):
                     responses = [future.result(timeout=15) for future in futures]
                 successes = sum(item is not None for item in responses)
                 result.update(requests=stats["requests"], succeeded=successes, peak_in_flight=stats["peak"], statuses=dict(stats["statuses"]))
-                assert successes == (128 if status == 429 else 0)
-                assert stats["requests"] == (256 if status == 429 else 128)
+                assert successes == 128
+                assert stats["requests"] == 256
+                assert len(stats["attempts"]) == 128
+                assert all(attempts == 2 for attempts in stats["attempts"].values())
                 assert len(clients) == 1
             finally:
                 for client in clients:

@@ -53,7 +53,7 @@ def test_diagnosis_redacts_actual_outbound_payload(service, monkeypatch):
     monkeypatch.setattr(FailureStore, "save_diagnosis", lambda *a: None)
     sent = []
     def capture(model, prompt, content, **kwargs):
-        sent.append(json.loads(content[0]))
+        sent.append(json.loads(content[0]["text"]))
         return {"cause": "timeout", "evidence": "504", "actions": ["retry"]}
     monkeypatch.setattr(service.ai, "_get_api_response", capture)
     assert service.diagnose_analysis_failures()["succeeded"] == 1

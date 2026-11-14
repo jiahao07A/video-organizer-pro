@@ -357,7 +357,8 @@ class WorkstationView(QWidget):
         layout.setSpacing(10)
 
         # 1. 顶部工具栏
-        toolbar = QHBoxLayout()
+        from ..widgets.flow_layout import FlowLayout
+        toolbar = FlowLayout(spacing=6)
 
         self.path_input = QLineEdit()
         self.path_input.setReadOnly(True)
@@ -413,7 +414,6 @@ class WorkstationView(QWidget):
         toolbar.addWidget(self.path_input)
         toolbar.addWidget(self.browse_btn)
         toolbar.addWidget(self.accumulate_btn)
-        toolbar.addSpacing(20)
         toolbar.addWidget(self.search_input)
         toolbar.addWidget(self.filter_btn)
         toolbar.addWidget(self.view_switch_btn)
@@ -429,6 +429,7 @@ class WorkstationView(QWidget):
 
         self.target_summary_label = QLabel("操作目标集：正在计算…")
         self.target_summary_label.setObjectName("operation_target_summary")
+        self.target_summary_label.setWordWrap(True)
         self.target_summary_label.setStyleSheet("color: #888; padding: 2px 4px;")
         self.target_summary_label.setToolTip(
             "批量操作规则：有列表选中时使用列表选中；无选中时使用当前可见列表全部。工作台目标不得越出工作范围。"
@@ -538,7 +539,7 @@ class WorkstationView(QWidget):
         from gui.services.responsive_table import ResponsiveTableLayout
         self.responsive_table = ResponsiveTableLayout(self)
 
-        controls_layout = QHBoxLayout()
+        controls_layout = FlowLayout(spacing=6)
         self.simulate_btn = QPushButton("模拟重命名")
         self.apply_btn = QPushButton("应用重命名")
         self.rollback_btn = QPushButton("回滚")
@@ -565,7 +566,6 @@ class WorkstationView(QWidget):
         controls_layout.addWidget(self.export_ale_btn)
         controls_layout.addWidget(self.sync_xmp_btn)
         controls_layout.addWidget(self.auto_organize_btn)
-        controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
         progress_layout = QVBoxLayout()
@@ -585,7 +585,8 @@ class WorkstationView(QWidget):
         self.sub_progress_bar.setFormat("本轮 %p%")
         bar_row.addWidget(QLabel("总"))
         bar_row.addWidget(self.progress_bar, 1)
-        bar_row.addWidget(QLabel("本轮"))
+        self.sub_progress_caption = QLabel("本轮")
+        bar_row.addWidget(self.sub_progress_caption)
         bar_row.addWidget(self.sub_progress_bar, 1)
         progress_layout.addWidget(self.status_label)
         progress_layout.addLayout(bar_row)
@@ -1132,6 +1133,8 @@ class WorkstationView(QWidget):
         if action == analyze_action:
             self.analyze_selected()
         elif action == recovery_action:
+            if self._reject_busy_operation():
+                return
             from gui.widgets.recovery_controls import launch_manual_recovery
             launch_manual_recovery(self)
         elif action == delete_action:
@@ -1145,6 +1148,8 @@ class WorkstationView(QWidget):
 
     def batch_replace_tags_ui(self):
         """弹出对话框进行批量标签替换（仅操作目标集）。"""
+        if self._reject_busy_operation():
+            return
         from PySide6.QtWidgets import QInputDialog
         targets = self._resolve_batch_targets()
         if not targets:
@@ -1168,7 +1173,7 @@ class WorkstationView(QWidget):
             f"（不会修改范围外的全库其它条目）",
             QMessageBox.Yes | QMessageBox.No,
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.Yes and not self._reject_busy_operation():
             self.service.bulk_replace_tags(old_tag, new_tag, selected_paths=targets)
             self.load_data()
             QMessageBox.information(self, "成功", f"已在 {len(targets)} 条目标中完成替换。")
@@ -1180,31 +1185,82 @@ class WorkstationView(QWidget):
             return
 
         def job():
-            return self.service.scan_and_register_work_scope()
+            # run_io_job 在启动线程前已保存 worker 并连接主线程进度接收器。
+            return self.service.scan_and_register_work_scope(
+                progress_callback=lambda snapshot: self._io_worker.progress_snapshot.emit(dict(snapshot))
+            )
+
+        started = time.monotonic()
+        latest = {}
+
+        def on_progress(snapshot):
+            latest.clear()
+            latest.update(snapshot)
+            percent = max(0, min(1000, int(snapshot.get("percent", 0))))
+            done = max(0, int(snapshot.get("completed", 0)))
+            total = max(0, int(snapshot.get("total", 0)))
+            phase = str(snapshot.get("phase_label") or "扫描")
+            elapsed = max(0, float(snapshot.get("elapsed_seconds", time.monotonic() - started)))
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"扫描总 {percent / 10:.1f}%")
+            if total:
+                self.sub_progress_bar.setRange(0, total)
+                self.sub_progress_bar.setValue(min(done, total))
+                self.sub_progress_bar.setFormat(f"{phase} {done}/{total}")
+            else:
+                # 枚举尚无分母，不用虚构百分比；数量继续反馈扫描活动。
+                self.sub_progress_bar.setRange(0, 0)
+                self.sub_progress_bar.setFormat(f"{phase} · 已发现 {done}")
+            self.status_label.setText(
+                f"{reason} · {phase} " + (f"{done}/{total}" if total else f"已发现 {done}")
+                + f" · 已用 {elapsed:.1f} 秒 · 发现 {snapshot.get('files_found', 0)}"
+                + f" · 新增 {snapshot.get('new_count', 0)} · 重复 {snapshot.get('duplicate_count', 0)}"
+                + f" · 失败 {snapshot.get('error_count', 0)}"
+            )
+            self.status_message.emit(self.status_label.text())
+            self.progress_updated.emit(percent // 10)
+
+        def finish_progress():
+            self.progress_bar.setVisible(False)
+            self.sub_progress_bar.setVisible(False)
+            self.progress_bar.setRange(0, 100)
+            self.sub_progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("总 %p%")
+            self.sub_progress_bar.setFormat("本轮 %p%")
+            self.sub_progress_caption.setText("本轮")
+            self.progress_updated.emit(-1)
+            self.set_ui_enabled(True)
 
         def on_ok(registered):
             n_reg = len(registered or [])
             self.load_data()
-            self.status_label.setText(f"{reason}完成；新入库未分析 {n_reg} 个")
+            elapsed = max(0, float(latest.get("elapsed_seconds", time.monotonic() - started)))
+            self.status_label.setText(
+                f"{reason}完成；新入库未分析 {n_reg} 个 · 已用 {elapsed:.1f} 秒"
+                + f" · 重复 {latest.get('duplicate_count', 0)} · 失败 {latest.get('error_count', 0)}"
+            )
             self.status_message.emit(self.status_label.text())
-            self.progress_bar.setVisible(False)
-            self.progress_bar.setRange(0, 100)
-            self.set_ui_enabled(True)
+            finish_progress()
 
         def on_fail(msg):
-            self.progress_bar.setVisible(False)
-            self.progress_bar.setRange(0, 100)
-            self.set_ui_enabled(True)
+            finish_progress()
+            self.status_label.setText(f"{reason}失败 · 已用 {time.monotonic() - started:.1f} 秒：{msg or '未知错误'}")
+            self.status_message.emit(self.status_label.text())
             QMessageBox.warning(self, "扫盘失败", msg or "未知错误")
 
         def on_start():
             self.set_ui_enabled(False)
             self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("扫描总 0.0%")
+            self.sub_progress_bar.setVisible(True)
+            self.sub_progress_bar.setRange(0, 0)
+            self.sub_progress_caption.setText("阶段")
             self.status_label.setText(f"{reason}中…")
 
         run_io_job(
-            self, fn=job, on_ok=on_ok, on_fail=on_fail, on_start=on_start,
+            self, fn=job, on_ok=on_ok, on_fail=on_fail, on_start=on_start, on_progress=on_progress,
             busy_message=f"{reason}中…",
         )
 
@@ -1295,33 +1351,20 @@ class WorkstationView(QWidget):
 
     def analyze_selected(self):
         """右键：仅分析当前列表选中（非「可见全部」回退）。"""
+        if self._reject_busy_operation():
+            return
         paths = self._get_selected_paths()
         if not paths:
             return
-        force = getattr(self, "force_reanalyze_cb", None) and self.force_reanalyze_cb.isChecked()
-        if force:
-            reply = QMessageBox.question(
-                self, "确认强制重新分析",
-                f"将对选中的 {len(paths)} 个视频强制重新分析并覆盖结果。是否继续？",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-        self.set_ui_enabled(False)
-        self.cancel_analysis_btn.setEnabled(True)
-        self.progress_bar.setValue(0)
-        self.sub_progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.sub_progress_bar.setVisible(True)
-        self.worker = AnalysisWorker(self.service, paths, force_reanalyze=bool(force))
-        self.worker.progress_updated.connect(self.update_status)
-        self.worker.snapshot_updated.connect(self.on_analysis_snapshot)
-        self.worker.result_ready.connect(self._receive_analysis_result)
-        self.worker.task_finished.connect(self._analysis_finished)
-        self.worker.start()
+        snapshot = self.service.resolve_operation_target_snapshot(
+            paths, paths, scope_paths=self._scope_paths(),
+        )
+        self._confirm_and_start_analysis(list(snapshot.target_paths), snapshot)
 
     def delete_selected(self):
         """工作台删除 = 移出工作范围（操作目标集）。"""
+        if self._reject_busy_operation():
+            return
         snapshot = self._resolve_batch_snapshot()
         paths = list(snapshot.target_paths)
         if not paths:
@@ -1338,7 +1381,7 @@ class WorkstationView(QWidget):
             f"仅从工作范围移除，素材库入库记录与磁盘文件都会保留。",
             QMessageBox.Yes | QMessageBox.No,
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.Yes and not self._reject_busy_operation():
             self.service.remove_videos_from_work_scope(paths)
             self.load_data()
 
@@ -1440,21 +1483,39 @@ class WorkstationView(QWidget):
             self.cancel_analysis_btn.setEnabled(False)
 
     def _has_active_background_task(self) -> bool:
-        """检查工作台自身的后台任务，防止范围在任务运行时被修改。"""
-        for name in ("_io_worker", "worker", "recovery_worker"):
-            worker = getattr(self, name, None)
-            if worker is None:
-                continue
-            try:
-                if worker.isRunning():
-                    return True
-            except RuntimeError:
-                # Qt 对象已销毁时视为没有可复用的活动任务。
-                continue
+        """检查服务和同窗页面的执行任务，允许只读查询并行。"""
+        lock = getattr(self.service, "_analysis_run_lock", None)
+        if lock is not None and lock.locked():
+            return True
+        library = getattr(self.window(), "library_page", None)
+        owners = [self]
+        if library is not None and library is not self:
+            owners.append(library)
+        for owner in owners:
+            for name in ("_io_worker", "worker", "recovery_worker"):
+                worker = getattr(owner, name, None)
+                if worker is None:
+                    continue
+                try:
+                    if worker.isRunning():
+                        return True
+                except RuntimeError:
+                    # Qt 对象已销毁时视为没有可复用的活动任务。
+                    continue
         return False
+
+    def _reject_busy_operation(self) -> bool:
+        """所有写入入口共用门禁，右键或直接调用也不能覆盖活动任务。"""
+        if not self._has_active_background_task():
+            return False
+        self.status_label.setText("已有后台任务在运行，请稍候。")
+        self.status_message.emit(self.status_label.text())
+        return True
 
     def start_analysis(self):
         """分析操作目标集：有选中用选中，无选中用当前可见；⊆ 工作范围。"""
+        if self._reject_busy_operation():
+            return
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先通过「浏览」设定工作范围。")
@@ -1462,6 +1523,12 @@ class WorkstationView(QWidget):
 
         snapshot = self._resolve_batch_snapshot()
         paths = list(snapshot.target_paths)
+        self._confirm_and_start_analysis(paths, snapshot)
+
+    def _confirm_and_start_analysis(self, paths, snapshot):
+        """按冻结目标统一确认副作用，确认后再次检查任务互斥。"""
+        if self._reject_busy_operation():
+            return
         if not paths:
             QMessageBox.warning(self, "警告", "工作范围内没有可分析的视频。")
             return
@@ -1496,6 +1563,8 @@ class WorkstationView(QWidget):
             if reply != QMessageBox.Yes:
                 return
 
+        if self._reject_busy_operation():
+            return
         self.set_ui_enabled(False)
         self.cancel_analysis_btn.setEnabled(True)
         self.progress_bar.setValue(0)
@@ -1515,6 +1584,8 @@ class WorkstationView(QWidget):
         self.worker.start()
 
     def start_rename(self, dry_run=True):
+        if self._reject_busy_operation():
+            return
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
@@ -1567,6 +1638,16 @@ class WorkstationView(QWidget):
             if reply == QMessageBox.No:
                 return
 
+        if self._reject_busy_operation():
+            return
+        if not dry_run:
+            preview = self.detail_panel.media_preview
+            preview_path = preview._path
+            if preview_path and os.path.normcase(os.path.abspath(preview_path)) in {
+                os.path.normcase(os.path.abspath(path)) for path in rename_paths
+            }:
+                # Windows 播放器停止后仍可持有文件句柄，实际更名前卸载本次目标。
+                preview.set_media(None)
         self.set_ui_enabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
@@ -1587,6 +1668,8 @@ class WorkstationView(QWidget):
         self.worker.start()
 
     def rollback_rename(self):
+        if self._reject_busy_operation():
+            return
         if self.service.rollback_last_session():
             QMessageBox.information(self, "成功", "已完整恢复上一次重命名会话。")
             self.load_data()
@@ -1616,6 +1699,8 @@ class WorkstationView(QWidget):
         self.progress_bar.setRange(0, 100)
 
     def export_fcpx(self):
+        if self._reject_busy_operation():
+            return
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
@@ -1627,6 +1712,9 @@ class WorkstationView(QWidget):
             return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出 FCPX XML", "", "FCPXML Files (*.fcpxml)")
         if not file_path:
+            return
+
+        if self._reject_busy_operation():
             return
 
         def job():
@@ -1648,6 +1736,8 @@ class WorkstationView(QWidget):
         )
 
     def export_ale(self):
+        if self._reject_busy_operation():
+            return
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
@@ -1659,6 +1749,9 @@ class WorkstationView(QWidget):
             return
         file_path, _ = QFileDialog.getSaveFileName(self, "导出 ALE (达芬奇)", "", "ALE Files (*.ale)")
         if not file_path:
+            return
+
+        if self._reject_busy_operation():
             return
 
         def job():
@@ -1686,6 +1779,8 @@ class WorkstationView(QWidget):
         )
 
     def sync_metadata(self):
+        if self._reject_busy_operation():
+            return
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
@@ -1705,6 +1800,9 @@ class WorkstationView(QWidget):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
+            return
+
+        if self._reject_busy_operation():
             return
 
         def job():
@@ -1745,6 +1843,8 @@ class WorkstationView(QWidget):
 
     def start_auto_organize(self):
         """物理整理：先模拟预览清单，确认后后台执行。"""
+        if self._reject_busy_operation():
+            return
         scope = self.service.get_work_scope_paths()
         if not scope:
             QMessageBox.warning(self, "警告", "请先设定工作范围。")
@@ -1774,6 +1874,8 @@ class WorkstationView(QWidget):
             filter_summary=self._filter_summary_text(),
         )
         if preview_dialog.exec() != QDialog.Accepted:
+            return
+        if self._reject_busy_operation():
             return
         selected_plan = preview_dialog.selected_plan()
         if not selected_plan:

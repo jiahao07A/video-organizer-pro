@@ -107,8 +107,8 @@ def test_cold_start_explicit_arrow_aliases():
 def test_subset_excludes_alias_pending_placeholder_and_caps():
     standards = {
         "mood": ["治愈", "紧张"] + [f"词{i}" for i in range(30)] + ["测试氛围1"],
-        "subject": ["男性", "女性"],
-        "custom": ["细节A"],
+        "subject": ["男性", "女性", "男人"],
+        "custom": ["细节A", "赛博"],
     }
     result = build_analysis_vocab_subset(
         standards,
@@ -127,8 +127,56 @@ def test_subset_excludes_alias_pending_placeholder_and_caps():
     assert len(result.by_group["mood"]) <= 5
     # usage 高的优先
     assert result.by_group["mood"][0] == "紧张"
-    assert result.total_count <= 20
-    assert result.placeholder_count >= 1
+    assert result.by_group["subject"] == ["女性", "男性"]
+    assert result.by_group["custom"] == ["细节A"]
+    assert result.total_count == 8
+    assert result.placeholder_count == 1
+
+
+@pytest.mark.parametrize(
+    "exclude_aliases,exclude_pending,expected",
+    [
+        (set(), set(), ["别名", "合法词", "待审词"]),
+        ({"别名"}, set(), ["合法词", "待审词"]),
+        (set(), {"待审词"}, ["别名", "合法词"]),
+        ({"别名"}, {"待审词"}, ["合法词"]),
+    ],
+)
+def test_subset_excludes_only_explicit_aliases_and_pending(
+    exclude_aliases, exclude_pending, expected,
+):
+    result = build_analysis_vocab_subset(
+        {"mood": ["合法词", "别名", "待审词"]},
+        exclude_aliases=exclude_aliases,
+        exclude_pending=exclude_pending,
+    )
+    assert result.by_group == {"mood": expected}
+    assert result.total_count == len(expected)
+
+
+@pytest.mark.parametrize(
+    "total_max,expected",
+    [
+        (0, {"mood": [], "subject": [], "custom": []}),
+        (1, {"mood": ["氛围A"], "subject": [], "custom": []}),
+        (5, {"mood": ["氛围A", "氛围B", "氛围C"], "subject": ["主体A", "主体B"], "custom": []}),
+        (8, {"mood": ["氛围A", "氛围B", "氛围C"], "subject": ["主体A", "主体B", "主体C"], "custom": ["建议A", "建议B"]}),
+    ],
+)
+def test_subset_total_budget_limits_across_groups(total_max, expected):
+    # 每组3词、组上限5；9词跨组竞争总预算，不能靠组内裁剪满足断言。
+    result = build_analysis_vocab_subset(
+        {
+            "mood": ["氛围C", "氛围B", "氛围A"],
+            "subject": ["主体C", "主体B", "主体A"],
+            "custom": ["建议C", "建议B", "建议A"],
+        },
+        per_closed_max=5,
+        total_max=total_max,
+    )
+    assert result.by_group == expected
+    assert result.total_count == total_max
+    assert sum(map(len, result.by_group.values())) == total_max
 
 
 def test_subset_thin_warns_on_placeholders_only():

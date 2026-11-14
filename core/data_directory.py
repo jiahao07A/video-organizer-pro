@@ -870,7 +870,7 @@ class DataDirectoryManager:
             if not os.path.exists(path):
                 continue
             try:
-                with open(path, "r", encoding="utf-8") as handle:
+                with open(path, "r", encoding="utf-8-sig") as handle:
                     payload = json.load(handle)
             except Exception as exc:
                 raise DataDirectoryError(f"{label} 无法读取: {exc}") from exc

@@ -16,6 +16,8 @@
 
 安装程序提供标准 Windows 安装向导、开始菜单入口、可选桌面快捷方式和卸载入口。安装版不需要用户预先安装 Python。首次启动时，程序会在安装目录下建立 `data` 管理数据目录；如果安装位置不可写，会提示选择其他目录。
 
+当前源码与安装器以 **Windows 10 1809（内部版本 17763）及以上、Windows 11 x64** 为支持范围，安装器会拒绝更旧系统。这是当前 Qt 依赖的最低系统要求；本轮验证在 Windows 11 上进行，尚未取得 Windows 10 实机或虚拟机验证结果。
+
 > AI 分析仍需要用户配置可用的 OpenAI 兼容 API。`ffmpeg` 仅在音频转录或视频内部元数据处理等功能需要时使用，不随本安装程序承诺内置。
 
 ## 这个项目解决什么问题
@@ -170,7 +172,7 @@ API Key 只保存在本机管理数据目录中。不要把 `settings.json`、�
 
 ## 从源码运行
 
-正式版用户优先使用安装程序。源码运行支持 Windows x64 上的 Python 3.11、3.12 和 3.13。运行依赖固定在 `requirements.txt`，测试与打包依赖固定在 `requirements-dev.txt`。
+正式版用户优先使用安装程序。源码运行支持 Windows 10 1809 及以上、Windows 11 x64 上的 Python 3.11、3.12 和 3.13。运行依赖固定在 `requirements.txt`，测试与打包依赖固定在 `requirements-dev.txt`。
 
 ```powershell
 python -m venv .venv
@@ -218,7 +220,7 @@ python build.py
 - 发布包清单审计：排除 API Key、设置、标签配置、数据库、日志、备份、缩略图缓存和真实视频
 - 隔离安装后的启动/退出与标准卸载流程冒烟
 
-已发布资产页面会记录安装包大小和 SHA-256。正式版 `v0.0.0` 完整测试结果为 `408 passed, 1 failed`：失败项为首次升级对话框 GUI 测试 `tests/test_startup_upgrade_gui.py::test_startup_upgrade_dialog_confirms_and_reports_progress`，该用例单独运行曾通过，但完整套件运行会超时；这是当前已知限制。自动化测试通过不代表外部 AI 服务、所有视频编码、剪辑软件导入和所有文件系统权限组合都已覆盖。
+已发布资产页面会记录安装包大小和 SHA-256。历史正式版 `v0.0.0` 完整测试结果为 `408 passed, 1 failed`：当时首次升级对话框 GUI 测试 `tests/test_startup_upgrade_gui.py::test_startup_upgrade_dialog_confirms_and_reports_progress` 在完整套件中超时。该数字仅记录历史发布状态；当前源码的分模块审查、修复、测试与平台边界见 [2026-11-14 全项目审查报告](docs/reviews/2026-11-14-project-review.md)。自动化测试通过不代表外部 AI 服务、所有视频编码、剪辑软件导入和所有文件系统权限组合都已覆盖。
 
 ## 项目结构
 
