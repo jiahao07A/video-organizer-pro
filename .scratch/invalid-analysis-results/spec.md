@@ -1,8 +1,9 @@
 # 阻止无效分析结果污染素材与文件名
 
-Status: implemented-pending-acceptance
+Status: resolved
 GitHub Issue: #73 — https://github.com/jiahao07A/video-organizer-pro/issues/73
 Branch: fix/73-invalid-analysis-results
+PR: https://github.com/jiahao07A/video-organizer-pro/pull/76
 
 ## 背景与目标
 
@@ -48,8 +49,10 @@ RC7 与 RC8 存在同一缺陷：合法 JSON 中的失败性摘要被当作分�
 - [x] 完成相关回归、并发及真实抽帧验证
 - [x] 完成独立 Subagent 审查、主 Agent 修复及新 Subagent 复审循环
 - [x] 用户验收并明确批准提交、合并与发布
-- [ ] PR 获得非作者批准并合入 main
-- [ ] 从合并后的 main 构建、签名、隔离验收并发布 rc9
+- [x] PR 获得非作者批准并合入 main
+- [x] 从合并后的 main 构建、签名、隔离验收并发布 rc9
+
+结项：PR #76 已合并，主干提交 `ed2744b407a9d9dccf74d119a886effedd31957d`；`v0.0.1-rc9` 已公开为预发布，最终隔离安装冒烟、下载资产 SHA-256 与 Ed25519 清单验签通过。完整证据见 [verification.md](./verification.md)；发布记录 PR #77 已合并。
 
 ## Comments
 
