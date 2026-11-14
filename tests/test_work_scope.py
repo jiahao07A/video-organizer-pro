@@ -169,6 +169,45 @@ class TestScanAndRegister:
         row2 = service.db.get_video_by_path(video)
         assert row2["summary"] == "原始摘要勿覆盖"
 
+    def test_pending_history_scan_refreshes_l1_cache(
+        self, service: VideoOrganizerService, tmp_path: Path
+    ):
+        historical = tmp_path / "offline" / "historical.mp4"
+        service.db.insert_video_if_absent(
+            {
+                "path": str(historical),
+                "filename": historical.name,
+                "status": "pending",
+            }
+        )
+        assert service.get_all_videos()[0]["fingerprint_state"] == "pending"
+
+        historical.parent.mkdir()
+        historical.write_bytes(b"history returned")
+        eligible = service.filter_processable_paths([str(historical)])
+
+        assert eligible == [str(historical)]
+        cached = service.get_all_videos()
+        restored = next(row for row in cached if row["path"] == str(historical))
+        assert restored["fingerprint_state"] == "verified"
+        assert restored["file_hash"]
+
+    def test_manual_pending_fingerprint_refresh_invalidates_l1_cache(
+        self, service: VideoOrganizerService, tmp_path: Path
+    ):
+        historical = tmp_path / "offline" / "manual.mp4"
+        service.db.insert_video_if_absent(
+            {"path": str(historical), "filename": historical.name, "status": "pending"}
+        )
+        assert service.get_all_videos()[0]["fingerprint_state"] == "pending"
+        historical.parent.mkdir()
+        historical.write_bytes(b"manual refresh")
+
+        assert service.refresh_pending_media_fingerprints() is True
+        restored = service.get_all_videos()[0]
+        assert restored["fingerprint_state"] == "verified"
+        assert restored["file_hash"]
+
     def test_file_scope_registers_single(self, service: VideoOrganizerService, tmp_path: Path):
         video = _touch_video(tmp_path / "single.mp4")
         other = _touch_video(tmp_path / "other.mp4")

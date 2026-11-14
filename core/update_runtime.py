@@ -32,17 +32,19 @@ def hold_application_mutex():
         # Inno Setup may start the application from its post-install action
         # before releasing its own mutex. Wait briefly for that normal race;
         # a long-held mutex still indicates a genuinely active installer.
-        installing = None
+        installer_active = False
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            installing = kernel.OpenMutexW(0x100000, False, "VideoOrganizerPro.Installing")
-            if not installing:
+            installer_handle = kernel.OpenMutexW(
+                0x100000, False, "VideoOrganizerPro.Installing"
+            )
+            if not installer_handle:
+                installer_active = False
                 break
-            kernel.CloseHandle(installing)
-            installing = None
+            installer_active = True
+            kernel.CloseHandle(installer_handle)
             time.sleep(0.1)
-        if installing:
-            kernel.CloseHandle(installing)
+        if installer_active:
             raise UpdateError("安装器正在运行，请完成或取消安装后再启动应用")
         kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
         kernel.CreateMutexW.restype = ctypes.c_void_p

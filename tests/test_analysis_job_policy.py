@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """分析任务策略纯逻辑（ticket 01）。"""
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -47,8 +49,23 @@ def test_should_retry_call_bounds():
     assert should_retry_call(1, call_extra_attempts=0) is False
 
 
-def test_should_retry_item_bounds():
-    assert should_retry_item(1, item_max_attempts=2) is True
+@pytest.mark.parametrize(
+    ("error", "retriable"),
+    [
+        (TimeoutError("timeout"), True),
+        ("401 Unauthorized", False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("attempt_b", "expected"),
+    [(1, True), (2, False)],
+)
+def test_should_retry_item_bounds(error, retriable, attempt_b, expected):
+    """单条重试必须同时满足瞬时错误和次数上限。"""
+    assert is_retriable(error) is retriable
+    bounded = should_retry_item(attempt_b, item_max_attempts=2)
+    assert bounded is expected
+    assert (is_retriable(error) and bounded) is (retriable and expected)
 
 
 @pytest.mark.parametrize("shape", ["exception", "response", "dict"])
@@ -101,6 +118,86 @@ def test_backoff_injectable():
     d = sleep_backoff(1, config=RetryConfig(backoff_base_sec=1.0), sleeper=slept.append)
     assert d == 1.0
     assert slept == [1.0]
+
+
+def test_backoff_cancel_event_wakes_without_waiting_full_delay():
+    from core.analysis_job_policy import sleep_backoff
+
+    waiter_started = threading.Event()
+
+    class TrackedEvent(threading.Event):
+        def wait(self, timeout=None):
+            waiter_started.set()
+            return super().wait(timeout)
+
+    cancel = TrackedEvent()
+    def trigger_cancel():
+        waiter_started.wait()
+        cancel.set()
+
+    setter = threading.Thread(target=trigger_cancel)
+    setter.start()
+    started = time.monotonic()
+    waiter_started.set()
+    delay = sleep_backoff(
+        1,
+        config=RetryConfig(backoff_base_sec=10.0, backoff_cap_sec=10.0),
+        cancel_event=cancel,
+    )
+    setter.join(timeout=1)
+
+    assert delay == 10.0
+    assert time.monotonic() - started < 0.5
+    assert not setter.is_alive()
+
+
+def test_backoff_cancel_event_precedes_blocking_injected_sleeper():
+    from core.analysis_job_policy import sleep_backoff
+
+    waiter_started = threading.Event()
+    release_sleeper = threading.Event()
+    sleeper_called = threading.Event()
+
+    class TrackedEvent(threading.Event):
+        def wait(self, timeout=None):
+            waiter_started.set()
+            return super().wait(timeout)
+
+    cancel = TrackedEvent()
+
+    def trigger_cancel():
+        assert waiter_started.wait(1)
+        cancel.set()
+
+    def release_guard():
+        release_sleeper.wait(0.2)
+        release_sleeper.set()
+
+    def blocking_sleeper(_delay):
+        sleeper_called.set()
+        release_sleeper.wait()
+
+    setter = threading.Thread(target=trigger_cancel)
+    guard = threading.Thread(target=release_guard)
+    setter.start()
+    guard.start()
+    started = time.monotonic()
+    delay = sleep_backoff(
+        1,
+        config=RetryConfig(backoff_base_sec=10.0, backoff_cap_sec=10.0),
+        sleeper=blocking_sleeper,
+        cancel_event=cancel,
+    )
+    elapsed = time.monotonic() - started
+    setter.join(timeout=1)
+    guard.join(timeout=1)
+
+    assert delay == 10.0
+    assert cancel.is_set()
+    assert not sleeper_called.is_set()
+    assert elapsed < 0.1
+    assert not setter.is_alive()
+    assert not guard.is_alive()
 
 
 def test_progress_first_round_denominator_and_no_b_inflate():

@@ -71,6 +71,69 @@ def test_monitor_duplicate_batch_completes_without_analysis(service, tmp_path, m
         monitor.stop(shutdown_analysis=True)
 
 
+def test_monitor_batch_refreshes_pending_fingerprints_once_for_all_gates(
+    service, tmp_path, monkeypatch
+):
+    root = tmp_path / 'watched'
+    root.mkdir()
+    config = normalize_watch_config({'xmp_mode': 'off', 'directories': [{'path': str(root)}]})
+    monitor = MediaDirectoryMonitor(service, config)
+    calls = []
+    original_query = service.db.execute_query
+
+    def count_pending_query(sql, params=()):
+        if "fingerprint_state='pending'" in sql:
+            calls.append(sql)
+        return original_query(sql, params)
+
+    monkeypatch.setattr(service.db, 'execute_query', count_pending_query)
+    paths = []
+    for index in range(3):
+        path = root / f'clip-{index}.mp4'
+        path.write_bytes(f'clip {index}'.encode())
+        paths.append(str(path))
+        monitor._process_video(str(path))
+    batch = service.db.execute_query(
+        "SELECT * FROM media_watch_batches WHERE state='queued' ORDER BY created_at LIMIT 1"
+    )[0]
+    items = service.db.execute_query(
+        "SELECT * FROM media_watch_items WHERE batch_id=? ORDER BY id", (batch['id'],)
+    )
+    monitor.registry._indexed = False
+    calls.clear()
+
+    def process_video(path, *_args, **_kwargs):
+        return {'status': 'analyzed', 'path': path}, None
+
+    def persist_success(result, **_kwargs):
+        service.db.execute_non_query(
+            "UPDATE videos SET status='analyzed' WHERE path=?", (result['path'],)
+        )
+        return 0
+
+    monkeypatch.setattr(service, '_process_single_video', process_video)
+    monkeypatch.setattr(service, '_persist_analysis_success', persist_success)
+    try:
+        monitor._execute_claimed_batch(batch, items)
+        assert len(calls) == 1
+        assert [service.media_registry.items()[index]['stage'] for index in range(3)] == [
+            'done', 'done', 'done'
+        ]
+    finally:
+        monitor.stop(shutdown_analysis=True)
+
+
+def test_empty_monitor_batch_does_not_refresh_pending_fingerprints(service, monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, 'refresh_pending_media_fingerprints', lambda: calls.append(True))
+    monitor = MediaDirectoryMonitor(service, normalize_watch_config({'directories': []}))
+    try:
+        monitor._execute_claimed_batch({'id': 1, 'config': '{}'}, [])
+        assert calls == []
+    finally:
+        monitor.stop(shutdown_analysis=True)
+
+
 def test_persistent_batch_resumes_and_runs_only_unfinished_stages(service, tmp_path, monkeypatch):
     root = tmp_path / 'watched'
     root.mkdir()
@@ -587,6 +650,38 @@ def test_accept_changes_uses_selection_from_operation_start(service, tmp_path, m
         assert service.db.get_video_by_path(rows[0]['path'])['fingerprint_state'] == 'verified'
         assert stages[rows[0]['id']] == 'queued'
         assert stages[rows[1]['id']] == 'pending'
+    finally:
+        monitor.stop(shutdown_analysis=True)
+
+
+def test_manual_fingerprint_button_uses_service_refresh_and_updates_cache(
+    service, tmp_path, app, monkeypatch
+):
+    from PySide6.QtWidgets import QPushButton
+    from gui.views.media_watch_workspace import MediaWatchWorkspace
+
+    historical = tmp_path / 'offline-manual.mp4'
+    service.db.insert_video_if_absent(
+        {'path': str(historical), 'filename': historical.name, 'status': 'pending'}
+    )
+    assert service.get_all_videos()[0]['fingerprint_state'] == 'pending'
+    historical.write_bytes(b'manual GUI refresh')
+    monitor = MediaDirectoryMonitor(
+        service,
+        normalize_watch_config({'directories': [{'path': str(tmp_path)}]}),
+    )
+    service.media_monitor = monitor
+    try:
+        page = MediaWatchWorkspace(service)
+        page._job = lambda fn, on_ok=None: fn()
+        button = next(
+            item for item in page.findChildren(QPushButton)
+            if item.text() == '补齐历史指纹'
+        )
+        button.click()
+        row = service.get_all_videos()[0]
+        assert row['fingerprint_state'] == 'verified'
+        assert row['file_hash']
     finally:
         monitor.stop(shutdown_analysis=True)
 

@@ -584,7 +584,8 @@ def test_real_catalog_scan_propagates_context_to_thumbnail_pool(runtime, tmp_pat
         db=SimpleNamespace(get_video_by_path=lambda path: None),
         media_registry=SimpleNamespace(register=lambda path, **_: {'path': path, 'filename': path}),
         processor=SimpleNamespace(extract_frames=extract), _thumbnail_dir=str(tmp_path),
-        log=lambda message: None, invalidate_video_memory_cache=lambda: None)
+        log=lambda message: None, invalidate_video_memory_cache=lambda: None,
+        refresh_pending_media_fingerprints=lambda: None)
     assert VideoOrganizerService.scan_and_register_work_scope(service) == sources
     events = read_events(runtime)
     operation = next(e for e in events if e.get('operation') == 'catalog.scan' and e['event'] == 'operation.start')

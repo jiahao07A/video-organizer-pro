@@ -97,19 +97,28 @@ class MediaRegistry:
         self._indexed = False
 
     def index_existing(self, progress=None, *, force=False):
-        """仅补齐历史指纹；离线文件仍保持 pending，后续调用可再补齐。"""
+        """补齐历史指纹；批次边界可 force 重试仍处于 pending 的离线文件。"""
         with self._index_lock:
             if self._indexed and not force:
-                return
+                return False
             rows = self.db.execute_query("SELECT id,path FROM videos WHERE fingerprint_state='pending' ORDER BY id")
+            updated = False
             for index, row in enumerate(rows):
                 try:
-                    self.register(row['path'], source='unknown', record_event=False, index_existing=False)
+                    current = self.register(
+                        row['path'], source='unknown', record_event=False, index_existing=False
+                    )
+                    updated = updated or bool(
+                        current
+                        and current.get('fingerprint_state') != 'pending'
+                        and current.get('file_hash')
+                    )
                 except (OSError, ValueError):
                     pass
                 if progress:
                     progress(index + 1, len(rows))
             self._indexed = True
+            return updated
 
     def register(self, path, *, source='manual', task_id='', batch_id='', record_event=True, index_existing=True,
                  owned_content_update=False):
@@ -123,7 +132,26 @@ class MediaRegistry:
             raise OSError('指纹校验期间文件仍在变化，等待稳定后重试')
         with self.db.lock, self.db._managed_connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            row = conn.execute("SELECT * FROM videos WHERE lower(replace(path,char(92),'/'))=?", (path_key(path),)).fetchone()
+            row = conn.execute("SELECT * FROM videos WHERE path=? LIMIT 1", (path,)).fetchone()
+            if row is None and os.name == 'nt':
+                # 仅大小写/斜杠变体才走这条低频兼容路径；普通登记保持索引友好的精确查询。
+                identity = path_key(path)
+                candidates = conn.execute("SELECT id,path FROM videos ORDER BY id").fetchall()
+                match = None
+                for candidate in candidates:
+                    candidate_path = candidate['path']
+                    if not candidate_path:
+                        continue
+                    if path_key(candidate_path) != identity:
+                        continue
+                    try:
+                        if os.path.samefile(candidate_path, path):
+                            match = candidate
+                            break
+                    except OSError:
+                        continue
+                if match is not None:
+                    row = conn.execute("SELECT * FROM videos WHERE id=?", (match['id'],)).fetchone()
             if row is None:
                 cursor = conn.execute(
                     "INSERT INTO videos(path,filename,original_filename,file_hash,status,tags,tag_groups,raw_metadata,source_kind,source_task_id,source_batch_id) VALUES(?,?,?,?,'pending','[]','{}','{}',?,?,?)",
@@ -162,8 +190,8 @@ class MediaRegistry:
             result = dict(conn.execute('SELECT * FROM videos WHERE id=?', (video_id,)).fetchone())
         return self.db._row_to_video_dict(result)
 
-    def eligible_paths(self, paths, *, verify=True):
-        self.index_existing()
+    def eligible_paths(self, paths, *, verify=True, force_index=True):
+        self.index_existing(force=force_index)
         eligible = []
         for path in dict.fromkeys(paths):
             if verify and os.path.isfile(path):

@@ -1,5 +1,7 @@
-import threading
+import os
 from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from core.media_registry import MediaRegistry
 from core.video_organizer_service import DatabaseManager
@@ -86,3 +88,64 @@ def test_offline_history_can_be_rechecked_and_corrects_earliest_identity(tmp_pat
     assert original['summary'] == 'historical'
     assert not original['duplicate_of']
     assert db.get_video_by_path(str(copy))['duplicate_of'] == original['id']
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows 路径大小写规则仅在 Windows 上适用')
+def test_unicode_case_variant_path_reuses_one_video_row(tmp_path):
+    db = DatabaseManager(str(tmp_path / 'catalog.db'))
+    registry = MediaRegistry(db)
+    upper = tmp_path / 'Ä.mp4'
+    lower = tmp_path / 'ä.mp4'
+    upper.write_bytes(b'unique video')
+
+    assert os.path.samefile(upper, lower)
+    first = registry.register(str(upper))
+    second = registry.register(str(lower))
+
+    assert second['id'] == first['id']
+    assert len(db.get_all_videos()) == 1
+
+
+def test_pending_history_retries_without_force_after_file_returns(tmp_path):
+    db = DatabaseManager(str(tmp_path / 'catalog.db'))
+    old = tmp_path / 'offline.mp4'
+    db.insert_video_if_absent(
+        {'path': str(old), 'filename': old.name, 'status': 'pending'}
+    )
+    registry = MediaRegistry(db)
+
+    registry.index_existing(force=True)
+    assert db.get_video_by_path(str(old))['fingerprint_state'] == 'pending'
+
+    old.write_bytes(b'available again')
+    registry.index_existing(force=True)
+
+    restored = db.get_video_by_path(str(old))
+    assert restored['fingerprint_state'] == 'verified'
+    assert restored['file_hash']
+
+
+def test_register_only_scans_pending_history_once_per_registry(tmp_path, monkeypatch):
+    db = DatabaseManager(str(tmp_path / 'catalog.db'))
+    for index in range(100):
+        path = tmp_path / 'offline' / f'{index}.mp4'
+        db.insert_video_if_absent(
+            {'path': str(path), 'filename': path.name, 'status': 'pending'}
+        )
+    registry = MediaRegistry(db)
+    pending_queries = 0
+    original_execute_query = db.execute_query
+
+    def count_pending_queries(sql, params=()):
+        nonlocal pending_queries
+        if "fingerprint_state='pending'" in sql:
+            pending_queries += 1
+        return original_execute_query(sql, params)
+
+    monkeypatch.setattr(db, 'execute_query', count_pending_queries)
+    for index in range(10):
+        path = tmp_path / f'new-{index}.mp4'
+        path.write_bytes(b'new')
+        registry.register(str(path))
+
+    assert pending_queries == 1

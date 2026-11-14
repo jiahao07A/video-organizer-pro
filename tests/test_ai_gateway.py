@@ -246,6 +246,62 @@ def test_cancelled_request_does_not_submit_call():
     assert failure.retriable is False
 
 
+def test_cancelled_during_chat_backoff_does_not_submit_next_call():
+    cancel = threading.Event()
+
+    class TimeoutClient(FakeChatClient):
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            cancel.set()
+            raise TimeoutError("timed out")
+
+    client = TimeoutClient([])
+    gateway = AiRequestGateway({})
+    result = gateway.request_chat(
+        model="m",
+        system_prompt="sys",
+        content_parts=[],
+        client=client,
+        cancel_event=cancel,
+        retry_config=RetryConfig(call_extra_attempts=1, backoff_base_sec=10.0),
+    )
+
+    assert result is None
+    assert len(client.calls) == 1
+    failure = gateway.get_last_failure()
+    assert failure.cancelled is True
+    assert failure.retriable is False
+
+
+def test_cancelled_during_audio_backoff_does_not_submit_next_call(tmp_path):
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"audio")
+    cancel = threading.Event()
+    calls = []
+
+    def transcribe(**kwargs):
+        calls.append(kwargs)
+        cancel.set()
+        raise TimeoutError("timed out")
+
+    client = SimpleNamespace(
+        audio=SimpleNamespace(transcriptions=SimpleNamespace(create=transcribe))
+    )
+    gateway = AiRequestGateway({})
+    result = gateway.transcribe_audio(
+        str(audio),
+        client=client,
+        cancel_event=cancel,
+        retry_config=RetryConfig(call_extra_attempts=1, backoff_base_sec=10.0),
+    )
+
+    assert result is None
+    assert len(calls) == 1
+    failure = gateway.get_last_failure()
+    assert failure.cancelled is True
+    assert failure.retriable is False
+
+
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
 @pytest.mark.parametrize("request_kind", ["chat", "audio"])
 def test_http_error_status_overrides_transient_text(tmp_path, status_code, request_kind):

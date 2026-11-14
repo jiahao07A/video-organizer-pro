@@ -127,7 +127,7 @@ class MediaWatchWorkspace(QWidget):
         content.addLayout(filter_row)
         pages = QHBoxLayout()
         for text, handler in [('上一页', lambda: self._page(-1)), ('下一页', lambda: self._page(1)),
-                              ('补齐历史指纹', lambda: self._job(lambda: self.registry.index_existing(force=True)))]:
+                              ('补齐历史指纹', lambda: self._job(lambda: self.service.refresh_pending_media_fingerprints()))]:
             button = QPushButton(text)
             button.clicked.connect(handler)
             pages.addWidget(button)
