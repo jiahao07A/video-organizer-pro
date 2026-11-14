@@ -103,7 +103,9 @@ def classify(error):
     text = (str(error.get("error_code") or "") + " " + str(error.get("exception_type") or "") + " " + message).lower()
     stage = error.get("stage") or error.get("task_key") or "unknown"
     category = "unknown"
-    if stage == "save":
+    if 'invalid analysis result' in text or 'invalid_analysis_result' in text:
+        category = "response"
+    elif stage == "save":
         category = "storage"
     elif stage == "extract" or any(x in text for x in ("filenotfounderror", "permissionerror", "文件不存在", "无法抽取", "无法打开视频", "解码", "no such file")):
         category = "file"

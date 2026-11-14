@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QBrush
 from core.video_organizer_service import VideoOrganizerService, FileManager, SettingsManager
+from core.analysis_result import InvalidAnalysisResult
 from gui.styles import get_theme_colors, normalize_theme
 
 
@@ -101,8 +102,8 @@ class BatchRenameDialog(QDialog):
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
         self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
         self.preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.preview_table.setColumnWidth(1, 420)
-        self.preview_table.setColumnWidth(2, 420)
+        self.preview_table.setColumnWidth(1, 340)
+        self.preview_table.setColumnWidth(2, 340)
         self.preview_table.setAlternatingRowColors(True)
         self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -157,6 +158,7 @@ class BatchRenameDialog(QDialog):
             }}
             QTableWidget#rename_preview_table {{
                 background-color: {c["item_bg"]};
+                alternate-background-color: {c["panel_bg"]};
                 color: {c["text"]};
                 gridline-color: {c["border"]};
                 border: 1px solid {c["border"]};
@@ -240,7 +242,12 @@ class BatchRenameDialog(QDialog):
             source_path = str(video.get("path") or "")
             if not source_path:
                 continue
-            new_name = self.get_preview_filename(video, pattern, find_regex, replace_str)
+            blocked_reason = ''
+            try:
+                new_name = self.get_preview_filename(video, pattern, find_regex, replace_str)
+            except InvalidAnalysisResult as exc:
+                new_name = os.path.basename(source_path)
+                blocked_reason = str(exc)
             target_path = os.path.join(os.path.dirname(source_path), new_name)
             source_key = self._path_key(source_path)
             target_key = self._path_key(target_path)
@@ -253,6 +260,7 @@ class BatchRenameDialog(QDialog):
                 "target_key": target_key,
                 "unchanged": unchanged,
                 "target_exists": target_exists,
+                "blocked_reason": blocked_reason,
             })
 
         planned_targets = {}
@@ -276,7 +284,10 @@ class BatchRenameDialog(QDialog):
             check_item.setFlags(check_item.flags() | Qt.ItemIsUserCheckable)
             excluded = row["source_key"] in self._excluded_paths
             check_item.setCheckState(Qt.Unchecked if excluded else Qt.Checked)
-            check_item.setToolTip("取消勾选可从本次重命名中排除")
+            if row['blocked_reason']:
+                check_item.setCheckState(Qt.Unchecked)
+                check_item.setFlags(check_item.flags() & ~Qt.ItemIsEnabled)
+            check_item.setToolTip(row['blocked_reason'] or "取消勾选可从本次重命名中排除")
             self.preview_table.setItem(row_index, 0, check_item)
 
             source_item = QTableWidgetItem(row["source_path"])
@@ -286,7 +297,9 @@ class BatchRenameDialog(QDialog):
             target_item.setForeground(unchanged_brush if row["unchanged"] else changed_brush)
             target_item.setToolTip(row["target_path"])
 
-            if row["unchanged"]:
+            if row['blocked_reason']:
+                state = "分析无效，已阻止"
+            elif row["unchanged"]:
                 state = "无需更名"
             elif row["target_exists"]:
                 state = "目标已存在；执行时可能改用冲突路径"
@@ -295,13 +308,13 @@ class BatchRenameDialog(QDialog):
             else:
                 state = "可执行"
             state_item = QTableWidgetItem(state)
-            if row["target_exists"] or row.get("duplicate_planned_target"):
+            if row['blocked_reason'] or row["target_exists"] or row.get("duplicate_planned_target"):
                 state_item.setForeground(QBrush(QColor(self._colors["danger"])))
             elif row["unchanged"]:
                 state_item.setForeground(unchanged_brush)
             else:
                 state_item.setForeground(text_brush)
-            state_item.setToolTip(state)
+            state_item.setToolTip(row['blocked_reason'] or state)
             self.preview_table.setItem(row_index, 1, source_item)
             self.preview_table.setItem(row_index, 2, target_item)
             self.preview_table.setItem(row_index, 3, state_item)
@@ -342,18 +355,20 @@ class BatchRenameDialog(QDialog):
     def _update_preview_summary(self):
         active_rows = [
             row for row in self._preview_rows
-            if row["source_key"] not in self._excluded_paths
+            if row["source_key"] not in self._excluded_paths and not row.get('blocked_reason')
         ]
         unchanged = sum(1 for row in active_rows if row["unchanged"])
         conflicts = sum(
             1 for row in active_rows
             if row["target_exists"] or row.get("duplicate_planned_target")
         )
-        excluded_count = len(self._preview_rows) - len(active_rows)
+        blocked_count = sum(bool(row.get('blocked_reason')) for row in self._preview_rows)
+        excluded_count = len(self._preview_rows) - len(active_rows) - blocked_count
         self.preview_summary_label.setText(
             f"预览条目 {len(self._preview_rows)} 条；当前选择 {len(active_rows)} 条；"
             f"排除 {excluded_count} 条；无需更名 {unchanged} 条；目标冲突 {conflicts} 条。"
             + (" 冲突时执行路径可能与请求目标路径不同。" if conflicts else "")
+            + (f" 已阻止 {blocked_count} 条无效分析结果，请重新分析或人工修正摘要。" if blocked_count else "")
         )
         regex_valid = not (
             self.regex_find.text() and self.status_label.text().startswith("正则错误")
@@ -379,7 +394,7 @@ class BatchRenameDialog(QDialog):
         """返回按原始方案顺序保留的源路径快照。"""
         return [
             row["source_path"] for row in self._preview_rows
-            if row["source_key"] not in self._excluded_paths and not row["unchanged"]
+            if row["source_key"] not in self._excluded_paths and not row["unchanged"] and not row.get('blocked_reason')
         ]
 
     def get_final_config(self):

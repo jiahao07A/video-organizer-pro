@@ -158,6 +158,7 @@ def is_retriable(error: Any) -> bool:
             return False
 
     retriable_markers = (
+        "invalid analysis result",
         "timeout",
         "timed out",
         "connection reset",
