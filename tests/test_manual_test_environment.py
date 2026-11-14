@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -71,3 +72,37 @@ def test_manual_environment_cleanup_is_idempotent_and_restores_log_routing(
     assert (environment.diagnostics_path / "cleanup-report.json").exists()
     assert os.environ.get(DIAGNOSTICS_ENV) is None
     assert os.environ.get(SESSION_ENV) is None
+
+
+def test_manual_environment_redacts_secrets_paths_and_exception_text(tmp_path: Path):
+    environment = ManualTestEnvironment(
+        record_count=0,
+        diagnostics_root=str(tmp_path / "diagnostics"),
+        create_media_files=False,
+    ).start()
+    logger = logging.getLogger("VideoOrganizer.security_probe")
+    api_key = "sk-manual-probe-secret"
+    bearer = "manual-probe-bearer-secret"
+    private_path = r"C:\Users\SyntheticUser\客户访谈.mp4"
+
+    try:
+        logger.error(
+            "api_key=%s Authorization: Bearer %s file=%s name=%s",
+            api_key,
+            bearer,
+            private_path,
+            "客户访谈.mp4",
+        )
+        try:
+            raise RuntimeError(f"request failed with {api_key} at {private_path}")
+        except RuntimeError:
+            logger.exception("synthetic request exception")
+    finally:
+        environment.close()
+
+    text = environment.diagnostics_log.read_text(encoding="utf-8")
+    for sensitive_value in (api_key, bearer, "SyntheticUser", "客户访谈.mp4"):
+        assert sensitive_value not in text
+    assert "<REDACTED>" in text
+    assert "<PATH:" in text
+    assert "RuntimeError" in text

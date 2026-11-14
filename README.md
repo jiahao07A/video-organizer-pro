@@ -126,7 +126,7 @@ API Key 只保存在本机管理数据目录中。不要把 `settings.json`、�
 离线更新需将官方安装包、`update.json` 和 `update.json.sig` 放在同一目录后导入。
 详细操作、旧版接入、失败恢复和维护者签名发布流程见 [软件更新与恢复](docs/软件更新与恢复.md)。
 
-源码环境需额外安装固定更新依赖：`python -m pip install -r requirements-update.txt`。
+源码环境通过 `requirements.txt` 安装并固定运行依赖；该清单包含更新功能依赖。
 
 安装版默认使用程序旁的 `data` 目录。管理数据包括：
 
@@ -170,13 +170,13 @@ API Key 只保存在本机管理数据目录中。不要把 `settings.json`、�
 
 ## 从源码运行
 
-正式版用户优先使用安装程序。开发者可以使用 Python 3.11 或 3.12 建立虚拟环境运行源码；当前发布构建已在 Windows x64、Python 3.13.12 环境验证过，但源码依赖尚未锁定到 `requirements.txt` 或 `pyproject.toml`。
+正式版用户优先使用安装程序。源码运行支持 Windows x64 上的 Python 3.11、3.12 和 3.13。运行依赖固定在 `requirements.txt`，测试与打包依赖固定在 `requirements-dev.txt`。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PySide6 opencv-python numpy openai Pillow ImageHash "scenedetect[opencv]" pytest
+python -m pip install -r requirements-dev.txt
 python video_organizer_pyside6.py
 ```
 
@@ -190,19 +190,17 @@ python video_organizer_app.py
 
 ## 开发者构建
 
-仓库使用 PyInstaller 的 `build_app.spec` 生成 Windows 目录包。`build.py` 会清理当前目录下的 `build/` 和 `dist/`，因此发布构建应使用隔离的工作路径和输出路径：
+仓库使用 PyInstaller 的 `build_app.spec` 生成 Windows 目录包。构建入口不会清理仓库中的目录，默认会在 `.release-build/local-build/` 下创建唯一的隔离输出目录：
 
 ```powershell
-python -m pip install PyInstaller
-python -m PyInstaller build_app.spec --noconfirm `
-  --workpath .release-build\work `
-  --distpath .release-build\dist
+python -m pip install -r requirements-dev.txt
+python build.py
 ```
 
 输出目录为：
 
 ```text
-.release-build\dist\VideoOrganizer\VideoOrganizer.exe
+.release-build\local-build\<run-id>\dist\VideoOrganizer\VideoOrganizer.exe
 ```
 
 正式版安装器的 Inno Setup 配置位于 `installer/VideoOrganizer.iss`。安装器工具只用于维护者构建，不需要随用户安装。

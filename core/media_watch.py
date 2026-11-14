@@ -586,9 +586,12 @@ class MediaDirectoryMonitor:
             self._wake.set()
 
     def _execute_claimed_batch(self, batch, items):
+        if not items:
+            return
         options = json.loads(batch['config'])
         root = options['directory']
         try:
+            self.service.refresh_pending_media_fingerprints()
             candidates = []
             for original_item in items:
                 current = self.service.db.execute_query('SELECT * FROM media_watch_items WHERE id=?', (original_item['id'],))
@@ -596,7 +599,9 @@ class MediaDirectoryMonitor:
                     continue
                 item = current[0]
                 try:
-                    eligible = self.service.filter_processable_paths([item['path']])
+                    eligible = self.service.filter_processable_paths(
+                        [item['path']], refresh_pending=False
+                    )
                 except OSError as exc:
                     self.registry.update_item(item['id'], item['stage'], FILE_WAIT_PREFIX + str(exc))
                     continue
@@ -635,7 +640,8 @@ class MediaDirectoryMonitor:
                 execution['auto_sync_xmp_after_analysis'] = False
                 self.service.run_analysis([item['path'] for item in analyze], cancel_event=self._cancel_batch,
                     callbacks={'snapshot': snapshot, 'item_started': item_started,
-                        'progress': lambda done,total: None, 'log': lambda text: None}, execution_options=execution)
+                        'progress': lambda done,total: None, 'log': lambda text: None}, execution_options=execution,
+                    pending_fingerprints_refreshed=True)
             for item in candidates:
                 latest = self.service.db.execute_query('SELECT * FROM media_watch_items WHERE id=?', (item['id'],))[0]
                 if latest['stage'] in ('ignored','manual','superseded','duplicate'):
@@ -665,7 +671,9 @@ class MediaDirectoryMonitor:
                     continue
                 path = row['path']
                 try:
-                    eligible = self.service.filter_processable_paths([path])
+                    eligible = self.service.filter_processable_paths(
+                        [path], refresh_pending=False
+                    )
                 except OSError as exc:
                     resume_stage = 'xmp_ready' if item['stage'] == 'xmp_ready' else 'rename_ready'
                     self.registry.update_item(item['id'], resume_stage, FILE_WAIT_PREFIX + str(exc))

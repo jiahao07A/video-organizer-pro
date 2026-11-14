@@ -364,13 +364,13 @@ class WorkstationView(QWidget):
         self.path_input.setPlaceholderText("尚未设定工作范围 — 请点「浏览」选择文件/文件夹")
         self.path_input.setToolTip("当前工作范围路径（由「浏览」整份替换设定）")
 
-        browse_btn = QPushButton("浏览")
-        browse_btn.setToolTip("多选文件与文件夹，确认为整份替换工作范围")
-        browse_btn.clicked.connect(self.browse_path)
+        self.browse_btn = QPushButton("浏览")
+        self.browse_btn.setToolTip("多选文件与文件夹，确认为整份替换工作范围")
+        self.browse_btn.clicked.connect(self.browse_path)
 
-        accumulate_btn = QPushButton("累加")
-        accumulate_btn.setToolTip("再选文件/文件夹，追加进当前工作范围")
-        accumulate_btn.clicked.connect(self.accumulate_path)
+        self.accumulate_btn = QPushButton("累加")
+        self.accumulate_btn.setToolTip("再选文件/文件夹，追加进当前工作范围")
+        self.accumulate_btn.clicked.connect(self.accumulate_path)
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索视频...")
@@ -411,8 +411,8 @@ class WorkstationView(QWidget):
 
         toolbar.addWidget(QLabel("路径:"))
         toolbar.addWidget(self.path_input)
-        toolbar.addWidget(browse_btn)
-        toolbar.addWidget(accumulate_btn)
+        toolbar.addWidget(self.browse_btn)
+        toolbar.addWidget(self.accumulate_btn)
         toolbar.addSpacing(20)
         toolbar.addWidget(self.search_input)
         toolbar.addWidget(self.filter_btn)
@@ -1175,6 +1175,10 @@ class WorkstationView(QWidget):
 
     def background_scan_work_scope(self, reason: str = "扫盘入库"):
         """后台扫描当前工作范围并入库。"""
+        if self._has_active_background_task():
+            self.status_label.setText("已有后台任务在运行，请稍候。")
+            return
+
         def job():
             return self.service.scan_and_register_work_scope()
 
@@ -1206,6 +1210,9 @@ class WorkstationView(QWidget):
 
     def browse_path(self):
         """多选文件与文件夹，确认后整份替换工作范围并后台扫盘入库。"""
+        if self._has_active_background_task():
+            self.status_label.setText("已有后台任务在运行，请稍候。")
+            return
         dialog = QFileDialog(self, "选择工作范围（可多选文件与文件夹，确认后整份替换）")
         dialog.setOption(QFileDialog.DontUseNativeDialog, True)
         dialog.setFileMode(QFileDialog.Directory)
@@ -1224,6 +1231,9 @@ class WorkstationView(QWidget):
         selected = self._collect_dialog_paths(dialog)
         if not selected:
             return
+        if self._has_active_background_task():
+            self.status_label.setText("已有后台任务在运行，请稍候。")
+            return
 
         # 先同步替换路径（轻量），扫盘后台做
         result = self.service.replace_work_scope(selected, scan=False)
@@ -1236,6 +1246,9 @@ class WorkstationView(QWidget):
 
     def accumulate_path(self):
         """多选路径并累加进当前工作范围，后台扫盘。"""
+        if self._has_active_background_task():
+            self.status_label.setText("已有后台任务在运行，请稍候。")
+            return
         dialog = QFileDialog(self, "累加到工作范围（可多选文件与文件夹）")
         dialog.setOption(QFileDialog.DontUseNativeDialog, True)
         dialog.setFileMode(QFileDialog.Directory)
@@ -1253,6 +1266,9 @@ class WorkstationView(QWidget):
             return
         selected = self._collect_dialog_paths(dialog)
         if not selected:
+            return
+        if self._has_active_background_task():
+            self.status_label.setText("已有后台任务在运行，请稍候。")
             return
 
         result = self.service.append_work_scope(selected, scan=False)
@@ -1402,6 +1418,8 @@ class WorkstationView(QWidget):
 
     def set_ui_enabled(self, enabled):
         """分析/长任务期间锁定写盘与导出入口。"""
+        self.browse_btn.setEnabled(enabled)
+        self.accumulate_btn.setEnabled(enabled)
         self.analyze_btn.setEnabled(enabled)
         self.recovery_retry_btn.setEnabled(enabled)
         self.simulate_btn.setEnabled(enabled)
@@ -1420,6 +1438,20 @@ class WorkstationView(QWidget):
                 pass
         if enabled:
             self.cancel_analysis_btn.setEnabled(False)
+
+    def _has_active_background_task(self) -> bool:
+        """检查工作台自身的后台任务，防止范围在任务运行时被修改。"""
+        for name in ("_io_worker", "worker", "recovery_worker"):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    return True
+            except RuntimeError:
+                # Qt 对象已销毁时视为没有可复用的活动任务。
+                continue
+        return False
 
     def start_analysis(self):
         """分析操作目标集：有选中用选中，无选中用当前可见；⊆ 工作范围。"""

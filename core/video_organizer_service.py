@@ -3141,6 +3141,7 @@ class VideoOrganizerService:
         新入库轻量缩略图抽帧使用 extract_workers 高并发（默认 100）。
         """
         registered: List[str] = []
+        self.refresh_pending_media_fingerprints()
         if not self._work_scope_paths:
             return registered
 
@@ -3225,17 +3226,28 @@ class VideoOrganizerService:
             self.log(f"工作范围扫盘：新登记 {len(registered)} 个未分析视频。")
         return registered
 
-    def filter_processable_paths(self, paths, *, record_discovery=False):
+    def refresh_pending_media_fingerprints(self):
+        """在批次边界补齐历史指纹，并同步失效可能过期的全库缓存。"""
+        changed = self.media_registry.index_existing(force=True)
+        if changed:
+            self.invalidate_video_memory_cache()
+        return changed
+
+    def filter_processable_paths(
+        self, paths, *, record_discovery=False, refresh_pending=True
+    ):
         """所有内容处理入口共用的全库去重门禁，强制分析也不能绕过。"""
         paths = list(dict.fromkeys(path for path in paths if path))
         if record_discovery:
             for path in paths:
                 if os.path.isfile(path):
                     try:
-                        self.media_registry.register(path, source='manual')
+                        self.media_registry.register(path, source='manual', index_existing=False)
                     except OSError:
                         pass
-        result = self.media_registry.eligible_paths(paths)
+        if refresh_pending:
+            self.refresh_pending_media_fingerprints()
+        result = self.media_registry.eligible_paths(paths, force_index=False)
         self._last_duplicate_skipped = len(paths) - len(result)
         if self._last_duplicate_skipped:
             self.log(f"去重检查：跳过 {self._last_duplicate_skipped} 项重复副本或内容变化待核对素材。")
@@ -4775,14 +4787,16 @@ class VideoOrganizerService:
     @traced('analysis.run')
     def run_analysis(self, input_path, *, force_reanalyze=False, recovery_mode=None,
                      recovery_override=None, selected_fallback=None, manual_options=None, cancel_event=None,
-                     priority=None, callbacks=None, execution_options=None):
+                     priority=None, callbacks=None, execution_options=None,
+                     pending_fingerprints_refreshed=False):
         if priority is not None:
             try:
                 with self.processing_queue.claim(priority, cancel_event):
                     return self.run_analysis(input_path, force_reanalyze=force_reanalyze,
                         recovery_mode=recovery_mode, recovery_override=recovery_override,
                         selected_fallback=selected_fallback, manual_options=manual_options,
-                        cancel_event=cancel_event, callbacks=callbacks, execution_options=execution_options)
+                        cancel_event=cancel_event, callbacks=callbacks, execution_options=execution_options,
+                        pending_fingerprints_refreshed=pending_fingerprints_refreshed)
             except InterruptedError:
                 count = len(input_path) if isinstance(input_path, list) else len(self.file_manager.scan_videos(input_path))
                 return {'attempted': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0,
@@ -4814,7 +4828,8 @@ class VideoOrganizerService:
             self._manual_options = validate_manual_options(manual_options, self.settings) if self._manual_recovery else {}
             validate_policy_input = __import__('core.analysis_recovery', fromlist=['validate_policy']).validate_policy
             validate_policy_input(self._recovery_override, self.settings)
-            return self._run_analysis(input_path, force_reanalyze=force_reanalyze or self._manual_recovery)
+            return self._run_analysis(input_path, force_reanalyze=force_reanalyze or self._manual_recovery,
+                pending_fingerprints_refreshed=pending_fingerprints_refreshed)
         finally:
             self.ai.gateway._tls.recovery_context = None
             self._manual_recovery = False
@@ -4930,6 +4945,7 @@ class VideoOrganizerService:
         input_path: Union[str, List[str]],
         *,
         force_reanalyze: bool = False,
+        pending_fingerprints_refreshed: bool = False,
     ) -> Dict[str, Any]:
         """
         执行分析工作流（分析任务）：分析目标集 + 三层重试 + 可选批次补跑。
@@ -4980,7 +4996,10 @@ class VideoOrganizerService:
 
         all_videos = [os.path.abspath(p) for p in all_videos if p]
         candidate_count = len(all_videos)
-        all_videos = self.filter_processable_paths(all_videos, record_discovery=True)
+        all_videos = self.filter_processable_paths(
+            all_videos, record_discovery=True,
+            refresh_pending=not pending_fingerprints_refreshed,
+        )
         duplicate_skipped = candidate_count - len(all_videos)
         status_rows = self.db.get_video_statuses_by_paths(all_videos)
         status_map = build_path_status_map(status_rows)

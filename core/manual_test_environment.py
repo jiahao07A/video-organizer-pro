@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from core.data_directory import DataPaths
+from core.diagnostic_logging import sanitize
 from core.video_organizer_service import DEFAULT_SETTINGS, VideoOrganizerService
 
 
@@ -40,6 +41,13 @@ def _path_is_within(child: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+class _SanitizingFormatter(logging.Formatter):
+    """脱敏最终格式化文本，同时避免修改其他 handler 共用的 LogRecord。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return sanitize(super().format(copy.copy(record)))
 
 
 class ManualTestEnvironment:
@@ -139,7 +147,7 @@ class ManualTestEnvironment:
         )
         handler.setLevel(logging.INFO)
         handler.setFormatter(
-            logging.Formatter(
+            _SanitizingFormatter(
                 "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )

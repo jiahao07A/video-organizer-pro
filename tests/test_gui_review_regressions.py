@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """GUI 评审回归：合成数据库与 Qt 离屏控件，不访问真实配置或素材。"""
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -68,6 +69,105 @@ def _insert(service, path, **values):
     record.update(values)
     service.db.upsert_video(record)
     return str(path)
+
+
+def test_scope_buttons_follow_workstation_busy_state(service, qt_app, views):
+    view = WorkstationView(service)
+    views.append(view)
+
+    view.set_ui_enabled(False)
+    assert not view.browse_btn.isEnabled()
+    assert not view.accumulate_btn.isEnabled()
+
+    view.set_ui_enabled(True)
+    assert view.browse_btn.isEnabled()
+    assert view.accumulate_btn.isEnabled()
+
+
+@pytest.mark.parametrize("worker_attribute", ["_io_worker", "worker", "recovery_worker"])
+def test_busy_scope_entries_preserve_scope_and_do_not_unlock(
+    service, tmp_path, qt_app, views, monkeypatch, worker_attribute
+):
+    from gui.workers.io_worker import IoWorker
+
+    service.replace_work_scope([str(tmp_path / "original")], scan=False)
+    original_scope = service.get_work_scope_paths()
+    view = WorkstationView(service)
+    views.append(view)
+    release = threading.Event()
+    started = threading.Event()
+
+    def existing_job():
+        started.set()
+        release.wait(5)
+
+    worker = IoWorker(existing_job, view)
+    setattr(view, worker_attribute, worker)
+    scans = []
+    monkeypatch.setattr(service, "scan_and_register_work_scope", lambda: scans.append(True))
+
+    def unexpected_dialog(*_args, **_kwargs):
+        pytest.fail("忙碌时不应打开工作范围选择框")
+
+    monkeypatch.setattr("gui.views.workstation.QFileDialog", unexpected_dialog)
+    view.set_ui_enabled(False)
+    worker.start()
+    try:
+        assert started.wait(2)
+        view.browse_path()
+        view.accumulate_path()
+        view.background_scan_work_scope()
+        assert service.get_work_scope_paths() == original_scope
+        assert scans == []
+        assert getattr(view, worker_attribute) is worker
+        assert not view.browse_btn.isEnabled()
+        assert not view.accumulate_btn.isEnabled()
+        assert not view.analyze_btn.isEnabled()
+    finally:
+        release.set()
+        assert worker.wait(5000)
+
+
+@pytest.mark.parametrize("entry", ["browse_path", "accumulate_path"])
+def test_scope_dialog_rechecks_busy_state_before_changing_scope(
+    service, tmp_path, qt_app, views, monkeypatch, entry
+):
+    from types import SimpleNamespace
+
+    service.replace_work_scope([str(tmp_path / "original")], scan=False)
+    original_scope = service.get_work_scope_paths()
+    view = WorkstationView(service)
+    views.append(view)
+
+    class ScopeDialog:
+        def __init__(self, *_args):
+            pass
+
+        def setOption(self, *_args):
+            pass
+
+        def setFileMode(self, *_args):
+            pass
+
+        def setNameFilters(self, *_args):
+            pass
+
+        def findChildren(self, *_args):
+            return []
+
+        def exec(self):
+            view._io_worker = SimpleNamespace(isRunning=lambda: True)
+            return QDialog.Accepted
+
+    from PySide6.QtWidgets import QFileDialog
+    for key in ("DontUseNativeDialog", "Directory", "ShowDirsOnly"):
+        setattr(ScopeDialog, key, getattr(QFileDialog, key))
+    monkeypatch.setattr("gui.views.workstation.QFileDialog", ScopeDialog)
+    monkeypatch.setattr(view, "_collect_dialog_paths", lambda _dialog: [str(tmp_path / "new")])
+
+    getattr(view, entry)()
+
+    assert service.get_work_scope_paths() == original_scope
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 大小写与斜杠路径语义")

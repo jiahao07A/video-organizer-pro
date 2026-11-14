@@ -223,3 +223,88 @@ def test_installer_requests_graceful_close_for_running_app():
     assert "CloseApplications=yes" in script
     assert "CloseApplicationsFilter=VideoOrganizer.exe" in script
     assert "CloseApplications=no" not in script
+
+
+def test_installer_mutex_timeout_blocks_start_and_closes_handles(monkeypatch):
+    import ctypes as ctypes_module
+    from core import update_runtime
+
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    closed = []
+    create_calls = []
+    kernel = SimpleNamespace(
+        OpenMutexW=FakeFunction(lambda *_: 123),
+        CloseHandle=FakeFunction(closed.append),
+        CreateMutexW=FakeFunction(lambda *args: create_calls.append(args) or 456),
+    )
+    clock = iter((0, 0, 20.1))
+    monkeypatch.setattr(update_runtime, "os", SimpleNamespace(name="nt"))
+    fake_ctypes = SimpleNamespace(
+        WinDLL=lambda *_args, **_kwargs: kernel,
+        c_uint=ctypes_module.c_uint,
+        c_int=ctypes_module.c_int,
+        c_wchar_p=ctypes_module.c_wchar_p,
+        c_void_p=ctypes_module.c_void_p,
+    )
+    monkeypatch.setattr(update_runtime, "ctypes", fake_ctypes)
+    monkeypatch.setattr(
+        update_runtime,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _seconds: None),
+    )
+    monkeypatch.setattr(update_runtime, "_mutex_handle", None)
+
+    with pytest.raises(UpdateError, match="安装器正在运行"):
+        update_runtime.hold_application_mutex()
+
+    assert closed == [123]
+    assert create_calls == []
+
+
+def test_installer_mutex_short_race_allows_start_and_closes_handles(monkeypatch):
+    import ctypes as ctypes_module
+    from core import update_runtime
+
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    closed = []
+    create_calls = []
+    opened = iter((123, None))
+    kernel = SimpleNamespace(
+        OpenMutexW=FakeFunction(lambda *_: next(opened)),
+        CloseHandle=FakeFunction(closed.append),
+        CreateMutexW=FakeFunction(lambda *args: create_calls.append(args) or 456),
+    )
+    clock = iter((0, 0, 0))
+    monkeypatch.setattr(update_runtime, "os", SimpleNamespace(name="nt"))
+    fake_ctypes = SimpleNamespace(
+        WinDLL=lambda *_args, **_kwargs: kernel,
+        c_uint=ctypes_module.c_uint,
+        c_int=ctypes_module.c_int,
+        c_wchar_p=ctypes_module.c_wchar_p,
+        c_void_p=ctypes_module.c_void_p,
+    )
+    monkeypatch.setattr(update_runtime, "ctypes", fake_ctypes)
+    monkeypatch.setattr(
+        update_runtime,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _seconds: None),
+    )
+    monkeypatch.setattr(update_runtime, "_mutex_handle", None)
+
+    update_runtime.hold_application_mutex()
+
+    assert closed == [123]
+    assert create_calls == [(None, False, update_runtime.APP_MUTEX)]
+    assert update_runtime._mutex_handle == 456

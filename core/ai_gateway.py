@@ -552,7 +552,15 @@ class AiRequestGateway:
                 ):
                     self._failure_and_return(message, retriable=True)
                     return None
-                sleep_backoff(attempt, config=cfg, sleeper=sleeper)
+                sleep_backoff(
+                    attempt,
+                    config=cfg,
+                    sleeper=sleeper,
+                    cancel_event=cancel_event,
+                )
+                if self._cancelled(cancel_event):
+                    self._failure_and_return("用户取消", retriable=False, cancelled=True)
+                    return None
 
     def transcribe_audio(
         self,
@@ -654,4 +662,12 @@ class AiRequestGateway:
                 ):
                     self._failure_and_return(message, retriable=True)
                     return None
-                sleep_backoff(attempt, config=cfg, sleeper=sleeper)
+                sleep_backoff(
+                    attempt,
+                    config=cfg,
+                    sleeper=sleeper,
+                    cancel_event=cancel_event,
+                )
+                if self._cancelled(cancel_event):
+                    self._failure_and_return("用户取消", retriable=False, cancelled=True)
+                    return None

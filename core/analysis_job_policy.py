@@ -453,18 +453,32 @@ def sleep_backoff(
     *,
     config: Optional[RetryConfig] = None,
     sleeper: Optional[Callable[[float], None]] = None,
+    cancel_event: Any = None,
 ) -> float:
-    """执行退避等待；sleeper 可注入（测试用 lambda _: None）。返回实际等待秒数。"""
+    """执行退避等待；可用取消事件提前唤醒，返回计划等待秒数。
+
+    ``sleeper`` 保留给现有测试和调用方注入；提供 ``cancel_event`` 时优先使用
+    ``Event.wait``，这样生产任务在退避期间取消也能立即醒来。
+    """
     cfg = config or RetryConfig()
     delay = backoff_seconds(
         attempt_index, base=cfg.backoff_base_sec, cap=cfg.backoff_cap_sec
     )
-    if delay > 0 and sleeper is not None:
-        sleeper(delay)
-    elif delay > 0:
-        import time
-
-        time.sleep(delay)
+    if delay > 0:
+        if cancel_event is not None:
+            try:
+                cancel_event.wait(delay)
+            except (AttributeError, TypeError):
+                if sleeper is not None:
+                    sleeper(delay)
+                else:
+                    import time
+                    time.sleep(delay)
+        elif sleeper is not None:
+            sleeper(delay)
+        else:
+            import time
+            time.sleep(delay)
     return delay
 
 
