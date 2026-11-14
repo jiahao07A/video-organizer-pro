@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """素材库：全部已入库视频；支持筛选与累加到工作范围。"""
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
+    QWidget, QVBoxLayout, QLineEdit, QPushButton,
     QLabel, QSplitter, QStackedWidget, QTableView, QListView,
     QHeaderView, QAbstractItemView, QMessageBox,
 )
@@ -77,7 +77,8 @@ class MaterialLibraryView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        toolbar = QHBoxLayout()
+        from ..widgets.flow_layout import FlowLayout
+        toolbar = FlowLayout(spacing=6)
         title = QLabel("素材库 — 全部已入库视频")
         title.setStyleSheet("font-weight: bold;")
         self.search_input = QLineEdit()
@@ -104,7 +105,6 @@ class MaterialLibraryView(QWidget):
         self.delete_btn.clicked.connect(self.uncatalog_selected)
 
         toolbar.addWidget(title)
-        toolbar.addStretch()
         toolbar.addWidget(self.search_input)
         toolbar.addWidget(self.filter_btn)
         toolbar.addWidget(self.view_switch_btn)
@@ -119,6 +119,7 @@ class MaterialLibraryView(QWidget):
 
         self.target_summary_label = QLabel("操作目标集：正在计算…")
         self.target_summary_label.setObjectName("operation_target_summary")
+        self.target_summary_label.setWordWrap(True)
         self.target_summary_label.setStyleSheet("color: #888; padding: 2px 4px;")
         self.target_summary_label.setToolTip(
             "批量操作规则：有列表选中时使用列表选中；无选中时使用当前可见列表全部。"
@@ -539,6 +540,8 @@ class MaterialLibraryView(QWidget):
 
     def uncatalog_selected(self):
         """素材库删除 = 取消入库（操作目标集）。"""
+        if self._reject_workstation_busy("取消入库"):
+            return
         snapshot = self._resolve_batch_snapshot()
         paths = list(snapshot.target_paths)
         if not paths:
@@ -556,6 +559,8 @@ class MaterialLibraryView(QWidget):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
+            return
+        if self._reject_workstation_busy("取消入库"):
             return
         self.service.uncatalog_videos(paths)
         self.load_data()
@@ -594,7 +599,31 @@ class MaterialLibraryView(QWidget):
             worker_key="_detail_worker",
         )
 
+    def _reject_workstation_busy(self, operation):
+        """写操作检查服务、素材库和工作台执行任务，保留只读查询并行。"""
+        lock = getattr(self.service, "_analysis_run_lock", None)
+        busy = bool(lock is not None and lock.locked())
+        for name in ("worker", "_io_worker", "recovery_worker"):
+            worker = getattr(self, name, None)
+            if worker is not None:
+                try:
+                    busy = worker.isRunning() or busy
+                except RuntimeError:
+                    # 已销毁的Qt包装对象不再代表活动任务。
+                    continue
+        workstation = getattr(self.window(), "workstation_page", None)
+        if workstation is not None:
+            busy = workstation._has_active_background_task() or busy
+        if busy:
+            self.status_label.setText(f"已有后台任务在运行，请稍候再{operation}。")
+            self.status_message.emit(self.status_label.text())
+            return True
+        return False
+
     def accumulate_selected_to_scope(self):
+        if self._reject_workstation_busy("累加"):
+            return
+        workstation = getattr(self.window(), "workstation_page", None)
         snapshot = self._resolve_batch_snapshot()
         paths = list(snapshot.target_paths)
         if not paths:
@@ -603,10 +632,12 @@ class MaterialLibraryView(QWidget):
                 "没有可累加的视频。\n请选中目标，或确保当前可见列表非空（无选中则累加可见全部）。",
             )
             return
-        result = self.service.append_work_scope(paths, scan=True)
+        result = self.service.append_work_scope(paths, scan=False)
         n = len(result.get("paths") or [])
         msg = f"已累加 {len(paths)} 条到工作范围，现共 {n} 项路径"
         self.status_label.setText(msg)
         self.status_message.emit(msg)
         self.work_scope_changed.emit()
+        if workstation is not None:
+            workstation.background_scan_work_scope(reason="素材库累加扫盘")
         QMessageBox.information(self, "完成", msg)

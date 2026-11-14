@@ -5,13 +5,26 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from core.diagnostic_logging import bind_worker, worker_run, worker_exception
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+
+
+class _ProgressRelay(QObject):
+    """在创建任务的线程交付快照，后台任务不直接接触界面。"""
+
+    def __init__(self, callback, parent):
+        super().__init__(parent)
+        self._callback = callback
+
+    @Slot(object)
+    def deliver(self, snapshot):
+        self._callback(snapshot)
 
 
 class IoWorker(QThread):
     """在后台线程执行无 Qt UI 副作用的可调用对象。"""
 
     progress_updated = Signal(int, str)  # percent or -1, message
+    progress_snapshot = Signal(object)  # optional structured task progress
     task_finished = Signal(bool, object)  # ok, result_or_error_str
 
     def __init__(self, fn: Callable[[], Any], parent=None):
@@ -36,6 +49,7 @@ def run_io_job(
     on_ok: Callable[[Any], None],
     on_fail: Optional[Callable[[str], None]] = None,
     on_start: Optional[Callable[[], None]] = None,
+    on_progress: Optional[Callable[[Any], None]] = None,
     busy_message: str = "处理中…",
 ) -> IoWorker:
     """
@@ -54,6 +68,9 @@ def run_io_job(
 
     worker = IoWorker(fn, parent)
     parent._io_worker = worker
+    if on_progress is not None:
+        relay = _ProgressRelay(on_progress, worker)
+        worker.progress_snapshot.connect(relay.deliver, Qt.QueuedConnection)
 
     def _ok(result):
         on_ok(result)

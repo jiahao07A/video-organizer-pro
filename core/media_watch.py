@@ -349,10 +349,8 @@ class MediaDirectoryMonitor:
                 baseline = set()
             for path in root_found:
                 existing = self.service.db.get_video_by_path(path)
-                retry_waiting = bool(existing and self.registry and any(
-                    item['path'] == path and item['error'].startswith(FILE_WAIT_PREFIX)
-                    for item in self.registry.items(root['id'])
-                ))
+                retry_waiting = bool(existing and self.registry and
+                                     self.registry.has_waiting_file(root['id'], path))
                 if path_key(path) in baseline and not retry_waiting:
                     continue
                 try:
@@ -459,10 +457,7 @@ class MediaDirectoryMonitor:
             self._set_state(path, '指纹校验')
             root = options['directory']
             stats = self._discovery.setdefault(root['id'], {})
-            retry_waiting = any(
-                item['path'] == path and item['error'].startswith(FILE_WAIT_PREFIX)
-                for item in self.registry.items(root['id'])
-            )
+            retry_waiting = self.registry.has_waiting_file(root['id'], path)
             if (not retry_waiting and self.service.db.execute_query(
                     'SELECT 1 FROM media_watch_baseline WHERE task_id=? AND path_key=?',
                     (root['id'], path_key(path))

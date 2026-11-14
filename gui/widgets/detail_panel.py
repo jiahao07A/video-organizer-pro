@@ -486,7 +486,7 @@ class DetailPanel(QWidget):
                     updates = {"manual_override": True, "status": "edited"}
                     if new_category:
                         updates["category"] = new_category
-                    if new_tags:
+                    if new_tags or not merge_tags:
                         if merge_tags:
                             existing = set(item.get("tags", []))
                             updates["tags"] = list(existing.union(set(new_tags)))
@@ -508,7 +508,7 @@ class DetailPanel(QWidget):
                     "status": "edited"
                 }
                 
-                if new_tags:
+                if new_tags or not merge_tags:
                     if merge_tags:
                         existing = set(self.current_video.get("tags", []))
                         updates["tags"] = list(existing.union(set(new_tags)))

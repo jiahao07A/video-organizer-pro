@@ -1,5 +1,7 @@
 """监控闭环回归：真实临时库与文件；不调用外部 AI、不写登录项。"""
 import json
+import logging
+from pathlib import Path
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,11 +15,53 @@ from core.processing_queue import ProcessingQueue
 
 
 @pytest.fixture
-def service(tmp_path, monkeypatch):
+def diagnostic_runtime(tmp_path, monkeypatch):
+    """真实日志/指标也逐测试隔离，避免清理用户或前序用例累积的日志。"""
+    from core import diagnostic_logging as dl
+    previous = dl.get_runtime()
+    if previous is not None and not previous.closed:
+        previous.flush()
+    logger = logging.getLogger('VideoOrganizer')
+    handlers, level, propagate = list(logger.handlers), logger.level, logger.propagate
+    monkeypatch.setattr(dl, '_runtime', None)
+    monkeypatch.setenv('VIDEO_ORGANIZER_ANALYSIS_LOG_DIR', str(tmp_path / 'diagnostics' / 'analysis_jobs'))
+    logger.handlers = []
+    runtime = dl.initialize(tmp_path / 'diagnostics')
+    try:
+        yield runtime
+    finally:
+        runtime.close()
+        logger.handlers = handlers
+        logger.setLevel(level)
+        logger.propagate = propagate
+        monkeypatch.setattr(dl, '_runtime', previous)
+
+
+@pytest.fixture
+def service(tmp_path, monkeypatch, diagnostic_runtime):
     monkeypatch.setattr('core.video_organizer_service.TAG_CONFIG_FILE', str(tmp_path / 'tags.json'))
     monkeypatch.setattr('core.video_organizer_service.get_settings_file_path', lambda: str(tmp_path / 'settings.json'))
     return VideoOrganizerService(settings=SettingsManager.deep_copy_defaults(), on_log=lambda _: None,
         db_path=str(tmp_path / 'catalog.db'), results_json=str(tmp_path / 'results.json'), results_csv=str(tmp_path / 'results.csv'))
+
+
+def test_service_fixture_isolates_real_diagnostics_and_analysis_metrics(service, diagnostic_runtime, tmp_path):
+    from core import diagnostic_logging as dl
+    from core.analysis_job_metrics import default_log_dir, new_job_metrics, persist_job_metrics
+    assert dl.get_runtime() is diagnostic_runtime
+    assert diagnostic_runtime.directory == (tmp_path / 'diagnostics').resolve()
+    tracker = new_job_metrics(target_count=1)
+    tracker.record_item_start('isolated.mp4')
+    tracker.record_item_result(ok=True, path='isolated.mp4')
+    metrics_path = Path(persist_job_metrics(tracker))
+    assert metrics_path.parent == Path(default_log_dir()) == tmp_path / 'diagnostics' / 'analysis_jobs'
+    assert json.loads(metrics_path.read_text(encoding='utf-8'))['item_success'] == 1
+    assert (metrics_path.parent / 'jobs_index.jsonl').is_file()
+    diagnostic_runtime.flush()
+    events = [json.loads(line) for path in diagnostic_runtime.files()
+              if path.name.startswith('events-') for line in path.read_text(encoding='utf-8').splitlines()]
+    assert any(event['event'] == 'analysis.item_result' and event['job_id'] == tracker.job_id
+               for event in events)
 
 
 def test_all_processing_entrypoints_reject_duplicate(service, tmp_path, monkeypatch):

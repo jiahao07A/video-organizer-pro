@@ -1105,11 +1105,35 @@ def show_recovery_detail(service, path, parent):
     dialog.exec()
 
 
-def launch_manual_recovery(view):
-    from gui.workers.analysis_worker import AnalysisWorker
+def _manual_recovery_busy(view):
+    """只检查执行任务，避免把恢复窗口自己的只读查询误作分析任务。"""
     lock = getattr(view.service, "_analysis_run_lock", None)
     if lock and lock.locked():
-        QMessageBox.information(view, "分析正在运行", "请等待当前分析结束，或取消当前任务后再重试。")
+        return True
+    workstation = getattr(view.window(), "workstation_page", None)
+    owners = [view]
+    if workstation is not None and workstation is not view:
+        owners.append(workstation)
+    for owner in owners:
+        checker = getattr(owner, "_has_active_background_task", None)
+        if callable(checker) and checker():
+            return True
+        for name in ("_io_worker", "worker", "recovery_worker"):
+            worker = getattr(owner, name, None)
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    return True
+            except RuntimeError:
+                continue
+    return False
+
+
+def launch_manual_recovery(view):
+    from gui.workers.analysis_worker import AnalysisWorker
+    if _manual_recovery_busy(view):
+        QMessageBox.information(view, "后台任务正在运行", "请等待当前任务结束，或取消当前任务后再重试。")
         return
     paths = view.service.recovery_target_paths(list(view._resolve_batch_snapshot().target_paths))
     if not paths:
@@ -1117,6 +1141,9 @@ def launch_manual_recovery(view):
         return
     dialog = ManualRecoveryDialog(view.service, paths, view)
     if dialog.exec() != QDialog.Accepted:
+        return
+    if _manual_recovery_busy(view):
+        QMessageBox.information(view, "后台任务正在运行", "请等待当前任务结束，或取消当前任务后再重试。")
         return
     if hasattr(view, "set_ui_enabled"):
         view.set_ui_enabled(False)

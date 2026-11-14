@@ -6,6 +6,9 @@ import json
 import os
 import threading
 import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from datetime import datetime, timezone
 
 FILE_WAIT_PREFIX = '等待文件可读取：'
@@ -125,70 +128,205 @@ class MediaRegistry:
         path = os.path.abspath(path)
         if index_existing:
             self.index_existing()
+        digest, after = self._prepare_fingerprint(path)
+        with self.db.lock, self.db._managed_connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            self._verify_fingerprint_snapshot(path, after)
+            result, _ = self._register_on_connection(
+                conn, path, digest, after, source=source, task_id=task_id,
+                batch_id=batch_id, record_event=record_event,
+                owned_content_update=owned_content_update,
+            )
+        return self.db._row_to_video_dict(result)
+
+    def _prepare_fingerprint(self, path):
+        """完整读取文件，并拒绝读取过程中变化的内容。"""
         before = os.stat(path)
         digest = self.hasher(path)
         after = os.stat(path)
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise OSError('指纹校验期间文件仍在变化，等待稳定后重试')
-        with self.db.lock, self.db._managed_connection() as conn:
-            conn.execute('BEGIN IMMEDIATE')
-            row = conn.execute("SELECT * FROM videos WHERE path=? LIMIT 1", (path,)).fetchone()
-            if row is None and os.name == 'nt':
-                # 仅大小写/斜杠变体才走这条低频兼容路径；普通登记保持索引友好的精确查询。
-                identity = path_key(path)
-                candidates = conn.execute("SELECT id,path FROM videos ORDER BY id").fetchall()
-                match = None
-                for candidate in candidates:
-                    candidate_path = candidate['path']
-                    if not candidate_path:
-                        continue
-                    if path_key(candidate_path) != identity:
-                        continue
-                    try:
-                        if os.path.samefile(candidate_path, path):
-                            match = candidate
-                            break
-                    except OSError:
-                        continue
-                if match is not None:
-                    row = conn.execute("SELECT * FROM videos WHERE id=?", (match['id'],)).fetchone()
-            if row is None:
-                cursor = conn.execute(
-                    "INSERT INTO videos(path,filename,original_filename,file_hash,status,tags,tag_groups,raw_metadata,source_kind,source_task_id,source_batch_id) VALUES(?,?,?,?,'pending','[]','{}','{}',?,?,?)",
-                    (path, os.path.basename(path), os.path.basename(path), digest, source, task_id, batch_id),
-                )
-                video_id = cursor.lastrowid
-                version = 1
-                state = 'verified'
+        return digest, after
+
+    @staticmethod
+    def _verify_fingerprint_snapshot(path, observed):
+        current = os.stat(path)
+        if (current.st_size, current.st_mtime_ns) != (observed.st_size, observed.st_mtime_ns):
+            raise OSError('指纹校验后文件发生变化，等待稳定后重试')
+
+    @staticmethod
+    def _path_index(conn):
+        index = {}
+        for row in conn.execute('SELECT id,path FROM videos ORDER BY id'):
+            if row['path']:
+                index.setdefault(path_key(row['path']), []).append((row['id'], row['path']))
+        return index
+
+    def _find_record(self, conn, path, path_index=None):
+        row = conn.execute("SELECT * FROM videos WHERE path=? LIMIT 1", (path,)).fetchone()
+        if row is None and os.name == 'nt':
+            identity = path_key(path)
+            if path_index is None:
+                candidates = [(row['id'], row['path']) for row in
+                              conn.execute('SELECT id,path FROM videos ORDER BY id')]
             else:
-                row = dict(row)
-                video_id, version = row['id'], row['content_version']
-                changed = bool(row.get('file_hash')) and row['file_hash'] != digest
-                state = row['fingerprint_state'] if row['fingerprint_state'] == 'review' else 'verified'
-                if changed:
-                    conn.execute('INSERT OR IGNORE INTO media_content_versions VALUES(?,?,?,?)', (video_id, version, row['file_hash'], json.dumps(row, ensure_ascii=False)))
-                    version += 1
-                    state = 'review' if not owned_content_update and (
-                        row.get('manual_override') or row.get('status') in ('edited', 'processing')) else 'verified'
-                    if state != 'review':
-                        conn.execute("UPDATE videos SET category=NULL,summary=NULL,tags='[]',tag_groups='{}',transcription=NULL,thumbnail=NULL,raw_metadata='{}',status='pending',metadata_injected=0 WHERE id=?", (video_id,))
-                    conn.execute("UPDATE videos SET review_state='unreviewed' WHERE id=?", (video_id,))
-                conn.execute('UPDATE videos SET file_hash=?,content_version=? WHERE id=?', (digest, version, video_id))
-                if changed and owned_content_update:
-                    # 程序自身写回只推进活动队列的内容绑定；历史批次仍保留原版本。
-                    conn.execute(
-                        "UPDATE media_watch_items SET content_version=?,updated_at=? WHERE video_id=? AND content_version=? "
-                        "AND stage IN ('queued','pending','analyzing','rename_ready','xmp_ready')",
-                        (version, utc_now(), video_id, version - 1),
-                    )
-                if changed:
-                    _classify(conn, row['file_hash'])
-            conn.execute('UPDATE videos SET file_size=?,file_mtime_ns=?,fingerprint_state=?,is_missing=0 WHERE id=?', (after.st_size, after.st_mtime_ns, state, video_id))
-            _classify(conn, digest)
-            if record_event:
-                conn.execute('INSERT INTO media_discoveries(video_id,source,task_id,batch_id,discovered_at) VALUES(?,?,?,?,?)', (video_id, source, task_id, batch_id, utc_now()))
-            result = dict(conn.execute('SELECT * FROM videos WHERE id=?', (video_id,)).fetchone())
-        return self.db._row_to_video_dict(result)
+                candidates = path_index.get(identity, ())
+            for video_id, candidate_path in candidates:
+                if not candidate_path or path_key(candidate_path) != identity:
+                    continue
+                try:
+                    if os.path.samefile(candidate_path, path):
+                        candidate = conn.execute('SELECT * FROM videos WHERE id=?', (video_id,)).fetchone()
+                        if candidate is not None and path_key(candidate['path']) == identity:
+                            return candidate
+                except OSError:
+                    continue
+        return row
+
+    def _register_on_connection(self, conn, path, digest, after, *, source='manual',
+                                task_id='', batch_id='', record_event=True,
+                                owned_content_update=False, path_index=None):
+        """单条和批量登记共用的持久化核心，事务归调用方所有。"""
+        row = self._find_record(conn, path, path_index)
+        is_new = row is None
+        if row is None:
+            cursor = conn.execute(
+                "INSERT INTO videos(path,filename,original_filename,file_hash,status,tags,tag_groups,raw_metadata,source_kind,source_task_id,source_batch_id) VALUES(?,?,?,?,'pending','[]','{}','{}',?,?,?)",
+                (path, os.path.basename(path), os.path.basename(path), digest, source, task_id, batch_id),
+            )
+            video_id = cursor.lastrowid
+            version = 1
+            state = 'verified'
+        else:
+            row = dict(row)
+            video_id, version = row['id'], row['content_version']
+            changed = bool(row.get('file_hash')) and row['file_hash'] != digest
+            state = row['fingerprint_state'] if row['fingerprint_state'] == 'review' else 'verified'
+            if changed:
+                conn.execute('INSERT OR IGNORE INTO media_content_versions VALUES(?,?,?,?)', (video_id, version, row['file_hash'], json.dumps(row, ensure_ascii=False)))
+                version += 1
+                state = 'review' if not owned_content_update and (
+                    row.get('manual_override') or row.get('status') in ('edited', 'processing')) else 'verified'
+                if state != 'review':
+                    conn.execute("UPDATE videos SET category=NULL,summary=NULL,tags='[]',tag_groups='{}',transcription=NULL,thumbnail=NULL,raw_metadata='{}',status='pending',metadata_injected=0 WHERE id=?", (video_id,))
+                conn.execute("UPDATE videos SET review_state='unreviewed' WHERE id=?", (video_id,))
+            conn.execute('UPDATE videos SET file_hash=?,content_version=? WHERE id=?', (digest, version, video_id))
+            if changed and owned_content_update:
+                # 程序自身写回只推进活动队列的内容绑定；历史批次仍保留原版本。
+                conn.execute(
+                    "UPDATE media_watch_items SET content_version=?,updated_at=? WHERE video_id=? AND content_version=? "
+                    "AND stage IN ('queued','pending','analyzing','rename_ready','xmp_ready')",
+                    (version, utc_now(), video_id, version - 1),
+                )
+            if changed:
+                _classify(conn, row['file_hash'])
+        conn.execute('UPDATE videos SET file_size=?,file_mtime_ns=?,fingerprint_state=?,is_missing=0 WHERE id=?', (after.st_size, after.st_mtime_ns, state, video_id))
+        _classify(conn, digest)
+        if record_event:
+            conn.execute('INSERT INTO media_discoveries(video_id,source,task_id,batch_id,discovered_at) VALUES(?,?,?,?,?)', (video_id, source, task_id, batch_id, utc_now()))
+        result = dict(conn.execute('SELECT * FROM videos WHERE id=?', (video_id,)).fetchone())
+        if path_index is not None and is_new:
+            path_index.setdefault(path_key(path), []).append((video_id, path))
+        return result, is_new
+
+    def register_many(self, paths, *, source='manual', progress=None, workers=4, batch_size=64,
+                      on_batch=None):
+        """有界并行完整指纹、按输入顺序批量提交，错误逐条隔离。"""
+        paths = list(dict.fromkeys(os.path.abspath(path) for path in paths))
+        total = len(paths)
+        result = {'items': [], 'errors': []}
+        if not paths:
+            return result
+        self.index_existing()
+        workers = max(1, min(int(workers), 4))
+        batch_size = max(1, min(int(batch_size), 256))
+        fingerprint_done = register_done = 0
+
+        def report(phase, done):
+            if progress:
+                progress(phase, done, total)
+
+        report('fingerprint', 0)
+        report('register', 0)
+        committed = []
+        # 复用连接避免每个文件关闭连接时重复触发WAL检查点；每批仍明确提交。
+        with self.db.reuse_connection(), ThreadPoolExecutor(max_workers=workers) as pool:
+            with self.db.lock, self.db._managed_connection() as conn:
+                path_index = self._path_index(conn) if os.name == 'nt' else None
+                data_version = conn.execute('PRAGMA data_version').fetchone()[0]
+            offsets = iter(range(0, total, batch_size))
+            pending = deque()
+
+            def submit_next_batch():
+                offset = next(offsets, None)
+                if offset is None:
+                    return
+                batch = paths[offset:offset + batch_size]
+                futures = {pool.submit(copy_context().run, self._prepare_fingerprint, path): path
+                           for path in batch}
+                pending.append((batch, futures))
+
+            # 最多当前批和下一批，避免全目录future占用内存；DB提交时哈希继续工作。
+            submit_next_batch()
+            submit_next_batch()
+            while pending:
+                batch, futures = pending.popleft()
+                prepared = {}
+                for future in as_completed(futures):
+                    path = futures[future]
+                    try:
+                        prepared[path] = future.result()
+                    except (OSError, ValueError) as exc:
+                        result['errors'].append({'path': path, 'reason': str(exc)})
+                    fingerprint_done += 1
+                    report('fingerprint', fingerprint_done)
+                batch_committed = []
+                batch_snapshots = []
+                with self.db.lock, self.db._managed_connection() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    current_version = conn.execute('PRAGMA data_version').fetchone()[0]
+                    # 其他连接若在哈希期间登记或改名，刷新一次索引以保留路径身份。
+                    if path_index is not None and current_version != data_version:
+                        path_index = self._path_index(conn)
+                    data_version = current_version
+                    for path in batch:
+                        if path in prepared:
+                            digest, observed = prepared[path]
+                            conn.execute('SAVEPOINT media_register_item')
+                            try:
+                                self._verify_fingerprint_snapshot(path, observed)
+                                row, is_new = self._register_on_connection(
+                                    conn, path, digest, observed, source=source, path_index=path_index)
+                            except Exception as exc:
+                                conn.execute('ROLLBACK TO media_register_item')
+                                conn.execute('RELEASE media_register_item')
+                                # 失败可能发生在核心返回前，撤去索引中的未提交行。
+                                if path_index is not None:
+                                    path_index = self._path_index(conn)
+                                result['errors'].append({'path': path, 'reason': str(exc)})
+                            else:
+                                conn.execute('RELEASE media_register_item')
+                                batch_committed.append((row['id'], is_new))
+                                batch_snapshots.append((self.db._row_to_video_dict(row), is_new))
+                        register_done += 1
+                    # 退出managed_connection后该批次才算成功；提交失败向上抛出。
+                committed.extend(batch_committed)
+                report('register', register_done)
+                if on_batch:
+                    on_batch(batch_snapshots)
+                submit_next_batch()
+            # 后来的同内容成员或早期历史记录可能纠正原记录归属，返回最终分类。
+            with self.db.lock, self.db._managed_connection() as conn:
+                for offset in range(0, len(committed), 256):
+                    chunk = committed[offset:offset + 256]
+                    ids = [item[0] for item in chunk]
+                    placeholders = ','.join('?' for _ in ids)
+                    rows = {row['id']: dict(row) for row in conn.execute(
+                        f'SELECT * FROM videos WHERE id IN ({placeholders})', ids)}
+                    for video_id, is_new in chunk:
+                        if video_id in rows:
+                            result['items'].append((self.db._row_to_video_dict(rows[video_id]), is_new))
+        return result
 
     def eligible_paths(self, paths, *, verify=True, force_index=True):
         self.index_existing(force=force_index)
@@ -252,6 +390,19 @@ class MediaRegistry:
 
     def update_item(self, item_id, stage, error=''):
         self.db.execute_non_query('UPDATE media_watch_items SET stage=?,error=?,updated_at=? WHERE id=?', (stage, error, utc_now(), item_id))
+
+    def has_waiting_file(self, task_id, path):
+        """精确查找可恢复的文件等待项，不依赖界面最近一页的记录。"""
+        with self.db.lock, self.db._managed_connection() as conn:
+            # SQLite 内置 lower 仅转换 ASCII；复用登记时的路径规则以覆盖
+            # Windows Unicode 大小写、分隔符及绝对路径的等价形式。
+            conn.create_function('media_watch_path_key', 1, path_key, deterministic=True)
+            return conn.execute(
+                "SELECT 1 FROM media_watch_items WHERE task_id=? "
+                "AND stage IN ('queued','rename_ready','xmp_ready','pending') "
+                "AND substr(error,1,?)=? AND media_watch_path_key(path)=? LIMIT 1",
+                (task_id, len(FILE_WAIT_PREFIX), FILE_WAIT_PREFIX, path_key(path)),
+            ).fetchone() is not None
 
     def items(self, task_id='', limit=200, *, offset=0, stage=''):
         conditions, params = [], []

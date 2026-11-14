@@ -435,8 +435,9 @@ def wait_for_background_work(window: Any, timeout: float = 10.0) -> bool:
         return True
 
     deadline = time.monotonic() + max(0.0, float(timeout))
-    seen_threads: set[int] = set()
     while time.monotonic() < deadline:
+        # 同一轮避免父子树与控件属性重复等待；下一轮必须重新检查存活状态。
+        seen_threads: set[int] = set()
         active = False
         widgets = [window, *window.findChildren(QWidget)]
         for thread in window.findChildren(QThread):
