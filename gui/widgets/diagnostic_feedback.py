@@ -1,5 +1,6 @@
 """诊断包导出和由用户提交的网页反馈。"""
 import copy
+import os
 from pathlib import Path
 import threading
 
@@ -10,6 +11,23 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QF
     QScrollArea, QWidget, QLayout, QBoxLayout)
 from core.diagnostic_bundle import build_bundle, ISSUE_URL
 from gui.workers.io_worker import run_io_job
+
+
+def _select_bundle_path(parent):
+    from core.diagnostic_logging import event
+    event('diagnostic.save_dialog_open')
+    dialog = QFileDialog(parent, '保存脱敏诊断包', 'video-organizer-diagnostics.zip', 'ZIP (*.zip)')
+    dialog.setAcceptMode(QFileDialog.AcceptSave)
+    dialog.setDefaultSuffix('zip')
+    if os.name == 'nt':
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+    dialog.setFileMode(QFileDialog.AnyFile)
+    accepted = dialog.exec() == QDialog.Accepted
+    event('diagnostic.save_dialog_return', accepted=accepted)
+    if not accepted:
+        return ''
+    selected = dialog.selectedFiles()
+    return selected[0] if selected else ''
 
 
 class DiagnosticFeedbackDialog(QDialog):
@@ -136,7 +154,7 @@ class DiagnosticFeedbackDialog(QDialog):
     def start(self):
         if getattr(self, '_io_worker', None) is not None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, '保存脱敏诊断包', 'video-organizer-diagnostics.zip', 'ZIP (*.zip)')
+        path = _select_bundle_path(self)
         if not path:
             return
         fields = {'summary': self.summary.text(), **{k: v.toPlainText() for k, v in self.inputs.items()}}
@@ -157,6 +175,9 @@ class DiagnosticFeedbackDialog(QDialog):
                    on_ok=self.completed, on_fail=self.failed)
 
     def completed(self, result):
+        from core.diagnostic_logging import event
+        event('diagnostic.bundle_generated', size_bytes=result.get('size', 0),
+              omission_count=len(result.get('omissions', [])))
         self.bundle_result = result
         self._result_form = self._pending_form or self.form_snapshot()
         self._pending_form = None

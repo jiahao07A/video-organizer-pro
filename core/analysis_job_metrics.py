@@ -12,6 +12,54 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
+class ResourceSampler:
+    """低频采样进程资源，只汇总峰值，不记录素材内容。"""
+    def __init__(self, tracker, interval=1.0):
+        self.tracker = tracker
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._io_start = (0, 0)
+
+    def start(self):
+        try:
+            import psutil
+            self._process = psutil.Process()
+            self._process.cpu_percent(None)
+            initial_io = self._process.io_counters()
+            self._io_start = (initial_io.read_bytes, initial_io.write_bytes)
+        except Exception as exc:
+            self._process = None
+            self.tracker.set_resource_sampling('unavailable', type(exc).__name__)
+            return self
+        self._thread = threading.Thread(target=self._run, name="analysis-resource-sampler", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                memory = self._process.memory_info()
+                io = self._process.io_counters()
+                self.tracker.record_resource_peak(
+                    cpu_percent=self._process.cpu_percent(None),
+                    rss_mb=memory.rss / 1024**2,
+                    threads=self._process.num_threads(),
+                    read_mb=max(0, io.read_bytes - self._io_start[0]) / 1024**2,
+                    write_mb=max(0, io.write_bytes - self._io_start[1]) / 1024**2,
+                )
+            except Exception as exc:
+                self.tracker.set_resource_sampling('unavailable', type(exc).__name__)
+                self._stop.set()
+                return
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+            self._thread = None
+
+
 def _safe_rate(num: int, den: int) -> float:
     if den <= 0:
         return 0.0
@@ -27,6 +75,10 @@ class AnalysisJobMetrics:
     force_reanalyze: bool = False
     target_count: int = 0
     max_workers: int = 0
+    extract_parallel: int = 0
+    phase_elapsed_sec: Dict[str, Any] = field(default_factory=dict)
+    resource_peak: Dict[str, float] = field(default_factory=dict)
+    resource_sampling: Dict[str, str] = field(default_factory=lambda: {'status': 'available', 'reason': ''})
 
     # API 调用层
     api_attempts: int = 0  # 每一次 chat.completions 请求
@@ -108,6 +160,28 @@ class AnalysisMetricsTracker:
     def __init__(self, metrics: AnalysisJobMetrics):
         self._m = metrics
         self._lock = threading.Lock()
+
+    def record_phase(self, name: str, elapsed_sec: float) -> None:
+        with self._lock:
+            elapsed = max(0.0, elapsed_sec)
+            phase = self._m.phase_elapsed_sec.setdefault(name, {
+                "count": 0, "total_sec": 0.0, "max_sec": 0.0, "buckets": {},
+            })
+            phase["count"] += 1
+            phase["total_sec"] = round(phase["total_sec"] + elapsed, 3)
+            phase["max_sec"] = round(max(phase["max_sec"], elapsed), 3)
+            bucket = "<1s" if elapsed < 1 else "1-5s" if elapsed < 5 else "5-15s" if elapsed < 15 else "15-60s" if elapsed < 60 else ">=60s"
+            phase["buckets"][bucket] = phase["buckets"].get(bucket, 0) + 1
+
+    def record_resource_peak(self, **values: float) -> None:
+        with self._lock:
+            for key, value in values.items():
+                if isinstance(value, (int, float)):
+                    self._m.resource_peak[key] = max(float(value), self._m.resource_peak.get(key, 0.0))
+
+    def set_resource_sampling(self, status: str, reason: str = '') -> None:
+        with self._lock:
+            self._m.resource_sampling = {'status': status, 'reason': reason[:80]}
 
     @property
     def job_id(self) -> str:
@@ -239,14 +313,17 @@ def new_job_metrics(
     force_reanalyze: bool = False,
     target_count: int = 0,
     max_workers: int = 0,
+    extract_parallel: int = 0,
+    started_at: Optional[float] = None,
 ) -> AnalysisMetricsTracker:
     mid = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     m = AnalysisJobMetrics(
         job_id=mid,
-        started_at=time.time(),
+        started_at=time.time() if started_at is None else started_at,
         force_reanalyze=force_reanalyze,
         target_count=target_count,
         max_workers=max_workers,
+        extract_parallel=extract_parallel,
     )
     return AnalysisMetricsTracker(m)
 

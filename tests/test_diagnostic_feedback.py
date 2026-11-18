@@ -273,7 +273,7 @@ def test_gui_real_background_export(app, monkeypatch, tmp_path, runtime):
     from PySide6.QtTest import QTest
     from gui.widgets.diagnostic_feedback import DiagnosticFeedbackDialog
     destination = tmp_path / 'background.zip'
-    monkeypatch.setattr('gui.widgets.diagnostic_feedback.QFileDialog.getSaveFileName', lambda *a: (str(destination), 'ZIP'))
+    monkeypatch.setattr('gui.widgets.diagnostic_feedback._select_bundle_path', lambda *_: str(destination))
     monkeypatch.setattr('gui.widgets.diagnostic_feedback.QDesktopServices.openUrl', lambda _: False)
     dialog = DiagnosticFeedbackDialog(SimpleNamespace(settings={}, _database_path=str(tmp_path / 'missing.db')))
     dialog.summary.setText('后台导出测试')
@@ -539,6 +539,30 @@ def test_unrelated_metrics_cannot_exhaust_event_read_budget(runtime, tmp_path):
     result = build_bundle(tmp_path / 'metrics-selected.zip', runtime=runtime)
     with zipfile.ZipFile(result['path']) as archive:
         assert 'metrics.selected.error' in archive.read('logs/events.jsonl').decode()
+
+
+def test_analysis_metric_nested_summaries_are_exported_without_free_text(runtime, tmp_path):
+    dl.event('analysis.test', job_id='metrics.ziptest')
+    folder = runtime.directory / 'analysis_jobs'
+    folder.mkdir()
+    (folder / 'job_metrics.ziptest.json').write_text(json.dumps({
+        'job_id': 'metrics.ziptest', 'elapsed_sec': 12.0, 'target_count': 2,
+        'phase_elapsed_sec': {'extract': {'count': 2, 'total_sec': 10.0, 'max_sec': 7.0,
+                                          'buckets': {'5-15s': 2}, 'secret': 'private video path'}},
+        'resource_peak': {'rss_mb': 512.0, 'threads': 8, 'unsafe': 'private'},
+        'resource_sampling': {'status': 'unavailable', 'reason': 'AccessDenied', 'extra': 'private'},
+        'rates': {'api_fail_rate_pct': 50.0, 'C:/private/customer/video.mp4': 100.0},
+        'recent_events': [{'path': 'private video path'}], 'user_note': 'private text',
+    }), encoding='utf-8')
+    result = build_bundle(tmp_path / 'metrics.zip', runtime=runtime, period='24h')
+    with zipfile.ZipFile(result['path']) as archive:
+        exported = json.loads(archive.read('analysis/job_metrics.ziptest.json'))
+    assert exported['phase_elapsed_sec']['extract']['count'] == 2
+    assert exported['resource_peak']['rss_mb'] == 512.0
+    assert exported['resource_sampling'] == {'status': 'unavailable', 'reason': 'AccessDenied'}
+    assert exported['rates'] == {'api_fail_rate_pct': 50.0}
+    assert 'recent_events' not in exported and 'user_note' not in exported
+    assert 'private' not in json.dumps(exported)
 
 
 @pytest.mark.parametrize('header', ['Authorization: Bearer {secret}', 'authorization=Basic {secret}', 'Authorization: Basic {secret}', 'Bearer {secret}', 'Authorization: Token {secret}', 'Authorization: Digest username=demo, response={secret}', 'Proxy-Authorization: NTLM {secret}', 'Authorization: Custom\n  {secret}'])

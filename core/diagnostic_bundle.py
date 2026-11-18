@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import sqlite3
 import sys
 import threading
@@ -82,7 +83,8 @@ def environment_snapshot(settings):
             versions[name] = 'unavailable'
     processing = settings.get('processing', {})
     allowed = {k: v for k, v in processing.items() if k in {
-        'max_workers', 'enable_audio_transcription', 'frame_interval', 'max_frames', 'scene_threshold',
+        'max_workers', 'extract_parallel', 'extract_workers', 'target_size', 'enable_scene_detection',
+        'enable_audio_transcription', 'frame_interval', 'max_frames', 'scene_threshold',
         'call_extra_attempts', 'item_max_attempts', 'batch_rerun_enabled'}}
     allowed['analysis_retry'] = {k: v for k, v in processing.get('analysis_retry', {}).items() if k in {'call_extra_attempts', 'item_max_attempts', 'batch_rerun_enabled'}}
     routes = {}
@@ -97,6 +99,60 @@ def environment_snapshot(settings):
                      'system': platform.system(), 'release': platform.release(), 'architecture': platform.machine(),
                      'packaged': bool(getattr(sys, 'frozen', False)), 'dependencies': versions,
                      'processing': allowed, 'routes': routes})
+
+
+def _safe_analysis_metrics(value):
+    """保留有用的数值摘要，丢弃事件样例及任意自由文本。"""
+    if not isinstance(value, dict):
+        return {}
+    allowed_scalars = {
+        'job_id', 'finished_at', 'elapsed_sec', 'force_reanalyze', 'target_count',
+        'max_workers', 'extract_parallel', 'api_attempts', 'api_success', 'api_fail',
+        'call_retries', 'cache_hits', 'cache_misses', 'item_starts', 'item_attempts',
+        'item_retries', 'item_success', 'item_fail', 'extract_fail', 'batch_rerun_started',
+        'cancelled',
+    }
+    result = {key: child for key, child in value.items()
+              if key in allowed_scalars and isinstance(child, (bool, int, float))}
+    for key in ('job_id', 'finished_at'):
+        child = value.get(key)
+        if isinstance(child, str) and re.fullmatch(r'[A-Za-z0-9_.:+-]{1,48}', child):
+            result[key] = child
+    rates = value.get('rates')
+    if isinstance(rates, dict):
+        allowed_rates = {
+            'call_retry_rate_pct', 'api_fail_rate_pct', 'cache_hit_rate_pct',
+            'item_retry_rate_pct', 'item_fail_rate_pct', 'avg_api_attempts_per_item',
+        }
+        result['rates'] = {key: child for key, child in rates.items()
+                           if key in allowed_rates and isinstance(child, (int, float))}
+    phases = value.get('phase_elapsed_sec')
+    if isinstance(phases, dict):
+        result['phase_elapsed_sec'] = {}
+        for name, phase in phases.items():
+            if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,48}', name) or not isinstance(phase, dict):
+                continue
+            clean = {key: phase[key] for key in ('count', 'total_sec', 'max_sec')
+                     if isinstance(phase.get(key), (int, float))}
+            buckets = phase.get('buckets')
+            if isinstance(buckets, dict):
+                clean['buckets'] = {k: v for k, v in buckets.items()
+                                    if k in ('<1s', '1-5s', '5-15s', '15-60s', '>=60s')
+                                    and isinstance(v, int)}
+            result['phase_elapsed_sec'][name] = clean
+    peak = value.get('resource_peak')
+    if isinstance(peak, dict):
+        result['resource_peak'] = {key: child for key, child in peak.items()
+                                   if key in ('cpu_percent', 'rss_mb', 'threads', 'read_mb', 'write_mb', 'extract_active_peak')
+                                   and isinstance(child, (int, float))}
+    sampling = value.get('resource_sampling')
+    if isinstance(sampling, dict):
+        result['resource_sampling'] = {
+            'status': sampling.get('status') if sampling.get('status') in ('available', 'unavailable') else 'unavailable',
+            'reason': sampling.get('reason', '') if isinstance(sampling.get('reason', ''), str)
+                      and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,47}', sampling.get('reason', '')) else '',
+        }
+    return result
 
 
 def build_bundle(destination, *, settings=None, database=None, period='session', fields=None, cancel=None, runtime=None):
@@ -261,7 +317,7 @@ def build_bundle(destination, *, settings=None, database=None, period='session',
                     continue
                 value = json.loads(data)
                 # 自由文本不导出，指标读取不占用运行日志预算。
-                value = {k: v for k, v in value.items() if isinstance(v, (bool, int, float)) or k in ('job_id', 'finished_at', 'rates')}
+                value = _safe_analysis_metrics(value)
                 add('analysis/' + path.name, value)
             except (OSError, ValueError, AttributeError, RecursionError) as exc:
                 omissions.append('分析指标：' + str(sanitize(exc)))
