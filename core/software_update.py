@@ -43,6 +43,7 @@ class UpdateState(str, Enum):
     DOWNLOADING = "downloading"
     READY = "ready"
     PREPARING = "preparing"
+    INSTALLING = "installing"
     FAILED = "failed"
 
 

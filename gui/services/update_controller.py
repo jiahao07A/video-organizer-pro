@@ -86,7 +86,7 @@ class UpdateController(QObject):
 
     @property
     def busy(self):
-        return self.state in (UpdateState.CHECKING, UpdateState.DOWNLOADING, UpdateState.PREPARING) or bool(self.job and self.job.isRunning())
+        return self.state in (UpdateState.CHECKING, UpdateState.DOWNLOADING, UpdateState.PREPARING, UpdateState.INSTALLING) or bool(self.job and self.job.isRunning())
 
     def _set(self, state, message):
         from core.diagnostic_logging import event
