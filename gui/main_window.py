@@ -126,18 +126,34 @@ class MainWindow(QMainWindow):
     def _launch_update(self, session):
         from core.update_runtime import launch_installer
         from gui.views.settings import _window_has_active_background_work
+        from core.software_update import UpdateState
         try:
             if _window_has_active_background_work(self):
                 raise RuntimeError("发现仍在运行的后台任务，已停止安装")
             c = self.update_controller
             launch_installer(c.release_directory() / c.release.filename, session, c.cache)
+            from core.diagnostic_logging import event
+            c._set(UpdateState.INSTALLING, "安装器已启动，正在退出旧版本…")
+            event('update.installer_started', version=c.release.version)
             self._update_preparing = False
             self._update_exiting = True
             if self._update_notice:
                 self._update_notice.close()
-            self.close()
+            self._request_application_exit()
         except Exception as exc:
             self.update_controller._fail(str(exc))
+
+    def _request_application_exit(self):
+        """关闭窗口并显式退出 Qt，避免托盘模式留下旧进程。"""
+        self._allow_exit = True
+        self._close_accepted = False
+        self.close()
+        if self._close_accepted:
+            from core.diagnostic_logging import event
+            event('update.application_exit_requested')
+            QApplication.instance().quit()
+        else:
+            self._allow_exit = False
 
     def closeEvent(self, event):
         from gui.views.settings import _window_has_active_background_work
@@ -240,6 +256,9 @@ class MainWindow(QMainWindow):
             self.monitor_action.setText("暂停素材监控")
 
     def _exit_application(self):
+        if self._update_exiting:
+            self._request_application_exit()
+            return
         if self.update_controller.busy or self._update_preparing:
             self.status_bar.showMessage("更新处理中，请等待完成后再退出", 5000)
             return

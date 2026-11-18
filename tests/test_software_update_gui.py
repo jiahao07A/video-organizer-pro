@@ -225,6 +225,42 @@ def test_settings_tab_and_task_gate(app, tmp_path, monkeypatch, signed):
     app.processEvents()
 
 
+def test_update_installer_start_failure_is_reported_without_exit(app, tmp_path, monkeypatch):
+    from gui.main_window import MainWindow
+    from core.software_update import UpdateState
+    from PySide6.QtWidgets import QWidget
+    monkeypatch.setattr('gui.services.update_controller.update_cache', lambda: tmp_path / 'cache')
+    controller = UpdateController(SimpleNamespace(manual_test_environment=True))
+    controller.state = UpdateState.READY
+    controller.release = SimpleNamespace(filename='never-execute.exe', version='0.0.2')
+    controller.release_directory().mkdir(parents=True, exist_ok=True)
+    marker = controller.cache / 'backup-marker.json'
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('preserve', encoding='utf-8')
+    window = MainWindow.__new__(MainWindow)
+    from PySide6.QtWidgets import QMainWindow
+    QMainWindow.__init__(window)
+    window.update_controller = controller
+    window.setCentralWidget(QWidget(window))
+    window._update_preparing = True
+    window._update_exiting = False
+    window._update_notice = None
+    window.centralWidget().setEnabled(False)
+    controller.changed.connect(window._update_state_changed)
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: None)
+    monkeypatch.setattr('gui.views.settings._window_has_active_background_work', lambda _: False)
+    monkeypatch.setattr('core.update_runtime.launch_installer', lambda *_: (_ for _ in ()).throw(OSError('synthetic start failure')))
+    window._launch_update(SimpleNamespace())
+    assert controller.state == UpdateState.FAILED
+    assert 'synthetic start failure' in controller.message
+    assert not window._update_preparing
+    assert window.centralWidget().isEnabled()
+    assert not window._update_exiting
+    assert marker.read_text(encoding='utf-8') == 'preserve'
+    assert window.isVisible() is False
+    window.deleteLater()
+
+
 def test_unsaved_settings_require_successful_explicit_save(app, tmp_path, monkeypatch):
     from core.video_organizer_service import VideoOrganizerService
     from gui.views.settings import SettingsView
