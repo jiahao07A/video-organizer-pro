@@ -80,3 +80,23 @@ def test_summary_line_contains_key_fields():
     line = tr.summary_line()
     assert "API尝试" in line
     assert "调用层重试" in line
+
+
+def test_phase_histogram_and_resource_peaks_are_bounded_summaries():
+    tr = new_job_metrics()
+    tr.record_phase('extract', 0.5)
+    tr.record_phase('extract', 10)
+    tr.record_phase('extract', 75)
+    tr.record_resource_peak(rss_mb=20)
+    tr.record_resource_peak(rss_mb=12)
+    snap = tr.snapshot()
+    assert snap['phase_elapsed_sec']['extract'] == {
+        'count': 3, 'total_sec': 85.5, 'max_sec': 75.0,
+        'buckets': {'<1s': 1, '5-15s': 1, '>=60s': 1},
+    }
+    assert snap['resource_peak']['rss_mb'] == 20
+
+
+def test_metrics_accept_workflow_start_time():
+    tr = new_job_metrics(started_at=100.0)
+    assert tr.snapshot()['elapsed_sec'] >= 0

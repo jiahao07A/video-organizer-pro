@@ -1650,6 +1650,7 @@ class VideoProcessor:
         scene_list = []
         components = _scene_detection_components() if use_scene_detection else None
         if components:
+            scene_started = time.monotonic()
             try:
                 ContentDetector, SceneManager, open_video = components
                 video = open_video(video_path)
@@ -1659,8 +1660,13 @@ class VideoProcessor:
                 scene_list = scene_manager.get_scene_list()
             except Exception:
                 logger.debug('media.scene_detection_failed', exc_info=True)
+            finally:
+                event('media.scene_detection_end', item_id=item_id,
+                      elapsed_ms=round((time.monotonic() - scene_started) * 1000),
+                      scene_count=len(scene_list))
 
         cap = cv2.VideoCapture(video_path)
+        decode_started = time.monotonic()
         try:
             try:
                 event('media.properties', item_id=item_id, extension=os.path.splitext(video_path)[1], size_bytes=os.path.getsize(video_path), width=cap.get(cv2.CAP_PROP_FRAME_WIDTH), height=cap.get(cv2.CAP_PROP_FRAME_HEIGHT), fps=cap.get(cv2.CAP_PROP_FPS), frame_count=cap.get(cv2.CAP_PROP_FRAME_COUNT), codec=cap.get(cv2.CAP_PROP_FOURCC), opened=cap.isOpened() if hasattr(cap, 'isOpened') else None)
@@ -1717,7 +1723,8 @@ class VideoProcessor:
             logger.warning('media.extract_failed', exc_info=True)
         finally:
             cap.release()
-        event('media.extract_end', item_id=item_id, extracted_frames=len(base64_frames))
+        event('media.extract_end', item_id=item_id, extracted_frames=len(base64_frames),
+              decode_encode_elapsed_ms=round((time.monotonic() - decode_started) * 1000))
             
         return {"frames": base64_frames, "thumbnail": thumbnail_path, "phash": phash}
 
@@ -2932,6 +2939,8 @@ class VideoOrganizerService:
         ep = max(1, min(ep, 512))
         self._extract_parallel = ep
         self._extract_sem = threading.Semaphore(ep)
+        self._extract_active = 0
+        self._extract_peak = 0
         self._xmp_ctx_cache = None
         self._xmp_ctx_lock = threading.Lock()
         self._last_rollback_result = None
@@ -4919,6 +4928,8 @@ class VideoOrganizerService:
             self._analysis_run_lock = lock = threading.Lock()
         if not lock.acquire(blocking=False):
             raise RuntimeError("已有分析任务正在运行，请等待完成或取消后再试。")
+        self._analysis_run_started = time.monotonic()
+        self._analysis_run_started_wall = time.time()
         previous_callbacks = (self.on_log, self.on_progress, getattr(self, 'on_analysis_snapshot', None))
         previous_settings = self.settings
         if callbacks:
@@ -4943,6 +4954,10 @@ class VideoOrganizerService:
             return self._run_analysis(input_path, force_reanalyze=force_reanalyze or self._manual_recovery,
                 pending_fingerprints_refreshed=pending_fingerprints_refreshed)
         finally:
+            sampler = getattr(self, "_resource_sampler", None)
+            if sampler is not None:
+                sampler.stop()
+                self._resource_sampler = None
             self.ai.gateway._tls.recovery_context = None
             self._manual_recovery = False
             try:
@@ -4951,6 +4966,10 @@ class VideoOrganizerService:
                         context.store.state(context, "interrupted")
             finally:
                 self._recovery_contexts = {}
+                elapsed = time.monotonic() - self._analysis_run_started
+                event('analysis.workflow_elapsed', elapsed_ms=round(elapsed * 1000))
+                self._analysis_run_started = None
+                self._analysis_run_started_wall = None
                 self.on_log, self.on_progress, self.on_analysis_snapshot = previous_callbacks
                 if hasattr(self._analysis_local, 'settings'):
                     del self._analysis_local.settings
@@ -5063,6 +5082,7 @@ class VideoOrganizerService:
         执行分析工作流（分析任务）：分析目标集 + 三层重试 + 可选批次补跑。
         返回 {attempted, succeeded, failed, skipped, message, ...}。
         """
+        setup_started = time.monotonic()
         from core.analysis_job_policy import (
             ProgressReducer,
             RetryConfig,
@@ -5080,6 +5100,7 @@ class VideoOrganizerService:
         from core.analysis_job_metrics import (
             new_job_metrics,
             persist_job_metrics,
+            ResourceSampler,
             setup_analysis_file_logging,
         )
 
@@ -5207,12 +5228,20 @@ class VideoOrganizerService:
         ep = max(1, min(ep, 512))
         self._extract_parallel = ep
         self._extract_sem = threading.Semaphore(ep)
+        self._extract_active = 0
+        self._extract_peak = 0
         self._xmp_ctx_cache = None
         metrics = new_job_metrics(
             force_reanalyze=force_reanalyze,
             target_count=len(videos_to_process),
             max_workers=max_workers_cfg,
+            extract_parallel=ep,
+            started_at=getattr(self, "_analysis_run_started_wall", None),
         )
+        metrics.record_phase("target_resolution_and_setup", time.monotonic() - setup_started)
+        sampler = ResourceSampler(metrics).start()
+        self._resource_sampler = sampler
+        analysis_started = time.monotonic()
         self._job_metrics = metrics
         self.ai._job_metrics = metrics
         self.log(
@@ -5314,6 +5343,7 @@ class VideoOrganizerService:
                     cancelled = True
                 if res and res.get("status") == "analyzed":
                     item_xmp_failures: List[Dict[str, str]] = []
+                    save_started = time.monotonic()
                     try:
                         xmp_failed += self._persist_analysis_success(res, xmp_failure_sink=item_xmp_failures)
                     except Exception as exc:
@@ -5325,6 +5355,8 @@ class VideoOrganizerService:
                         with self._progress_lock:
                             reducer.apply("item_terminal", path=video_path, ok=False)
                         continue
+                    finally:
+                        metrics.record_phase("result_save", time.monotonic() - save_started)
                     if contexts[video_path].active:
                         contexts[video_path].state = "recovered"
                         recovery_state_changed(video_path, "recovered")
@@ -5446,6 +5478,8 @@ class VideoOrganizerService:
         metrics_path = ""
         metrics_snap: Dict[str, Any] = {}
         try:
+            sampler.stop()
+            metrics.record_phase("analysis_total", time.monotonic() - analysis_started)
             metrics_path = persist_job_metrics(metrics)
             metrics_snap = metrics.snapshot()
             rates = metrics_snap.get("rates") or {}
@@ -5468,6 +5502,7 @@ class VideoOrganizerService:
         self._job_metrics = None
         self.ai._job_metrics = None
         self._xmp_ctx_cache = None
+        self._resource_sampler = None
         return {
             "attempted": total_target,
             "duplicate_skipped": duplicate_skipped,
@@ -5580,6 +5615,7 @@ class VideoOrganizerService:
                 )
 
                 emit_phase(AnalysisPhase.EXTRACT, attempt_b)
+                extract_started = time.monotonic()
                 if not os.path.exists(video_path):
                     finish_item(False, "文件不存在")
                     return None, "文件不存在"
@@ -5587,24 +5623,41 @@ class VideoOrganizerService:
                 file_hash = self.processor.get_file_hash(video_path)
 
                 # 抽帧闸门：高 max_workers 时也只允许少数路同时 OpenCV 解码
+                queue_started = time.monotonic()
                 with self._extract_sem:
+                    metrics = getattr(self, "_job_metrics", None)
+                    if metrics is not None:
+                        metrics.record_phase("extract_queue_wait", time.monotonic() - queue_started)
+                    with self._progress_lock:
+                        self._extract_active = getattr(self, "_extract_active", 0) + 1
+                        self._extract_peak = max(getattr(self, "_extract_peak", 0), self._extract_active)
+                    if metrics is not None:
+                        metrics.record_resource_peak(extract_active_peak=self._extract_peak)
                     if self.is_analysis_cancelled():
+                        with self._progress_lock:
+                            self._extract_active -= 1
                         finish_item(False, "用户取消")
                         return None, "用户取消"
-                    proc_res = self.processor.extract_frames(
-                        video_path,
-                        max_frames=SettingsManager.get_setting(
-                            self.settings, "processing.max_frames", 10
-                        ),
-                        target_size=SettingsManager.get_setting(
-                            self.settings, "processing.target_size", 512
-                        ),
-                        save_thumbnail=True,
-                        thumbnails_dir=self._thumbnail_dir,
-                        use_scene_detection=SettingsManager.get_setting(
-                            self.settings, "processing.enable_scene_detection", True
-                        ),
-                    )
+                    try:
+                        proc_res = self.processor.extract_frames(
+                            video_path,
+                            max_frames=SettingsManager.get_setting(
+                                self.settings, "processing.max_frames", 10
+                            ),
+                            target_size=SettingsManager.get_setting(
+                                self.settings, "processing.target_size", 512
+                            ),
+                            save_thumbnail=True,
+                            thumbnails_dir=self._thumbnail_dir,
+                            use_scene_detection=SettingsManager.get_setting(
+                                self.settings, "processing.enable_scene_detection", True
+                            ),
+                        )
+                    finally:
+                        if metrics is not None:
+                            metrics.record_phase("extract", time.monotonic() - extract_started)
+                        with self._progress_lock:
+                            self._extract_active -= 1
                 frames = proc_res.get("frames", [])
                 thumbnail_path = proc_res.get("thumbnail")
                 phash = proc_res.get("phash", "")
