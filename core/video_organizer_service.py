@@ -951,7 +951,6 @@ class DatabaseManager:
                 (json.dumps(sorted(missing), ensure_ascii=False),)))
         return rows
 
-
     def _row_to_video_dict(self, row) -> Dict:
         d = dict(row)
         try:
@@ -6216,6 +6215,47 @@ class VideoOrganizerService:
         except Exception as e:
             self.log(f"导出 ALE 失败: {e}")
             return False
+
+    @traced('export.results')
+    def export_analysis_results(self, output_path: str, selected_paths: List[str]) -> int:
+        """显式导出冻结目标集中的素材；空集或全是副本时保持现有文件不变。"""
+        target = Path(output_path).absolute()
+        fmt = target.suffix.lower()
+        if fmt not in (".json", ".csv"):
+            raise ValueError("分析结果只能导出为 .json 或 .csv 文件。")
+        resolved = target.resolve()
+        manager = _service_data_manager()
+        protected = (self._settings_path, self._tag_config_path, self.db.db_path, manager.locator_path,
+                     manager.fallback_locator_path, Path(manager.application_directory) / ".video-organizer-install.json")
+        if (resolved in {Path(p).resolve() for p in protected}
+                or resolved.is_relative_to(Path(self._backup_dir).resolve())
+                or resolved.is_relative_to(Path(self._thumbnail_dir).resolve())):
+            raise ValueError("不能用导出结果覆盖应用配置、安装标记、数据库或备份。")
+        videos = self.filter_processable_rows(self.db.get_videos_by_paths(selected_paths))
+        if not videos:
+            return 0
+        if fmt == ".json":
+            fields = ("path", "filename", "category", "summary", "tags", "tag_groups",
+                      "transcription", "status", "timestamp", "manual_override")
+            write_json_atomic(str(target), [{key: row.get(key) for key in fields} for row in videos])
+        else:
+            tag_count = max(5, max(len(row.get("tags") or []) for row in videos))
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig", newline="", dir=target.parent,
+                                                 suffix=".tmp", delete=False) as handle:
+                    tmp = Path(handle.name)
+                    writer = csv.writer(handle)
+                    writer.writerow(["文件路径", "文件名", "分类", "摘要", *(f"标签{i+1}" for i in range(tag_count))])
+                    for row in videos:
+                        tags = row.get("tags") or []
+                        writer.writerow([*(row.get(k) for k in ("path", "filename", "category", "summary")),
+                                         *tags, *([""] * (tag_count-len(tags)))])
+                os.replace(tmp, target)
+            finally:
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
+        return len(videos)
 
     @traced('export.xmp')
     def sync_metadata_to_xmp(

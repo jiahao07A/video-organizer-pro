@@ -98,3 +98,78 @@ def test_ale_defaults_clean_every_field(service, tmp_path):
     lines = out.read_text(encoding="utf-8-sig").splitlines()
     rows = lines[lines.index("Data")+1:]
     assert rows == ["one line .mp4\t首行 次行\ta b, 中文\tA 类别\t首行 次行"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+def test_result_export_bounds_real_rows_and_preserves_fields(service, tmp_path, fmt):
+    one = register(service, tmp_path / "one.mp4", "one")
+    register(service, tmp_path / "outside.mp4", "outside")
+    dup = tmp_path / "duplicate.mp4"
+    dup.write_bytes(b"one")
+    assert service.media_registry.register(str(dup))["duplicate_of"]
+    out = tmp_path / ("results." + fmt)
+    assert service.export_analysis_results(str(out), [one, str(dup)]) == 1
+    if fmt == "json":
+        rows = json.loads(out.read_text(encoding="utf-8"))
+        assert [(v["path"], v["tags"], v["summary"]) for v in rows] == [(one, ["a\tb", "中文"], "首行\r\n次行")]
+    else:
+        with out.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        assert [(v["文件路径"], v["标签1"], v["标签2"], v["摘要"]) for v in rows] == [(one, "a\tb", "中文", "首行\r\n次行")]
+    previous = out.read_bytes()
+    assert service.export_analysis_results(str(out), []) == 0
+    assert out.read_bytes() == previous
+    assert not (tmp_path / "default.json").exists()
+    with pytest.raises(ValueError):
+        service.export_analysis_results(one, [one])
+    assert Path(one).read_bytes() == b"one"
+    with pytest.raises(ValueError):
+        service.export_analysis_results(service._settings_path, [one])
+
+
+def test_workstation_menu_exports_only_the_visible_filter(service, tmp_path, qt_app, monkeypatch):
+    from PySide6.QtCore import QElapsedTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from gui.views.workstation import WorkstationView
+
+    keep = register(service, tmp_path / "keep.mp4", "keep")
+    other = register(service, tmp_path / "other.mp4", "other")
+    service.replace_work_scope([keep, other], scan=False)
+    view = WorkstationView(service)
+    out = tmp_path / "selection.json"
+    notices = []
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(out), "JSON (*.json)"))
+    monkeypatch.setattr(QMessageBox, "information", lambda _, title, msg: notices.append(title))
+    monkeypatch.setattr(QMessageBox, "warning", lambda _, title, msg: notices.append(msg))
+    try:
+        view.show()
+        view.search_input.setText("keep.mp4")
+        timer = QElapsedTimer()
+        timer.start()
+        while timer.elapsed() < 5000 and not (view.model.rowCount() == 1 and view.model.videos[0]["path"] == keep):
+            QTest.qWait(20)
+        assert [row["path"] for row in view.model.videos] == [keep]
+        next(action for action in view.export_results_btn.menu().actions() if action.text() == "JSON").trigger()
+        timer.restart()
+        while timer.elapsed() < 5000 and not notices:
+            QTest.qWait(20)
+        assert notices == ["导出完成"]
+        assert [row["path"] for row in json.loads(out.read_text(encoding="utf-8"))] == [keep]
+    finally:
+        view.close()
+        view.deleteLater()
+
+
+def test_result_export_protects_internal_marker_paths_but_not_unrelated_names(service, tmp_path, monkeypatch):
+    from core.data_directory import DataDirectoryManager
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "profile"))
+    manager = DataDirectoryManager(application_directory=str(tmp_path / "installation"))
+    monkeypatch.setattr("core.video_organizer_service._service_data_manager", lambda: manager)
+    selected = [register(service, tmp_path / "clip.mp4", "clip")]
+    for protected in (Path(manager.locator_path), Path(manager.fallback_locator_path),
+                      Path(manager.application_directory) / ".video-organizer-install.json"):
+        with pytest.raises(ValueError):
+            service.export_analysis_results(str(protected), selected)
+    ordinary = tmp_path / ".video-organizer-install.json"
+    assert service.export_analysis_results(str(ordinary), selected) == 1
