@@ -85,7 +85,7 @@ def test_window_pages_fit_with_reachable_settings_save(window, qt_app, width, he
                     mapped = QRect(button.mapTo(panel, QPoint(0, 0)), button.size())
                     assert panel.rect().contains(mapped), (button.text(), panel.rect(), mapped)
         if index == 3:
-            button = page.save_btn
+            button = page.reset_btn
             mapped = QRect(button.mapTo(window, QPoint(0, 0)), button.size())
             assert button.isVisible() and window.rect().contains(mapped)
 

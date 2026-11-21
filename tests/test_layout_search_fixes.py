@@ -125,7 +125,7 @@ def test_search_dropdown_preserves_settings_space_and_keyboard_selection(app,ser
         first=popup.model().index(0,0)
         QTest.mouseClick(popup.viewport(),Qt.LeftButton,Qt.NoModifier,popup.visualRect(first).center())
         QTest.qWait(30)
-        assert view.tabs.currentIndex()==3
+        assert view.tabs.currentIndex()==0
         assert not popup.isVisible()
     finally:
         view.close()

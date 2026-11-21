@@ -145,6 +145,21 @@ def test_failed_or_empty_fetch_keeps_manual_value(app):
     assert picker.combo.count() == 0 and picker.combo.isEditable()
 
 
+def test_verified_model_list_refreshes_existing_pickers_without_changing_selection(app):
+    catalog = ModelCatalog(gateway=Gateway())
+    picker = ModelPicker(provider, "custom-model", catalog=catalog)
+    other = ModelPicker(lambda: provider(provider_id="other"), "other-model", catalog=catalog)
+    changes = []
+    picker.textChanged.connect(changes.append)
+    for values in (["first-model"], ["new-model", "vision-b"], []):
+        catalog.store(provider(), values)
+        assert [picker.combo.itemText(index) for index in range(picker.combo.count())] == values
+        assert picker.text() == "custom-model"
+        assert changes == []
+        assert other.combo.count() == 0
+        assert other.text() == "other-model"
+
+
 def test_removed_recovery_row_does_not_destroy_running_worker(app, service, monkeypatch):
     gate = threading.Event()
     catalog = ModelCatalog(gateway=Gateway(lambda route: gate.wait(3) and ["model-a"]))

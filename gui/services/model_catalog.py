@@ -31,6 +31,14 @@ class ModelCatalog(QObject):
         values = self._cache.get(connection_identity(provider))
         return list(values) if values is not None else None
 
+    def store(self, provider, values):
+        """Store a verified model list for the exact connection identity."""
+        key = connection_identity(provider)
+        self._cache[key] = list(values or [])
+        if not self._closing:
+            self.completed.emit(key, True, list(self._cache[key]))
+        return list(self._cache[key])
+
     def is_loading(self, provider):
         return connection_identity(provider) in self._workers
 
