@@ -2668,7 +2668,7 @@ class FileManager:
 
     @staticmethod
     def sanitize_filename(name: str, max_len: int = 150) -> str:
-        invalid_chars = r'[\\/:*?"<>|]'
+        invalid_chars = r'[\\/:*?"<>|\x00-\x1f]'
         sanitized = re.sub(invalid_chars, "_", name)
         sanitized = sanitized.replace("\n", " ").replace("\r", " ").strip()
         if len(sanitized) > max_len:
