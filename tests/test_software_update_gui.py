@@ -23,6 +23,23 @@ def controller(app, tmp_path, monkeypatch):
     return UpdateController(SimpleNamespace(manual_test_environment=True))
 
 
+@pytest.mark.parametrize("bad_time", [1780000000000, float('nan'), float('inf'), True, -1])
+def test_invalid_saved_time_keeps_update_panel_and_valid_preferences(app, tmp_path, monkeypatch, bad_time):
+    from gui.widgets.software_update import SoftwareUpdatePanel
+    monkeypatch.setattr("gui.services.update_controller.update_cache", lambda: tmp_path)
+    (tmp_path / "preferences.json").write_text(json.dumps({
+        "last_check": bad_time, "snooze_until": bad_time, "auto_check": False, "preview": True,
+    }), encoding="utf-8")
+    controller = UpdateController(SimpleNamespace(manual_test_environment=True))
+    panel = SoftwareUpdatePanel(controller, lambda: None)
+    try:
+        assert panel.last.text() == "上次检查：尚未检查"
+        assert controller.preferences["snooze_until"] == 0
+        assert not panel.auto.isChecked() and panel.preview.isChecked()
+    finally:
+        panel.close()
+
+
 def test_background_checks_and_manual_skip_visibility(controller, monkeypatch):
     calls = []
     monkeypatch.setattr(controller, "check", lambda manual=True: calls.append(manual))
