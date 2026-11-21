@@ -206,7 +206,7 @@ class SettingsView(QWidget):
             return
         try:
             restart_monitor = self._stop_monitor_for_maintenance()
-        except RuntimeError:
+        except (RuntimeError, TimeoutError):
             QMessageBox.warning(self, "暂时无法备份", "素材监控仍在处理，请等待任务结束后重试。")
             return
         try:
@@ -225,7 +225,7 @@ class SettingsView(QWidget):
             return
         try:
             restart_monitor = self._stop_monitor_for_maintenance()
-        except RuntimeError:
+        except (RuntimeError, TimeoutError):
             QMessageBox.warning(self, "暂时无法恢复", "素材监控仍在处理，请等待任务结束后重试。")
             return
         restored = False
