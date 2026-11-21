@@ -627,8 +627,5 @@ class MainWindow(QMainWindow):
         self.refresh_style()
 
     def run_backup(self):
-        path = self.service.backup_configuration()
-        if path:
-            QMessageBox.information(self, "备份成功", f"管理数据已成功备份至：\n{path}")
-        else:
-            QMessageBox.warning(self, "备份失败", "管理数据备份过程中出现错误。")
+        # 两个备份入口使用同一套后台任务、设置落盘及监控暂停/恢复检查。
+        self._ensure_page(3)._backup_configuration()
