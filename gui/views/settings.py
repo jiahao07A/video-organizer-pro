@@ -1890,7 +1890,7 @@ class SettingsView(QWidget):
 
         run_io_job(
             self,
-            fn=lambda: self.service.ai.list_models(route_override=provider),
+            fn=lambda: self.service.ai.gateway.list_models(route_override=provider),
             on_ok=on_ok,
             on_fail=on_fail,
             busy_message="正在测试 AI 连接…",
