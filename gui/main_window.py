@@ -251,7 +251,11 @@ class MainWindow(QMainWindow):
 
     def _reconfigure_media_monitor(self):
         config = SettingsManager.get_setting(self.service.settings, "processing.media_watch", {}) or {}
-        self.media_monitor.reconfigure(config)
+        try:
+            self.media_monitor.reconfigure(config)
+        except TimeoutError:
+            QMessageBox.warning(self, "素材监控尚未停止", "旧监控仍在停止，设置已保留。请稍后再次保存监控设置以重试。")
+            return
         self._monitor_paused = self.media_monitor._paused_all
         if hasattr(self, "monitor_action"):
             self.monitor_action.setText("恢复素材监控" if self._monitor_paused else "暂停素材监控")
