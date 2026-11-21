@@ -503,17 +503,23 @@ def test_monitor_global_card_reset_keeps_task_override(qt_app, service, monkeypa
 
 def test_connection_test_does_not_change_routes_or_selected_models(qt_app, service, monkeypatch):
     from gui.services.model_catalog import ModelCatalog
+    from tests.support.qt_http import wait
+    from tests.support.review_sdk_server import sdk_server
     model_catalog = ModelCatalog()
     monkeypatch.setattr("gui.widgets.model_picker.model_catalog", lambda: model_catalog)
     monkeypatch.setattr("gui.services.model_catalog.model_catalog", lambda: model_catalog)
     view = SettingsView(service)
+    view._on_add_provider()
+    assert view._selected_provider_id() != service.settings["current_provider_id"]
     before_routes = copy.deepcopy(service.settings["task_model_routing"])
-    before_models = copy.deepcopy(service.settings["model_providers"])
     before_default = service.settings["current_provider_id"]
-    def execute(parent, **kwargs):
-        kwargs["on_ok"](["candidate-a", "candidate-b"])
-    monkeypatch.setattr("gui.views.settings.run_io_job", execute)
-    view._test_selected_connection()
+    with sdk_server() as (url, calls):
+        view.api_url_input.setText(url)
+        view.api_key_input.setText("only-selected-key")
+        before_models = copy.deepcopy(service.settings["model_providers"])
+        view.connection_test_btn.click()
+        wait(qt_app, view.connection_test_btn.isEnabled)
+        assert calls == [("/v1/models", "Bearer only-selected-key")]
     assert service.settings["task_model_routing"] == before_routes
     assert service.settings["model_providers"] == before_models
     assert service.settings["current_provider_id"] == before_default
