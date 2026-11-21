@@ -328,13 +328,26 @@ class MediaRegistry:
                             result['items'].append((self.db._row_to_video_dict(rows[video_id]), is_new))
         return result
 
-    def eligible_paths(self, paths, *, verify=True, force_index=True):
+    def eligible_paths(self, paths, *, verify=True, force_index=True, verified=None):
         self.index_existing(force=force_index)
         eligible = []
         for path in dict.fromkeys(paths):
-            if verify and os.path.isfile(path):
+            receipt = (verified or {}).get(path)
+            row = None
+            if receipt:
+                # 只用于当前调用；等待历史建索引后再次对照磁盘与库内版本。
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    pass
+                else:
+                    if (stat.st_size, stat.st_mtime_ns) == receipt[:2]:
+                        current = self.db.get_video_by_path(path)
+                        if current and (current['file_size'], current['file_mtime_ns'], current['id']) == receipt:
+                            row = current
+            if row is None and verify and os.path.isfile(path):
                 row = self.register(path, record_event=False, index_existing=False)
-            else:
+            elif row is None:
                 row = self.db.get_video_by_path(path)
             if row and row.get('file_hash'):
                 with self.db.lock, self.db._managed_connection() as conn:
