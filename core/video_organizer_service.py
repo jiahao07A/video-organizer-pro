@@ -1749,21 +1749,76 @@ class AudioTranscriber:
 class MetadataInjector:
     """元数据注入逻辑 (XMP/FFmpeg)"""
     @staticmethod
+    def _probe(path):
+        info = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_streams', '-show_chapters', '-show_format',
+             '-of', 'json', path], capture_output=True, check=True, timeout=60, **hidden_process_options(),
+        )
+        return json.loads(info.stdout)
+
+    @staticmethod
+    def _preserved(before, after, comment):
+        def stream_layout(info):
+            return [(s.get('codec_type'), s.get('codec_name'), s.get('width'), s.get('height'),
+                     s.get('channels'), s.get('sample_rate'), s.get('disposition', {}),
+                     s.get('color_space'), s.get('color_transfer'), s.get('color_primaries'))
+                    for s in info['streams']]
+
+        def retained_tags(old, new, ignored=()):
+            new = {k.lower(): v for k, v in new.items()}
+            return all(new.get(k.lower()) == v for k, v in old.items() if k.lower() not in ignored)
+
+        def chapter_layout(info):
+            return [(round(float(c['start_time']), 3), round(float(c['end_time']), 3),
+                     c.get('tags', {}).get('title')) for c in info.get('chapters', [])]
+
+        def tags(info):
+            return {k.lower(): v for k, v in info['format'].get('tags', {}).items()}
+
+        old_tags, new_tags = tags(before), tags(after)
+        return (bool(before['streams']) and before['format']['format_name'] == after['format']['format_name']
+                and old_tags.get('major_brand') == new_tags.get('major_brand')
+                and stream_layout(before) == stream_layout(after)
+                and all(retained_tags(old.get('tags', {}), new.get('tags', {}), {'duration', 'encoder'})
+                        for old, new in zip(before['streams'], after['streams']))
+                and chapter_layout(before) == chapter_layout(after)
+                and new_tags.get('comment') == comment
+                and all(new_tags.get(k) == v for k, v in old_tags.items()
+                        if k not in {'comment', 'encoder', 'compatible_brands', 'minor_version'}))
+
+    @staticmethod
     def inject_tags(video_path: str, tags: List[str], summary: str):
         temp_path = None
         try:
-            tags_str = ",".join(tags)
+            extension = os.path.splitext(video_path)[1].lower()
+            if extension not in WORK_SCOPE_VIDEO_EXTENSIONS:
+                return False
+            source_stat = os.stat(video_path)
+            original = MetadataInjector._probe(video_path)
+            comment = f'{summary} | Tags: {",".join(tags)}'
             descriptor, temp_path = tempfile.mkstemp(
-                prefix='.video-organizer-metadata-', suffix='.mp4',
+                prefix='.video-organizer-metadata-', suffix=extension,
                 dir=os.path.dirname(os.path.abspath(video_path)),
             )
             os.close(descriptor)
             cmd = [
-                "ffmpeg", "-y", "-i", video_path, 
-                "-metadata", f"comment={summary} | Tags: {tags_str}", 
-                "-codec", "copy", temp_path
+                "ffmpeg", "-y", "-i", video_path,
+                "-map", "0", "-map_metadata", "0", "-map_chapters", "0",
+                "-metadata", f"comment={comment}", "-codec", "copy",
             ]
+            if extension in {'.mp4', '.mov', '.m4v'}:
+                brand = original['format'].get('tags', {}).get('major_brand')
+                if brand:
+                    cmd += ['-brand', brand]
+                cmd += ['-movflags', 'use_metadata_tags']
+            cmd.append(temp_path)
             subprocess.run(cmd, capture_output=True, check=True, **hidden_process_options())
+            if not MetadataInjector._preserved(original, MetadataInjector._probe(temp_path), comment):
+                return False
+            current = os.stat(video_path)
+            if ((source_stat.st_size, source_stat.st_mtime_ns, source_stat.st_ino)
+                    != (current.st_size, current.st_mtime_ns, current.st_ino)):
+                return False
             os.replace(temp_path, video_path)
             return True
         except Exception:
@@ -4720,13 +4775,17 @@ class VideoOrganizerService:
         """入库；可选自动写 XMP，返回自动 XMP 失败条数。"""
         if res.get('_analysis_side_effects'):
             validate_analysis_result(res)
-        if res.get('_content_version') is not None:
+        def verify_identity():
             current = self.media_registry.register(res['path'], record_event=False)
             if (current.get('content_version') != res['_content_version'] or current.get('duplicate_of')
                     or current.get('fingerprint_state') == 'review'
                     or current.get('timestamp') != res.get('_initial_timestamp')):
+                self.db.execute_non_query("UPDATE videos SET fingerprint_state='review' WHERE id=?", (current['id'],))
                 raise ValueError('分析期间素材内容或人工成果发生变化，结果未覆盖，等待人工核对。')
-        if res.pop('_inject_metadata', False):
+        if res.get('_content_version') is not None:
+            verify_identity()
+        metadata_requested = res.pop('_inject_metadata', False)
+        if metadata_requested:
             res['metadata_injected'] = MetadataInjector.inject_tags(res['path'], res.get('tags', []), res.get('summary', ''))
             if res['metadata_injected']:
                 owned = self.media_registry.register(res['path'], record_event=False, owned_content_update=True)
@@ -4735,7 +4794,15 @@ class VideoOrganizerService:
                 res['file_hash'] = owned['file_hash']
                 res['content_version'] = owned['content_version']
                 res['_content_version'] = owned['content_version']
+            elif res.get('_content_version') is not None:
+                # 工具缺失/格式不支持可保留分析成果；外部换片或人工编辑不能提交旧成果。
+                verify_identity()
         self.db.upsert_video(res)
+        if metadata_requested and not res.get('metadata_injected'):
+            missing = [tool for tool in ('ffmpeg', 'ffprobe') if not shutil.which(tool)]
+            reason = (f"请安装并将 {'、'.join(missing)} 加入 PATH" if missing
+                      else "请检查容器和轨道是否可原样保存，以及文件是否可写、写入期间是否被修改")
+            self.log(f"{os.path.basename(res['path'])}：分析数据已保留，未写入源文件。{reason}。", force_ui=True)
         # 仅在完整缓存上按路径对齐更新，禁止写破缓存
         self._cache_put_video_row(res.get("path") or "", res)
         auto_xmp = SettingsManager.get_setting(
