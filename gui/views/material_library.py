@@ -201,6 +201,7 @@ class MaterialLibraryView(QWidget):
 
         self.splitter.addWidget(self.view_stack)
         self.detail_panel = DetailPanel(self.service)
+        self.detail_panel.data_changed.connect(self.load_data)
         self.detail_panel.setMinimumWidth(320)
         self.splitter.addWidget(self.detail_panel)
         self.splitter.setStretchFactor(0, 3)

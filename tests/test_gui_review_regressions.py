@@ -503,6 +503,21 @@ def test_sidebar_backup_respects_running_thread(service, views, monkeypatch):
         assert worker.wait(5000)
 
 
+def test_library_detail_edit_refreshes_filtered_rows(service, tmp_path, qt_app, views, monkeypatch):
+    path = _insert(service, tmp_path / "library.mp4", status="analyzed", summary="old-match")
+    view = MaterialLibraryView(service)
+    views.append(view)
+    view.search_input.setText("old-match")
+    _wait_for(qt_app, lambda: view.model.rowCount() == 1 and not view._query_pending)
+    view.table_view.selectRow(0)
+    _wait_for(qt_app, lambda: (view.detail_panel.current_video or {}).get("path") == path)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
+    view.detail_panel.summary_input.setPlainText("changed")
+    view.detail_panel.save_btn.click()
+    assert service.db.get_video_by_path(path)["summary"] == "changed"
+    _wait_for(qt_app, lambda: view.model.rowCount() == 0)
+
+
 def test_sensitive_controls_start_unified_autosave(service, views):
     view = SettingsView(service)
     views.append(view)
