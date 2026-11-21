@@ -77,9 +77,13 @@ class UpdateController(QObject):
         self._restore_ready()
 
     def _validate_preferences(self):
+        # 两个值由本机写入（立即检查或延后一天）。毫秒、非有限值及
+        # 极远的将来既不能传给本机日历，也不能让自动更新无限期停摆。
+        latest = time.time() + 86400
         for key in ("last_check", "snooze_until"):
-            if not isinstance(self.preferences[key], (int, float)) or self.preferences[key] < 0:
-                raise ValueError("时间配置无效")
+            value = self.preferences[key]
+            if type(value) not in (int, float) or not 0 <= value <= latest:
+                self.preferences[key] = 0
         for key in ("auto_check", "preview"):
             if type(self.preferences[key]) is not bool:
                 raise ValueError("更新配置无效")
