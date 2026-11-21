@@ -10,7 +10,6 @@ opens the application's production database or real media files.
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import math
 import sqlite3
@@ -29,7 +28,7 @@ from core.video_organizer_service import DatabaseManager
 
 
 def populate(db_path: str, size: int) -> None:
-    db = DatabaseManager(db_path)
+    DatabaseManager(db_path)
     conn = sqlite3.connect(db_path)
     now = "2026-10-05 12:00:00"
     rows = []
@@ -56,8 +55,6 @@ def populate(db_path: str, size: int) -> None:
             rows,
         )
     conn.close()
-    # Keep the local variable alive until initialization has completed.
-    del db
 
 
 def measure(fn):
@@ -95,27 +92,19 @@ def run(size: int, repeat: int = 3) -> dict:
         }
         timings = {}
         result_sizes = {}
-        try:
-            for name, fn in queries.items():
-                samples = []
-                value = None
-                for _ in range(max(1, int(repeat))):
-                    elapsed, value = measure(fn)
-                    samples.append(elapsed)
-                timings[name] = {
-                    "samples_ms": samples,
-                    "median_ms": round(statistics.median(samples), 3),
-                    "p95_ms": percentile(samples, 0.95),
-                }
-                result_sizes[name] = len(value.rows) if hasattr(value, "rows") else value
-            return {"size": size, "repeat": max(1, int(repeat)), "timings_ms": timings, "result_sizes": result_sizes}
-        finally:
-            # DatabaseManager uses short-lived SQLite connections. Release all
-            # owning objects before TemporaryDirectory removes the database on
-            # Windows, where an open handle prevents cleanup.
-            del catalog
-            del db_manager
-            gc.collect()
+        for name, fn in queries.items():
+            samples = []
+            value = None
+            for _ in range(max(1, int(repeat))):
+                elapsed, value = measure(fn)
+                samples.append(elapsed)
+            timings[name] = {
+                "samples_ms": samples,
+                "median_ms": round(statistics.median(samples), 3),
+                "p95_ms": percentile(samples, 0.95),
+            }
+            result_sizes[name] = len(value.rows) if hasattr(value, "rows") else value
+        return {"size": size, "repeat": max(1, int(repeat)), "timings_ms": timings, "result_sizes": result_sizes}
 
 
 def main() -> None:
