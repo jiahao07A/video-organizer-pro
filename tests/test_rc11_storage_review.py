@@ -18,6 +18,26 @@ def service(tmp_path):
     return VideoOrganizerService(settings=SettingsManager.deep_copy_defaults(), db_path=str(tmp_path / 'review.db'))
 
 
+def test_discovery_reads_once_but_later_gate_rehashes(service, tmp_path):
+    path = tmp_path / '数据.mp4'
+    path.write_bytes(b'first')
+    with patch.object(service.media_registry, 'hasher', wraps=full_hash) as hashed:
+        assert service.filter_processable_paths([str(path)], record_discovery=True) == [str(path)]
+        assert hashed.call_count == 1
+        path.write_bytes(b'other')
+        assert service.filter_processable_paths([str(path)]) == [str(path)]
+        assert hashed.call_count == 2
+    assert service.db.get_video_by_path(str(path))['file_hash'] == full_hash(str(path))
+
+
+def test_discovery_error_cannot_bypass_fingerprint(service, tmp_path):
+    path = tmp_path / 'err.mp4'
+    path.write_bytes(b'first')
+    with patch.object(service.media_registry, 'hasher', side_effect=OSError('synthetic unavailable')):
+        with pytest.raises(OSError):
+            service.filter_processable_paths([str(path)], record_discovery=True, refresh_pending=False)
+
+
 @pytest.mark.skipif(os.name != 'nt', reason='Windows 路径语义')
 def test_unicode_scope_directory_file_and_exclusion(service, tmp_path):
     folder = tmp_path / 'Übung'

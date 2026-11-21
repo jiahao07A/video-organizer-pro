@@ -3315,16 +3315,18 @@ class VideoOrganizerService:
     ):
         """所有内容处理入口共用的全库去重门禁，强制分析也不能绕过。"""
         paths = list(dict.fromkeys(path for path in paths if path))
+        verified = {}
         if record_discovery:
             for path in paths:
                 if os.path.isfile(path):
                     try:
-                        self.media_registry.register(path, source='manual', index_existing=False)
+                        row = self.media_registry.register(path, source='manual', index_existing=False)
+                        verified[path] = (row['file_size'], row['file_mtime_ns'], row['id'])
                     except OSError:
                         pass
         if refresh_pending:
             self.refresh_pending_media_fingerprints()
-        result = self.media_registry.eligible_paths(paths, force_index=False)
+        result = self.media_registry.eligible_paths(paths, force_index=False, verified=verified)
         self._last_duplicate_skipped = len(paths) - len(result)
         if self._last_duplicate_skipped:
             self.log(f"去重检查：跳过 {self._last_duplicate_skipped} 项重复副本或内容变化待核对素材。")
