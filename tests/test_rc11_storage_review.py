@@ -51,3 +51,22 @@ def test_plain_pages_keep_count_and_use_sort_index(service, tmp_path):
     assert len(statements) == 2
     details = [r['detail'] for r in execute('EXPLAIN QUERY PLAN '+statements[0][0], statements[0][1])]
     assert any('idx_videos_timestamp_id' in s for s in details)
+
+
+def test_unchanged_watch_scan_opens_bounded_connections(service, tmp_path):
+    root = tmp_path / 'incoming'
+    root.mkdir()
+    records = []
+    for i in range(32):
+        p = root / f'{i}.mp4'
+        p.write_bytes(str(i).encode())
+        records.append(str(p))
+    service.media_registry.register_many(records)
+    monitor = MediaDirectoryMonitor(service, {'auto_analyze': False, 'directories': [{'path': str(root)}]})
+    try:
+        with patch.object(service.db, '_get_connection', wraps=service.db._get_connection) as opens:
+            monitor.scan_now()
+        assert opens.call_count <= 8
+        assert all(service.db.get_video_by_path(p)['fingerprint_state'] == 'verified' for p in records)
+    finally:
+        monitor.stop(shutdown_analysis=True)
