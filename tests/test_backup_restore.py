@@ -275,7 +275,8 @@ def test_interrupted_restore_is_rolled_back_before_next_service_load(
 
     assert recovered.db.get_video_by_path(video_path)["summary"] == "可恢复数据"
     assert settings_path.read_text(encoding="utf-8") == '{"marker": "safe"}'
-    assert tag_config_path.read_text(encoding="utf-8") == (
-        '{"version": "6.0", "marker": "safe", "tag_groups": []}'
-    )
+    # 回滚后按当前格式升级；恢复出的源字节必须先保留，不能留下中断内容。
+    assert json.loads(tag_config_path.read_text(encoding="utf-8"))["marker"] == "safe"
+    upgrade_backups = list((tag_config_path.parent / "backups" / "config-upgrades").glob("tag_config.json.*.bak"))
+    assert any(p.read_bytes() == b'{"version": "6.0", "marker": "safe", "tag_groups": []}' for p in upgrade_backups)
     assert not journal_path.exists()

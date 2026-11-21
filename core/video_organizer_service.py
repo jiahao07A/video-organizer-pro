@@ -1456,38 +1456,19 @@ class SettingsManager:
         普通启动仅以默认值补齐 settings.json 的缺失字段。
         文件缺失时，只有显式恢复才读取旧 settings_blob；已有文件始终优先。
         """
-        settings = SettingsManager.deep_copy_defaults()
+        from core.config_compatibility import adapt_settings, load_config
+        adapter = lambda raw: adapt_settings(raw, DEFAULT_SETTINGS)
         resolved_settings_path = SettingsManager._settings_path(db, settings_path)
-
-        # 1. 文件
-        if os.path.exists(resolved_settings_path):
-            try:
-                with open(resolved_settings_path, "r", encoding="utf-8-sig") as f:
-                    file_settings = json.load(f)
-                if not isinstance(file_settings, dict):
-                    raise ValueError("根节点必须是 JSON 对象（{}）")
-                SettingsManager.deep_update(settings, file_settings)
-            except Exception as e:
-                # 阻止启动后将默认值写回损坏文件，保留用户手动编辑内容。
-                raise ValueError(f"配置文件读取失败：{resolved_settings_path}；{e}") from e
-
-        elif recover_from_database and db is not None:
+        if not os.path.exists(resolved_settings_path) and recover_from_database and db is not None:
             blob = db.get_setting("settings_blob")
             if isinstance(blob, str):
-                blob = json.loads(blob)
+                try:
+                    blob = json.loads(blob)
+                except ValueError:
+                    raise ValueError("数据库设置备份不是有效 JSON") from None
             if blob is not None:
-                if not isinstance(blob, dict):
-                    raise ValueError("数据库设置备份必须是 JSON 对象")
-                SettingsManager.deep_update(settings, blob)
-
-        # 模型供应商：无档案则从旧扁平 api 迁移；写穿 api.* 供 AIHandler
-        try:
-            from core.model_providers import ensure_providers
-            ensure_providers(settings)
-        except Exception as e:
-            logger.warning(f"模型供应商迁移/规范化失败: {e}")
-
-        return settings
+                return adapter(blob)
+        return load_config(resolved_settings_path, adapter)
 
     @staticmethod
     @traced('settings.save')
@@ -1497,26 +1478,19 @@ class SettingsManager:
         settings_path: Optional[str] = None,
     ):
         """保存完整嵌套配置到 settings.json，并写入数据库 settings_blob。"""
-        import copy
+        from core.config_compatibility import adapt_settings, prepare_config_write
         register_settings(settings)
+        adapter = lambda raw: adapt_settings(raw, DEFAULT_SETTINGS)
+        payload = adapter(settings if settings is not None else {})
+        register_settings(payload)
         resolved_settings_path = SettingsManager._settings_path(db, settings_path)
-        if settings is not None:
-            try:
-                from core.model_providers import ensure_providers
-                ensure_providers(settings)
-            except Exception as e:
-                logger.warning(f"保存前同步模型供应商失败: {e}")
-        payload = copy.deepcopy(settings) if settings is not None else SettingsManager.deep_copy_defaults()
-        if settings is None:
-            try:
-                from core.model_providers import ensure_providers
-                ensure_providers(payload)
-            except Exception as e:
-                logger.warning(f"保存前同步模型供应商失败: {e}")
-
-        # 原子写入，避免半截 JSON；与管理数据快照共享进程内边界。
+        # 原子写入，与管理数据快照共享进程内锁；磁盘未来版本也禁止覆盖。
         with STORAGE_IO_LOCK:
+            prepare_config_write(resolved_settings_path, adapter)
             write_json_atomic(resolved_settings_path, payload)
+            if settings is not None:
+                settings.clear()
+                settings.update(payload)
 
             if db:
                 # 数据库写入失败必须向调用方传播：文件已落盘但数据库未同步时，界面不能显示“已保存”。
@@ -4026,113 +4000,31 @@ class VideoOrganizerService:
 
     def load_tag_config(self) -> Dict:
         """加载标签配置，并支持从旧版本自动迁移至 v6.0"""
+        from core.config_compatibility import adapt_tag_config, guard_tag_projection, load_config
         with STORAGE_IO_LOCK:
             with self.db.lock:
                 pending = self.db.get_storage_metadata('tag_import_projection_pending')
                 if pending is not None:
-                    config = self._tag_config_projection(pending['config'])
+                    guard_tag_projection(self._tag_config_path)
+                    config = self._tag_config_projection(adapt_tag_config(pending['config']))
                     try:
                         self._write_tag_import_projection(config)
                     except Exception:
                         # 数据库已提交。文件仍不可写也使用正确内存，保留恢复记录。
-                        logger.warning('标签配置投影尚未恢复，继续使用数据库词表；备份：%s', pending.get('backup'), exc_info=True)
+                        logger.warning('标签配置投影尚未恢复，继续使用数据库词表；恢复记录与备份已保留。')
                     return config
-        default_v6 = {
-            "version": "6.0",
-            "global_settings": {
-                "system_prompt": "你是一个资深的影视后期素材整理专家。请通过观察视频帧，提取精准的元数据。",
-                "language": "zh-CN",
-                "output_format": "json",
-                "export_schemes": {
-                    "filename_pattern": "{category}-{tags}-{summary}",
-                    "xmp_hierarchical": True,
-                    "xmp_prefix_category": True,
-                    "ale_columns": ["Name", "Keywords", "Category", "Summary"]
-                }
-            },
-            "categories": [
-                { "id": "aroll", "display_name": "A-Roll (访谈/主体)", "order": 0 },
-                { "id": "broll", "display_name": "B-Roll (空镜/素材)", "order": 1 },
-                { "id": "working", "display_name": "工作记录", "order": 2 }
-            ],
-            "tag_groups": []
-        }
-
-        if not os.path.exists(self._tag_config_path):
-            from core.tag_vocab import ensure_canonical_tag_groups
-            return ensure_canonical_tag_groups(default_v6)
-
-        try:
-            with open(self._tag_config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            
-            # 检查版本并执行迁移
-            # 已有 tag_groups 的配置按 v6 处理；勿把「缺 version 字段」误当 v1 整表清空
-            raw_ver = config.get("version", None)
-            has_groups = bool(config.get("tag_groups"))
-            if has_groups and (raw_ver is None or str(raw_ver) < "6.0"):
-                config = dict(config)
-                config["version"] = "6.0"
-                from core.tag_vocab import ensure_canonical_tag_groups
-                config = ensure_canonical_tag_groups(config)
-                self.save_tag_config(config)
-                return config
-
-            version = str(raw_ver if raw_ver is not None else "1.0")
-            if version < "6.0" and not has_groups:
-                logger.info(f"正在将标签配置从 v{version} 迁移至 v6.0...")
-                migrated = default_v6.copy()
-                
-                # 迁移旧版的 config 列表
-                old_config = config.get("config", [])
-                new_groups = []
-                for item in old_config:
-                    new_group = {
-                        "id": item.get("id"),
-                        "name": item.get("display_name", item.get("id")),
-                        "rules": {
-                            "selection_mode": "single" if item.get("exclusive", True) else "multiple",
-                            "max_count": item.get("max_count", 1),
-                            "ai_expandable": item.get("ai_expandable", False),
-                            "local_prompt": item.get("description", "")
-                        },
-                        "tags": item.get("tags", [])
-                    }
-                    new_groups.append(new_group)
-                
-                migrated["tag_groups"] = new_groups
-                
-                # 兼容性迁移：如果旧版有 categories 也可以尝试保留
-                if "categories" in config and isinstance(config["categories"], list):
-                    migrated["categories"] = config["categories"]
-                
-                # 自动保存迁移后的版本
-                from core.tag_vocab import ensure_canonical_tag_groups
-                migrated = ensure_canonical_tag_groups(migrated)
-                self.save_tag_config(migrated)
-                return migrated
-            
-            from core.tag_vocab import ensure_canonical_tag_groups
-            return ensure_canonical_tag_groups(config)
-        except Exception as e:
-            logger.error(f"加载标签配置失败: {e}")
-            from core.tag_vocab import ensure_canonical_tag_groups
-            return ensure_canonical_tag_groups(default_v6)
+        return load_config(self._tag_config_path, adapt_tag_config)
 
     def save_tag_config(self, config: Dict):
-        from core.tag_vocab import ensure_canonical_tag_groups
+        from core.config_compatibility import adapt_tag_config, prepare_config_write
 
-        # 始终带上 version，避免下次启动被误当 v1 迁移
-        if isinstance(config, dict) and not config.get("version"):
-            config = dict(config)
-            config["version"] = "6.0"
         try:
-            config = ensure_canonical_tag_groups(config or {})
-        except Exception:
-            pass
-        self.tag_config = config
-        try:
+            # 与加载入口使用相同的默认值、格式版本和类型校验。
+            adapter = adapt_tag_config
+            config = adapter(config)
+            self.tag_config = config
             with STORAGE_IO_LOCK, self.db.lock:
+                prepare_config_write(self._tag_config_path, adapter)
                 pending = self.db.get_storage_metadata('tag_import_projection_pending')
                 if pending is not None:
                     # 恢复期间用户又修改组规则：恢复记录也必须跟上最新配置。
@@ -4141,11 +4033,13 @@ class VideoOrganizerService:
                 write_json_atomic(self._tag_config_path, config)
                 if pending is not None:
                     self.db.execute_non_query("DELETE FROM storage_metadata WHERE key = ?", ('tag_import_projection_pending',))
-            # 更新 AI Handler 中的配置
             if hasattr(self, "ai"):
                 self.ai.tag_config = config
-        except Exception as e:
-            logger.error(f"保存标签配置失败: {e}")
+            return True
+        except Exception:
+            # 不记录异常值，第三方异常可能包含 Key、URL 或 Prompt 原文。
+            logger.error("保存标签配置失败；请检查配置版本、格式、磁盘空间及写入权限，编辑内容已保留。")
+            return False
 
     def build_cold_start_draft(
         self,
@@ -4232,6 +4126,9 @@ class VideoOrganizerService:
         return config
 
     def _write_tag_import_projection(self, config: Dict) -> None:
+        from core.config_compatibility import adapt_tag_config, prepare_tag_projection_write
+        config = adapt_tag_config(config)
+        prepare_tag_projection_write(self._tag_config_path, config)
         write_json_atomic(self._tag_config_path, config)
         self.db.execute_non_query("DELETE FROM storage_metadata WHERE key = ?", ('tag_import_projection_pending',))
 
