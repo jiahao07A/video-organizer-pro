@@ -437,6 +437,19 @@ def test_remember_scope_autosave_snapshots_current_paths(service, tmp_path, view
     assert service.settings["ui_preferences"]["last_work_scope"] == [folder]
 
 
+def test_quick_theme_survives_unrelated_settings_autosave(service, views):
+    import json
+    window = MainWindow(service)
+    views.append(window)
+    page = window._ensure_page(3)
+    window.theme_btn.click()
+    page.font_spin.setValue(19)
+    assert page.prefs_controller.flush_now()
+    stored = json.loads(Path(service._settings_path).read_text(encoding="utf-8"))["ui_preferences"]
+    assert stored["theme"] == page.theme_combo.currentData() == "light"
+    assert stored["font_size"] == 19
+
+
 def test_monitor_global_advanced_navigation_can_return_to_monitor(service, views):
     window = MainWindow(service)
     views.append(window)
@@ -447,6 +460,25 @@ def test_monitor_global_advanced_navigation_can_return_to_monitor(service, views
     assert window.settings_page.tabs.currentIndex() == window.settings_page._page_index_by_id["monitoring"]
     window.nav_list.setCurrentRow(2)
     assert window.content_stack.currentWidget() is window.media_watch_page
+
+
+@pytest.mark.parametrize("settings_open", [False, True])
+def test_quick_theme_reports_write_failure_without_applying_style(service, views, monkeypatch, settings_open):
+    window = MainWindow(service)
+    views.append(window)
+    if settings_open:
+        window._ensure_page(3)
+    before = window.styleSheet()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: warnings.append(a[1]))
+    def failed(*args, **kwargs):
+        raise OSError("synthetic write failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(SettingsManager, "save_settings", failed)
+        window.toggle_theme()
+    assert warnings and window.styleSheet() == before
+    if not settings_open:
+        assert service.settings["ui_preferences"]["theme"] == "dark"
 
 
 def test_sensitive_controls_start_unified_autosave(service, views):
