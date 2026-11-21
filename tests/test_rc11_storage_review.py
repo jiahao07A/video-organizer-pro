@@ -33,3 +33,21 @@ def test_unicode_scope_directory_file_and_exclusion(service, tmp_path):
     assert service.db.reconcile_monitored_paths(str(folder).lower(), [keep.lower()])
     assert service.db.monitored_status_counts(str(folder))['缺失'] == 1
     assert service.db.get_video_by_path(neighbor)['is_missing'] == 0
+
+
+def test_plain_pages_keep_count_and_use_sort_index(service, tmp_path):
+    service.db.insert_videos_if_absent([{'path': str(tmp_path / f'{i}.mp4'), 'timestamp': '2026-01-01'}
+                                        for i in range(3)])
+    statements = []
+    execute = service.db.execute_query
+    def recording(query, params=()):
+        statements.append((query,params))
+        return execute(query,params)
+    with patch.object(service.db, 'execute_query', side_effect=recording):
+        first = service.catalog.list_page(limit=1, offset=1)
+        empty = service.catalog.list_page(limit=1, offset=4)
+    assert first.total_count == empty.total_count == 3 and not empty.rows
+    assert [r['id'] for r in first.rows] == [2]
+    assert len(statements) == 2
+    details = [r['detail'] for r in execute('EXPLAIN QUERY PLAN '+statements[0][0], statements[0][1])]
+    assert any('idx_videos_timestamp_id' in s for s in details)
