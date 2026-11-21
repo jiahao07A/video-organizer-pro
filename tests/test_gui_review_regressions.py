@@ -481,6 +481,28 @@ def test_quick_theme_reports_write_failure_without_applying_style(service, views
         assert service.settings["ui_preferences"]["theme"] == "dark"
 
 
+def test_sidebar_backup_respects_running_thread(service, views, monkeypatch):
+    from gui.workers.io_worker import IoWorker
+    window = MainWindow(service)
+    views.append(window)
+    started, finish = threading.Event(), threading.Event()
+    def hold():
+        started.set()
+        finish.wait(5)
+    worker = IoWorker(hold, window)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: None)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
+    before = service.list_backups()
+    worker.start()
+    try:
+        assert started.wait(2)
+        window.backup_btn.click()
+        assert service.list_backups() == before
+    finally:
+        finish.set()
+        assert worker.wait(5000)
+
+
 def test_sensitive_controls_start_unified_autosave(service, views):
     view = SettingsView(service)
     views.append(view)
