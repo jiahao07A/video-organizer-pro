@@ -159,7 +159,7 @@ class DataDirectoryManager:
         valid_payloads = []
         for candidate in candidates:
             try:
-                with open(candidate, "r", encoding="utf-8") as handle:
+                with open(candidate, "r", encoding="utf-8-sig") as handle:
                     payload = json.load(handle)
             except Exception as exc:
                 raise DataDirectoryError(f"数据目录定位记录无法读取: {exc}") from exc

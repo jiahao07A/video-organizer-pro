@@ -59,7 +59,7 @@ def _normalize_models(raw: Any) -> Dict[str, str]:
     base = default_models()
     if not isinstance(raw, dict):
         return base
-    out = dict(base)
+    out = {**copy.deepcopy(raw), **base}
     for key in MODEL_KEYS:
         val = raw.get(key)
         if val is not None and str(val).strip():
@@ -97,7 +97,8 @@ def list_providers(settings: Dict) -> List[Dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         pid = str(item.get("id") or "").strip() or new_provider_id()
-        out.append(
+        normalized = copy.deepcopy(item)
+        normalized.update(
             make_provider(
                 provider_id=pid,
                 display_name=str(item.get("display_name") or DEFAULT_DISPLAY_NAME),
@@ -106,6 +107,7 @@ def list_providers(settings: Dict) -> List[Dict[str, Any]]:
                 models=item.get("models"),
             )
         )
+        out.append(normalized)
     return out
 
 
@@ -153,7 +155,7 @@ def empty_route_slot() -> Dict[str, str]:
 def _normalize_route_slot(raw: Any) -> Dict[str, str]:
     if not isinstance(raw, dict):
         return empty_route_slot()
-    return {
+    return {**copy.deepcopy(raw),
         "provider_id": str(raw.get("provider_id") or "").strip(),
         "model": str(raw.get("model") or "").strip(),
     }
@@ -163,7 +165,7 @@ def get_task_model_routing(settings: Dict) -> Dict[str, Dict[str, str]]:
     raw = settings.get("task_model_routing")
     if not isinstance(raw, dict):
         return {k: empty_route_slot() for k in TASK_ROUTE_KEYS}
-    out: Dict[str, Dict[str, str]] = {}
+    out = copy.deepcopy(raw)
     for key in TASK_ROUTE_KEYS:
         out[key] = _normalize_route_slot(raw.get(key))
     return out
@@ -197,10 +199,12 @@ def replace_task_model_routing(
 ) -> Dict:
     """整表替换路由（设置 UI 保存用）。"""
     ensure_providers(settings)
-    cleaned: Dict[str, Dict[str, str]] = {}
+    cleaned = copy.deepcopy(settings.get("task_model_routing") or {})
     src = routing if isinstance(routing, dict) else {}
     for key in TASK_ROUTE_KEYS:
-        cleaned[key] = _normalize_route_slot(src.get(key))
+        cleaned[key] = {**cleaned.get(key, {}), **_normalize_route_slot(src.get(key))}
+    for key in src.keys() - set(TASK_ROUTE_KEYS):
+        cleaned[key] = copy.deepcopy(src[key])
     settings["task_model_routing"] = cleaned
     return settings
 
@@ -223,7 +227,7 @@ def migrate_task_model_routing(settings: Dict) -> Dict:
     models = _normalize_models(current.get("models"))
 
     existing = settings.get("task_model_routing")
-    routing: Dict[str, Dict[str, str]] = {}
+    routing = copy.deepcopy(existing) if isinstance(existing, dict) else {}
     if isinstance(existing, dict):
         for key in TASK_ROUTE_KEYS:
             if key in existing:
@@ -236,10 +240,6 @@ def migrate_task_model_routing(settings: Dict) -> Dict:
                 "provider_id": current_id,
                 "model": models.get(key) or DEFAULT_MODEL,
             }
-        else:
-            # 有槽但 model 空：用档案默认
-            if not routing[key].get("model"):
-                routing[key]["model"] = models.get(key) or DEFAULT_MODEL
 
     for key in TASK_ROUTE_KEYS:
         if key not in routing:
@@ -327,7 +327,8 @@ def ensure_providers(settings: Dict) -> Dict:
     # 删供应商后：指向失效 id 的槽清空 provider_id（回退当前）
     routing = get_task_model_routing(settings)
     changed = False
-    for key, slot in routing.items():
+    for key in TASK_ROUTE_KEYS:
+        slot = routing[key]
         pid = str(slot.get("provider_id") or "").strip()
         if pid and pid not in ids:
             slot["provider_id"] = ""
@@ -379,7 +380,7 @@ def apply_provider_to_api_flat(settings: Dict) -> Dict:
     api = _get_api_section(settings)
     api["key"] = provider.get("api_key") or ""
     api["base_url"] = provider.get("base_url") or ""
-    api["model_personalization"] = _normalize_models(provider.get("models"))
+    api["model_personalization"] = {**(api.get("model_personalization") or {}), **_normalize_models(provider.get("models"))}
     return settings
 
 
@@ -414,7 +415,7 @@ def update_provider(
         if base_url is not None:
             p["base_url"] = base_url or ""
         if models is not None:
-            p["models"] = _normalize_models(models)
+            p["models"] = _normalize_models({**p.get("models", {}), **models})
         providers[i] = p
         found = True
         break
@@ -480,22 +481,18 @@ def remove_provider(settings: Dict, provider_id: str) -> Dict:
 
 
 def replace_providers(settings: Dict, providers: List[Dict[str, Any]], current_id: str) -> Dict:
-    """整表替换（设置 UI 保存用）。超过上限截断前 MAX_PROVIDERS 条。"""
+    """整表替换，保留同身份档案的扩展字段；拒绝超限而不截断密钥。"""
+    if len(providers or []) > MAX_PROVIDERS:
+        raise ProviderLimitError(f"最多只能保存 {MAX_PROVIDERS} 个模型供应商")
+    previous = {p['id']: p for p in list_providers(settings)}
     cleaned: List[Dict[str, Any]] = []
     for item in providers or []:
         if not isinstance(item, dict):
             continue
-        cleaned.append(
-            make_provider(
-                provider_id=str(item.get("id") or "") or None,
-                display_name=str(item.get("display_name") or DEFAULT_DISPLAY_NAME),
-                api_key=str(item.get("api_key") or ""),
-                base_url=str(item.get("base_url") or ""),
-                models=item.get("models"),
-            )
-        )
-        if len(cleaned) >= MAX_PROVIDERS:
-            break
+        merged = {**copy.deepcopy(previous.get(item.get('id'), {})), **copy.deepcopy(item)}
+        merged['models'] = {**previous.get(item.get('id'), {}).get('models', {}), **item.get('models', {})}
+        normalized = list_providers({'model_providers': [merged]})[0]
+        cleaned.append(normalized)
     if not cleaned:
         cleaned = [make_provider(display_name=DEFAULT_DISPLAY_NAME)]
     settings["model_providers"] = cleaned

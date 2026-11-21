@@ -1,5 +1,6 @@
 """监控配置的唯一默认值和继承规则。"""
 import fnmatch
+import copy
 import os
 import uuid
 
@@ -37,6 +38,8 @@ def _value(key, value, default):
         except (ValueError, TypeError):
             return default
     if isinstance(default, bool):
+        if isinstance(value, str) and value.strip().lower() in ('true', 'false'):
+            return value.strip().lower() == 'true'
         return value if isinstance(value, bool) else default
     if isinstance(default, list):
         if isinstance(value, str):
@@ -53,7 +56,8 @@ def _value(key, value, default):
 
 def normalize_watch_config(config):
     config = config if isinstance(config, dict) else {}
-    result = {key: _value(key, config.get(key, default), default) for key, default in DEFAULTS.items()}
+    result = copy.deepcopy(config)
+    result.update({key: _value(key, config.get(key, default), default) for key, default in DEFAULTS.items()})
     result['directories'] = []
     seen = set()
     for raw in config.get('directories') or []:
@@ -65,10 +69,10 @@ def normalize_watch_config(config):
         if identity in seen:
             continue
         seen.add(identity)
-        directory = {
+        directory = {**copy.deepcopy(raw),
             'id': str(raw.get('id') or uuid.uuid5(uuid.NAMESPACE_URL, identity)),
             'name': str(raw.get('name') or os.path.basename(path) or path),
-            'path': path, 'enabled': raw.get('enabled', True) is not False,
+            'path': path, 'enabled': _value('enabled', raw.get('enabled', True), True),
         }
         for key, default in DEFAULTS.items():
             directory[key] = _value(key, raw[key], default) if raw.get(key) is not None else None
