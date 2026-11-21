@@ -4,13 +4,14 @@ import sys
 import json
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, 
-    QComboBox, QFormLayout, QScrollArea, QFrame, QCheckBox, 
+    QComboBox, QFormLayout, QScrollArea, QFrame, QCheckBox, QLayout,
     QPushButton, QMessageBox, QMenu, QToolButton
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from .tag_flow import TagFlowWidget
 from .media_preview import MediaPreviewWidget
+from .flow_layout import FlowLayout
 from core.video_organizer_service import VideoOrganizerService
 
 class DetailPanel(QWidget):
@@ -36,6 +37,16 @@ class DetailPanel(QWidget):
         self.batch_info.setVisible(False)
         layout.addWidget(self.batch_info)
 
+        # 预览和详情共同滚动，避免小窗口把播放控制挤到表单下面。
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        content_layout.setSizeConstraint(QLayout.SetMinimumSize)
+
         # 1. 素材预览区（放大）
         preview_header = QHBoxLayout()
         preview_header.addWidget(QLabel("素材预览"))
@@ -45,23 +56,19 @@ class DetailPanel(QWidget):
         self.field_pref_btn.setPopupMode(QToolButton.InstantPopup)
         self.field_pref_btn.setToolTip("选择详情区显示/隐藏的字段")
         preview_header.addWidget(self.field_pref_btn)
-        layout.addLayout(preview_header)
+        content_layout.addLayout(preview_header)
 
         self.media_preview = MediaPreviewWidget()
-        self.media_preview.setMinimumHeight(260)
-        layout.addWidget(self.media_preview, 2)
+        content_layout.addWidget(self.media_preview)
 
         # 兼容旧入口
         self.thumb_label = self.media_preview
 
         # 2. 表单区域
-        form_scroll = QScrollArea()
-        form_scroll.setWidgetResizable(True)
-        form_scroll.setFrameShape(QFrame.NoFrame)
-        
         form_container = QWidget()
         form_layout = QFormLayout(form_container)
         form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form_layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
         form_layout.setLabelAlignment(Qt.AlignRight)
         
         self.filename_label = QLabel("-")
@@ -102,8 +109,9 @@ class DetailPanel(QWidget):
         form_layout.addRow("转录:", self.transcript_input)
         self._form_layout = form_layout
         
-        form_scroll.setWidget(form_container)
-        layout.addWidget(form_scroll, 3)
+        content_layout.addWidget(form_container)
+        self.content_scroll.setWidget(content)
+        layout.addWidget(self.content_scroll, 1)
 
         # 批量设置
         self.merge_tags_cb = QCheckBox("合并标签 (不覆盖原有标签)")
@@ -111,7 +119,7 @@ class DetailPanel(QWidget):
         layout.addWidget(self.merge_tags_cb)
 
         # 3. 保存按钮
-        btn_layout = QHBoxLayout()
+        btn_layout = FlowLayout(margin=0, spacing=8)
         self.save_btn = QPushButton("保存修改")
         self.save_btn.setObjectName("primary_button")
         self.save_btn.setFixedHeight(40)
@@ -132,10 +140,10 @@ class DetailPanel(QWidget):
         self.storyboard_btn.clicked.connect(self.generate_storyboard)
         self.storyboard_btn.setEnabled(False)
         
-        btn_layout.addWidget(self.save_btn, 2)
-        btn_layout.addWidget(self.ai_rec_btn, 1)
-        btn_layout.addWidget(self.storyboard_btn, 1)
-        btn_layout.addWidget(self.export_tags_btn, 1)
+        btn_layout.addWidget(self.save_btn)
+        btn_layout.addWidget(self.ai_rec_btn)
+        btn_layout.addWidget(self.storyboard_btn)
+        btn_layout.addWidget(self.export_tags_btn)
         layout.addLayout(btn_layout)
 
         self._build_field_pref_menu()
