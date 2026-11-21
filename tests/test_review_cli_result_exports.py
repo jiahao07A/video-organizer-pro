@@ -173,3 +173,33 @@ def test_result_export_protects_internal_marker_paths_but_not_unrelated_names(se
             service.export_analysis_results(str(protected), selected)
     ordinary = tmp_path / ".video-organizer-install.json"
     assert service.export_analysis_results(str(ordinary), selected) == 1
+
+
+def test_fcpx_all_duplicates_does_not_claim_success(service, tmp_path, qt_app, monkeypatch):
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from gui.views.workstation import WorkstationView
+    register(service, tmp_path / "original.mp4", "same")
+    dup = tmp_path / "copy.mp4"
+    dup.write_bytes(b"same")
+    assert service.media_registry.register(str(dup))["duplicate_of"]
+    service.replace_work_scope([str(dup)], scan=False)
+    view = WorkstationView(service)
+    out = tmp_path / "untouched.fcpxml"
+    out.write_bytes(b"sentinel")
+    notices = []
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(out), ""))
+    for meth in ("information", "warning"):
+        monkeypatch.setattr(QMessageBox, meth, lambda _, title, msg: notices.append((title, msg)))
+    try:
+        view.show()
+        view.export_fcpx_btn.click()
+        for _ in range(150):
+            QTest.qWait(20)
+            if notices:
+                break
+        assert len(notices) == 1 and "没有可导出" in notices[0][1]
+        assert out.read_bytes() == b"sentinel"
+    finally:
+        view.close()
+        view.deleteLater()

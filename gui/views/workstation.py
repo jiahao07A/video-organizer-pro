@@ -1735,7 +1735,6 @@ class WorkstationView(QWidget):
                    on_fail=failed, on_start=lambda: self._busy_io_start("正在导出分析结果…"),
                    busy_message="正在导出分析结果…")
 
-
     def export_fcpx(self):
         if self._reject_busy_operation():
             return
@@ -1756,12 +1755,14 @@ class WorkstationView(QWidget):
             return
 
         def job():
-            self.service.export_to_fcpx_xml(file_path, selected_paths)
-            return file_path
+            return self.service.export_to_fcpx_xml(file_path, selected_paths)
 
-        def on_ok(path):
+        def on_ok(result):
             self._busy_io_end()
-            QMessageBox.information(self, "成功", f"FCPX XML 已导出至: {path}")
+            if result is False:
+                QMessageBox.information(self, "未导出", "没有可导出的素材，目标文件未更改。")
+            else:
+                QMessageBox.information(self, "成功", f"FCPX XML 已导出至: {file_path}")
 
         def on_fail(msg):
             self._busy_io_end()
