@@ -61,7 +61,8 @@ def decode_thumbnail(row, tmp_path):
     assert row['thumbnail']
     path = Path(row['thumbnail_path'])
     assert path.is_relative_to(tmp_path)
-    image = cv2.imread(str(path))
+    # OpenCV 的窄字符文件路径 API 在 Windows 上不能可靠读取中文路径。
+    image = cv2.imdecode(np.frombuffer(path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
     assert image is not None, '数据库缩略图必须真实可解码'
     assert max(image.shape[:2]) <= 64
     return path
@@ -209,7 +210,8 @@ def test_changed_file_around_thumbnail_generation_is_not_bound_and_is_reported(
         assert str(changing) not in calls and produced == []
     else:
         assert str(changing) in calls
-        assert cv2.imread(produced[0]) is not None  # 有效产物也必须因素材变化被拒绝绑定。
+        image = cv2.imdecode(np.frombuffer(Path(produced[0]).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert image is not None  # 有效产物也必须因素材变化被拒绝绑定。
 
 
 def test_change_after_thumbnail_result_validation_before_flush_is_rejected(service, tmp_path, monkeypatch):
