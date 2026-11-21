@@ -12,7 +12,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".m4v", ".flv", ".wmv"})
@@ -399,14 +399,30 @@ class VideoCatalog:
         columns = ", ".join(LIST_COLUMNS)
         columns += ", (SELECT state FROM video_recovery WHERE video_id=videos.id) AS recovery_state"
         columns += ", (SELECT updated_at FROM video_recovery WHERE video_id=videos.id) AS recovery_updated_at"
+        order = self._order(q)
+        if where:
+            # 筛选只执行一次，仅保存匹配编号和排序键，不复制大摘要等列。
+            sort_key = ORDER_COLUMNS.get(q.order_by, "timestamp")
+            matches = f"matched AS MATERIALIZED (SELECT id, {sort_key} AS sort_key FROM videos{where}), "
+            direction = "DESC" if q.descending else "ASC"
+            ids = f"SELECT id FROM matched ORDER BY sort_key {direction}, id {direction} LIMIT ? OFFSET ?"
+            page = f"SELECT {columns} FROM videos WHERE id IN ({ids})"
+            counted = "matched"
+        else:
+            # 缺省首屏可直接走 timestamp/id 索引；总数用 SQLite 的 COUNT 快速路径。
+            matches = ""
+            page = f"SELECT {columns} FROM videos ORDER BY {order} LIMIT ? OFFSET ?"
+            counted = "videos"
         rows = self.db.execute_query(
-            f"SELECT {columns}, COUNT(*) OVER() AS _total_count "
-            f"FROM videos{where} ORDER BY {self._order(q)} LIMIT ? OFFSET ?",
+            f"WITH {matches}page AS ({page}) SELECT page.*, totals.n AS _total_count "
+            f"FROM (SELECT COUNT(*) AS n FROM {counted}) AS totals LEFT JOIN page ON 1 ORDER BY {order}",
             tuple(params) + (limit, offset),
         )
-        total_count = int(rows[0].get("_total_count") or 0) if rows else self.count(q)
+        total_count = int(rows[0]["_total_count"])
         projected_rows = []
         for row in rows:
+            if row['id'] is None:  # 即使偏移超出末页，左连接仍返回同一快照的总数。
+                continue
             data = dict(row)
             data.pop("_total_count", None)
             projected_rows.append(_row_to_list_video(data, self.data_root))
