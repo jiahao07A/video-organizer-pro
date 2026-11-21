@@ -23,6 +23,7 @@ logger = logging.getLogger("VideoOrganizer.media_watch")
 STABILITY_SECONDS = 30.0
 CHECK_INTERVAL_SECONDS = 5.0
 RESCAN_INTERVAL_SECONDS = 300.0
+SHUTDOWN_JOIN_SECONDS = 10.0
 
 
 def _path_key(path: str) -> str:
@@ -183,9 +184,13 @@ class MediaDirectoryMonitor:
         if observer is not None:
             observer.stop()
         if wait and self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=SHUTDOWN_JOIN_SECONDS)
+            if self._thread.is_alive():
+                raise TimeoutError("素材监控仍在停止，请稍后重试退出。")
         if observer is not None and wait:
-            observer.join(timeout=10)
+            observer.join(timeout=SHUTDOWN_JOIN_SECONDS)
+            if observer.is_alive():
+                raise TimeoutError("素材目录监听仍在停止，请稍后重试退出。")
         if shutdown_analysis:
             self._cancel_batch.set()
             with self._analysis_lock:
