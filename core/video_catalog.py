@@ -56,7 +56,11 @@ def _path_key(path: str) -> str:
 
 def _sql_path_key() -> str:
     """与路径参数使用同一套 Windows 大小写/斜杠规则，不改写库内路径。"""
-    return "LOWER(REPLACE(path, CHAR(92), '/'))" if os.name == "nt" else "path"
+    return "catalog_path_key(path)" if os.name == "nt" else "path"
+
+
+def configure_catalog_connection(conn):
+    conn.create_function("catalog_path_key", 1, lambda path: _path_key(path) if path else "", deterministic=True)
 
 
 def _as_iso(value: Any) -> Optional[str]:
