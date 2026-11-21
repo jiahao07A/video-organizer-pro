@@ -11,6 +11,14 @@ import pytest
 from core import video_organizer_service as module
 
 
+@pytest.fixture
+def simulated_probe(monkeypatch):
+    # 这里使用的“视频”是普通哨兵字节。已有测试专验临时文件所有权与异常补偿；
+    # 格式、轨道和实际元数据由真实 ffmpeg/ffprobe 测试从文件读取。
+    monkeypatch.setattr(module.MetadataInjector, '_probe', lambda _: {'format': {}, 'streams': []})
+    monkeypatch.setattr(module.MetadataInjector, '_preserved', lambda *_: True)
+
+
 def synthetic_source(tmp_path, name='source.mp4'):
     source = tmp_path / name
     source.write_bytes(b'original video sentinel')
@@ -28,7 +36,7 @@ def assert_owned_output(path, source):
     assert output.exists()  # mkstemp 已独占创建；ffmpeg 写入本次拥有的路径。
 
 
-def test_metadata_injection_preserves_existing_neighbor_and_owns_unique_output(tmp_path, monkeypatch):
+def test_metadata_injection_preserves_existing_neighbor_and_owns_unique_output(tmp_path, monkeypatch, simulated_probe):
     source, neighbor = synthetic_source(tmp_path)
     captured = []
 
@@ -50,7 +58,7 @@ def test_metadata_injection_preserves_existing_neighbor_and_owns_unique_output(t
 
 
 @pytest.mark.parametrize('failure', ['ffmpeg', 'replace'])
-def test_injection_failure_preserves_source_and_neighbor_and_cleans_owned_output(tmp_path, monkeypatch, failure):
+def test_injection_failure_preserves_source_and_neighbor_and_cleans_owned_output(tmp_path, monkeypatch, failure, simulated_probe):
     source, neighbor = synthetic_source(tmp_path)
     captured = []
 
@@ -71,7 +79,7 @@ def test_injection_failure_preserves_source_and_neighbor_and_cleans_owned_output
     assert list(tmp_path.glob('.video-organizer-metadata-*')) == []
 
 
-def test_parallel_different_sources_have_distinct_owned_temporary_files(tmp_path, monkeypatch):
+def test_parallel_different_sources_have_distinct_owned_temporary_files(tmp_path, monkeypatch, simulated_probe):
     sources = [synthetic_source(tmp_path, name)[0] for name in ('first.mp4', 'second.mp4')]
     barrier = threading.Barrier(2)
     outputs = []
