@@ -77,6 +77,13 @@ def test_cli_initialization_failure_is_a_nonzero_exit(tmp_path, monkeypatch, cap
     assert "storage unavailable" in capsys.readouterr().err
 
 
+def test_installer_uninstalls_from_file_manifest_only():
+    source = (Path(__file__).resolve().parents[1] / "installer" / "VideoOrganizer.iss").read_text(encoding="utf-8")
+    rules = source.split("[UninstallDelete]", 1)[1]
+    directives = [line for line in rules.splitlines() if line.strip() and not line.lstrip().startswith(";")]
+    assert directives == ['Type: files; Name: "{app}\\.video-organizer-install.json"']
+
+
 def test_ale_uses_configured_columns_and_one_physical_row(service, tmp_path):
     path = register(service, tmp_path / "one.mp4", "one")
     service.tag_config["global_settings"]["export_schemes"]["ale_columns"] = ["Category", "Summary", "Keywords", "Name"]

@@ -108,5 +108,6 @@ begin
 end;
 
 [UninstallDelete]
-; The data directory is deliberately preserved. Users can remove it manually after review.
-Type: filesandordirs; Name: "{app}\_internal"
+; Inno 的安装清单只卸载已安装的文件。不要递归清理 _internal；
+; 用户可能将管理数据、快照或其他文件保存在该目录中。
+Type: files; Name: "{app}\.video-organizer-install.json"
