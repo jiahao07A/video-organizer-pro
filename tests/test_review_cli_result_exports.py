@@ -75,3 +75,26 @@ def test_cli_initialization_failure_is_a_nonzero_exit(tmp_path, monkeypatch, cap
     monkeypatch.setattr(cli, "VideoOrganizerService", failed_service)
     assert cli.main([str(path)]) == 1
     assert "storage unavailable" in capsys.readouterr().err
+
+
+def test_ale_uses_configured_columns_and_one_physical_row(service, tmp_path):
+    path = register(service, tmp_path / "one.mp4", "one")
+    service.tag_config["global_settings"]["export_schemes"]["ale_columns"] = ["Category", "Summary", "Keywords", "Name"]
+    out = tmp_path / "out.ale"
+    assert service.export_to_ale(str(out), [path])
+    lines = out.read_text(encoding="utf-8-sig").splitlines()
+    assert lines[lines.index("Column")+1].split("\t") == ["Category", "Summary", "Keywords", "Name"]
+    assert lines[lines.index("Data")+1:] == ["A 类别\t首行 次行\ta b, 中文\tone.mp4"]
+
+
+def test_ale_defaults_clean_every_field(service, tmp_path):
+    path = register(service, tmp_path / "one.mp4", "one")
+    row = service.db.get_video_by_path(path)
+    row["filename"] = "one\r\nline\t.mp4"
+    service.db.upsert_video(row)
+    service.tag_config["global_settings"]["export_schemes"].pop("ale_columns", None)
+    out = tmp_path / "out.ale"
+    assert service.export_to_ale(str(out), [path])
+    lines = out.read_text(encoding="utf-8-sig").splitlines()
+    rows = lines[lines.index("Data")+1:]
+    assert rows == ["one line .mp4\t首行 次行\ta b, 中文\tA 类别\t首行 次行"]

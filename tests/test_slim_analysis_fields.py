@@ -127,4 +127,6 @@ def test_export_ale_has_no_emotion_column(service: VideoOrganizerService, tmp_pa
     assert service.export_to_ale(str(out)) is True
     text = out.read_text(encoding="utf-8-sig")
     assert "Emotion" not in text
-    assert "Name\tDescription\tKeywords\tCategory\tSummary" in text
+    assert text.splitlines()[text.splitlines().index("Column") + 1].split("\t") == [
+        "Name", "Keywords", "Category", "Summary",
+    ]

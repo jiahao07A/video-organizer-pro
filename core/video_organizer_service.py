@@ -6181,6 +6181,14 @@ class VideoOrganizerService:
             self.log("没有可导出的视频数据。")
             return False
             
+        # ALE 没有 CSV 式的引号转义，每个字段必须保持为一行中的一格。
+        clean = lambda value: re.sub(r"[\r\n\t]+", " ", str(value or ""))
+        known = ("Name", "Description", "Keywords", "Category", "Summary")
+        configured = (getattr(self, "tag_config", {}) or {}).get("global_settings", {}).get("export_schemes", {}).get("ale_columns", known)
+        columns = list(dict.fromkeys(col for col in configured if col in known))
+        if not columns:
+            self.log("没有可导出的 ALE 列，请在命名与导出中选择支持的字段。")
+            return False
         # ALE 头部信息
         lines = [
             "Heading",
@@ -6189,22 +6197,16 @@ class VideoOrganizerService:
             "FPS\t25", # 默认为 25，实际导入时达芬奇会根据文件名匹配
             "",
             "Column",
-            "Name\tDescription\tKeywords\tCategory\tSummary"
+            "\t".join(columns)
         ]
         
         lines.append("Data")
         
         for item in videos:
-            name = item.get("filename", "")
-            description = item.get("summary", "").replace("\t", " ").replace("\n", " ")
-            tags = item.get("tags", [])
-            keywords = ", ".join(tags)
-            category = item.get("category", "")
-            summary = description  # 重复一遍以防字段映射不同
-            
-            # 使用制表符分隔（已去掉 Emotion / Rating / Composition）
-            row = f"{name}\t{description}\t{keywords}\t{category}\t{summary}"
-            lines.append(row)
+            fields = {"Name": item.get("filename"), "Description": item.get("summary"),
+                      "Keywords": ", ".join(item.get("tags") or []), "Category": item.get("category"),
+                      "Summary": item.get("summary")}
+            lines.append("\t".join(clean(fields[col]) for col in columns))
             
         try:
             with open(output_path, "w", encoding="utf-8-sig") as f: # 修改为 utf-8-sig 以增强达芬奇兼容性
