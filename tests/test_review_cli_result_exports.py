@@ -1,6 +1,7 @@
 """RC11 命令行范围和工作台显式导出；所有素材、配置与数据库均隔离。"""
 import csv
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,22 @@ def register(service, path, text):
     row.update(category="A\t类别", summary="首行\r\n次行", tags=["a\tb", "中文"], status="analyzed")
     service.db.upsert_video(row)
     return str(path)
+
+
+def close_view_after_io(view, app):
+    """等待真实任务及 queued 清理，避免晚到回调污染下一项测试。"""
+    from PySide6.QtCore import QCoreApplication, QElapsedTimer, QEvent
+    from PySide6.QtTest import QTest
+    timer = QElapsedTimer()
+    timer.start()
+    while timer.elapsed() < 5000 and getattr(view, '_io_worker', None) is not None:
+        QTest.qWait(20)
+        time.sleep(.001)
+    assert getattr(view, '_io_worker', None) is None, '导出线程及清理回调未结束，不能销毁视图'
+    view.close()
+    view.deleteLater()
+    app.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
 
 def test_cli_empty_directory_never_renames_library(service, tmp_path, monkeypatch):
@@ -156,16 +173,17 @@ def test_workstation_menu_exports_only_the_visible_filter(service, tmp_path, qt_
         timer.start()
         while timer.elapsed() < 5000 and not (view.model.rowCount() == 1 and view.model.videos[0]["path"] == keep):
             QTest.qWait(20)
+            time.sleep(.001)
         assert [row["path"] for row in view.model.videos] == [keep]
         next(action for action in view.export_results_btn.menu().actions() if action.text() == "JSON").trigger()
         timer.restart()
         while timer.elapsed() < 5000 and not notices:
             QTest.qWait(20)
+            time.sleep(.001)
         assert notices == ["导出完成"]
         assert [row["path"] for row in json.loads(out.read_text(encoding="utf-8"))] == [keep]
     finally:
-        view.close()
-        view.deleteLater()
+        close_view_after_io(view, qt_app)
 
 
 def test_result_export_protects_internal_marker_paths_but_not_unrelated_names(service, tmp_path, monkeypatch):
@@ -183,6 +201,7 @@ def test_result_export_protects_internal_marker_paths_but_not_unrelated_names(se
 
 
 def test_fcpx_all_duplicates_does_not_claim_success(service, tmp_path, qt_app, monkeypatch):
+    from PySide6.QtCore import QElapsedTimer
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QFileDialog, QMessageBox
     from gui.views.workstation import WorkstationView
@@ -201,12 +220,12 @@ def test_fcpx_all_duplicates_does_not_claim_success(service, tmp_path, qt_app, m
     try:
         view.show()
         view.export_fcpx_btn.click()
-        for _ in range(150):
+        timer = QElapsedTimer()
+        timer.start()
+        while timer.elapsed() < 3000 and not notices:
             QTest.qWait(20)
-            if notices:
-                break
+            time.sleep(.001)
         assert len(notices) == 1 and "没有可导出" in notices[0][1]
         assert out.read_bytes() == b"sentinel"
     finally:
-        view.close()
-        view.deleteLater()
+        close_view_after_io(view, qt_app)
