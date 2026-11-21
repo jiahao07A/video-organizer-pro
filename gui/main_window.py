@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox, QDialog,
     QSystemTrayIcon, QMenu, QApplication, QDialogButtonBox
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QSignalBlocker, QTimer, Signal
 from PySide6.QtWidgets import QStyle
 from PySide6.QtGui import QAction
 from .views.workstation import WorkstationView
@@ -543,6 +543,13 @@ class MainWindow(QMainWindow):
         page = self._ensure_page(index)
         if page is None:
             return
+        # 程序内跳转与侧栏点击共用页面 ID；监控在侧栏中的行号与页面 ID 不同。
+        if self.nav_list.currentItem().data(Qt.UserRole) != index:
+            with QSignalBlocker(self.nav_list):
+                for row in range(self.nav_list.count()):
+                    if self.nav_list.item(row).data(Qt.UserRole) == index:
+                        self.nav_list.setCurrentRow(row)
+                        break
         self.content_stack.setCurrentWidget(page)
         if index == 0:
             page.load_data()
