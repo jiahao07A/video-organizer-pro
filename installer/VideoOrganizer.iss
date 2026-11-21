@@ -11,6 +11,7 @@
   #error 缺少 AppNumericVersion
 #endif
 #define AppExeName "VideoOrganizer.exe"
+#define ApplicationMutex "VideoOrganizerPro.Application"
 #define AppId "{{D4FD6D1D-6D2D-4B2C-8B6D-000000000000}"
 #ifdef IsolatedSmoke
   #undef AppId
@@ -41,7 +42,7 @@ PrivilegesRequired=lowest
 DisableDirPage=no
 DisableProgramGroupPage=yes
 ChangesAssociations=no
-AppMutex=VideoOrganizerPro.Application
+AppMutex={#ApplicationMutex}
 ; Ask Windows/Inno Setup to send a normal close request to the old app.
 ; The user can still cancel if the app refuses to close.
 CloseApplications=yes
@@ -83,8 +84,21 @@ Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppName}"; Flags: nowait
 
 [Code]
 function InitializeSetup(): Boolean;
+var
+  Attempts: Integer;
 begin
   CreateMutex('VideoOrganizerPro.Installing');
+  { Qt quit is asynchronous: wait for the process to release its mutex before
+    Inno performs its AppMutex check. Never bypass the normal running-app gate. }
+  if ExpandConstant('{param:UPDATE|0}') = '1' then
+  begin
+    Attempts := 0;
+    while CheckForMutexes('{#ApplicationMutex}') and (Attempts < 300) do
+    begin
+      Sleep(100);
+      Attempts := Attempts + 1;
+    end;
+  end;
   Result := True;
 end;
 
