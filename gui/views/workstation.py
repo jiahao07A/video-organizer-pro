@@ -545,6 +545,11 @@ class WorkstationView(QWidget):
         self.rollback_btn = QPushButton("回滚")
         self.export_fcpx_btn = QPushButton("导出 FCPX")
         self.export_ale_btn = QPushButton("导出 ALE (达芬奇)")
+        self.export_results_btn = QPushButton("导出分析结果")
+        results_menu = QMenu(self.export_results_btn)
+        for fmt in ("json", "csv"):
+            results_menu.addAction(fmt.upper(), lambda _checked=False, kind=fmt: self.export_analysis_results(kind))
+        self.export_results_btn.setMenu(results_menu)
         self.sync_xmp_btn = QPushButton("同步元数据 (XMP)")
         self.sync_xmp_btn.setStyleSheet("background-color: #2e7d32; color: white;")
 
@@ -564,6 +569,7 @@ class WorkstationView(QWidget):
         controls_layout.addWidget(self.rollback_btn)
         controls_layout.addWidget(self.export_fcpx_btn)
         controls_layout.addWidget(self.export_ale_btn)
+        controls_layout.addWidget(self.export_results_btn)
         controls_layout.addWidget(self.sync_xmp_btn)
         controls_layout.addWidget(self.auto_organize_btn)
         layout.addLayout(controls_layout)
@@ -1472,6 +1478,7 @@ class WorkstationView(QWidget):
         self.path_input.setEnabled(enabled)
         self.export_fcpx_btn.setEnabled(enabled)
         self.export_ale_btn.setEnabled(enabled)
+        self.export_results_btn.setEnabled(enabled)
         self.auto_organize_btn.setEnabled(enabled)
         self.delete_btn.setEnabled(enabled)
         if hasattr(self, "detail_panel") and self.detail_panel:
@@ -1697,6 +1704,37 @@ class WorkstationView(QWidget):
         self.set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
+
+    def export_analysis_results(self, fmt):
+        if self._reject_busy_operation():
+            return
+        paths = list(self._resolve_batch_snapshot().target_paths)
+        if not self.service.get_work_scope_paths() or not paths:
+            QMessageBox.warning(self, "无法导出", "工作范围内没有可导出的素材。")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出分析结果", f"video_analysis_results.{fmt}",
+                                                   f"{fmt.upper()} (*.{fmt})")
+        if not file_path or self._reject_busy_operation():
+            return
+        if os.path.splitext(file_path)[1].lower() != f".{fmt}":
+            QMessageBox.warning(self, "导出失败", f"请使用 .{fmt} 扩展名。")
+            return
+
+        def complete(count):
+            self._busy_io_end()
+            if count:
+                QMessageBox.information(self, "导出完成", f"已将 {count} 条素材的结果导出至：{file_path}")
+            else:
+                QMessageBox.information(self, "未导出", "没有可导出的素材，目标文件未更改。")
+
+        def failed(msg):
+            self._busy_io_end()
+            QMessageBox.warning(self, "导出失败", msg)
+
+        run_io_job(self, fn=lambda: self.service.export_analysis_results(file_path, paths), on_ok=complete,
+                   on_fail=failed, on_start=lambda: self._busy_io_start("正在导出分析结果…"),
+                   busy_message="正在导出分析结果…")
+
 
     def export_fcpx(self):
         if self._reject_busy_operation():
