@@ -308,7 +308,8 @@ class MediaDirectoryMonitor:
         return True, found
 
     def scan_now(self, task_id="", include_history=False) -> None:
-        with getattr(self.service, '_file_operation_lock', nullcontext()):
+        # 每个查询/更新仍各自结束事务；整个补扫仅复用线程私有的 SQLite 连接。
+        with getattr(self.service, '_file_operation_lock', nullcontext()), getattr(self.service.db, 'reuse_connection', nullcontext)():
             return self._scan_now(task_id, include_history)
 
     def _scan_now(self, task_id='', include_history=False):
