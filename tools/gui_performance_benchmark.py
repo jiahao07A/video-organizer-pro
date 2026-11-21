@@ -11,7 +11,6 @@ and one debounced text query on the same local machine.
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import math
 import os
@@ -20,16 +19,19 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
 
 from core.video_organizer_service import VideoOrganizerService
 from gui.main_window import MainWindow
-from video_catalog_benchmark import populate
+from gui.workers.catalog_worker import CatalogQueryWorker
+from tools.video_catalog_benchmark import populate
 
 
 def pump_until(app: QApplication, predicate, timeout: float = 5.0) -> float | None:
@@ -45,7 +47,11 @@ def pump_until(app: QApplication, predicate, timeout: float = 5.0) -> float | No
 
 
 def run(app: QApplication, size: int) -> dict:
-    with tempfile.TemporaryDirectory(prefix=f"gui-catalog-{size}-") as tmp:
+    if size < 1:
+        raise ValueError("基准至少需要一条素材")
+    with tempfile.TemporaryDirectory(prefix=f"gui-catalog-{size}-") as tmp, patch.dict(
+        os.environ, {"LOCALAPPDATA": tmp, "VIDEO_ORGANIZER_LOG_DIR": tmp}
+    ):
         db_path = str(Path(tmp) / "benchmark.db")
         populate(db_path, size)
         settings = {
@@ -65,43 +71,52 @@ def run(app: QApplication, size: int) -> dict:
             results_csv=str(Path(tmp) / "results.csv"),
         )
         window = MainWindow(service)
-        window.show()
-        app.processEvents()
-        startup_ms = round((time.perf_counter() - started) * 1000, 3)
+        try:
+            window.show()
+            app.processEvents()
+            startup_ms = round((time.perf_counter() - started) * 1000, 3)
+            window.nav_list.setCurrentRow(1)
+            page = window.library_page
+            first_page_ms = pump_until(app, lambda: page._query_generation > 0 and not page._page_loading)
+            if first_page_ms is None:
+                raise TimeoutError("等待素材库首屏超时")
+            first_rows = page.model.rowCount()
+            if page._page_total != size or first_rows != min(size, page._page_limit):
+                raise RuntimeError(f"素材库首屏不完整：总数 {page._page_total}，首屏 {first_rows}")
 
-        window.nav_list.setCurrentRow(1)
-        first_page_ms = pump_until(
-            app,
-            lambda: window.library_page is not None
-            and window.library_page._page_offset > 0
-            and not window.library_page._page_loading,
-        )
-        old_generation = window.library_page._query_generation
-        query_started = time.perf_counter()
-        window.library_page.search_input.setText("clip-0001")
-        query_ms = pump_until(
-            app,
-            lambda: window.library_page._query_generation > old_generation
-            and not window.library_page._page_loading
-            and window.library_page._page_total < size,
-        )
-        if query_ms is None:
-            query_ms = round((time.perf_counter() - query_started) * 1000, 3)
-
-        result = {
-            "size": size,
-            "startup_to_window_ms": startup_ms,
-            "library_first_page_ms": first_page_ms,
-            "debounced_text_query_ms": query_ms,
-            "first_page_rows": window.library_page.model.rowCount(),
-            "filtered_rows": window.library_page._page_total,
-        }
-        window.close()
-        app.processEvents()
-        del window
-        del service
-        gc.collect()
-        return result
+            old_generation = page._query_generation
+            page.search_input.setText("clip-0001")
+            query_ms = pump_until(app, lambda: page._query_generation > old_generation and not page._page_loading)
+            if query_ms is None:
+                raise TimeoutError("等待防抖检索结果超时")
+            if page.status_label.text().startswith("查询失败"):
+                raise RuntimeError(page.status_label.text())
+            # populate 使用 clip-{i:07d}.mp4，因此此前缀只命中序号 [1000, 2000)。
+            # 核对总数及实际交给 GUI 模型的首屏，不为验证基准再扫描整库。
+            expected = max(0, min(size, 2000) - 1000)
+            displayed = page.model.videos
+            if (page._page_total != expected
+                    or len(displayed) != min(expected, page._page_limit)
+                    or not all(row["filename"].startswith("clip-0001") for row in displayed)):
+                raise RuntimeError(f"检索结果不符：期望 {expected} 条，实际总数 {page._page_total}，"
+                                   f"模型首屏 {len(displayed)} 条")
+            return {
+                "size": size,
+                "startup_to_window_ms": startup_ms,
+                "library_first_page_ms": first_page_ms,
+                "debounced_text_query_ms": query_ms,
+                "first_page_rows": first_rows,
+                "filtered_rows": page._page_total,
+            }
+        finally:
+            # 超时也要等 SQLite 查询退出，避免关闭时弹出忙碌对话框或销毁运行中的 QThread。
+            for worker in window.findChildren(CatalogQueryWorker):
+                worker.wait()
+            app.processEvents()
+            window._allow_exit = True
+            window.close()
+            window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
 
 def percentile(samples, fraction: float) -> float:
