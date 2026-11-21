@@ -116,12 +116,14 @@ class MainWindow(QMainWindow):
 
     def _update_state_changed(self):
         from core.software_update import UpdateState
-        if self._update_preparing and self.update_controller.state == UpdateState.FAILED:
+        if (self._update_preparing or self._update_exiting) and self.update_controller.state == UpdateState.FAILED:
             self._update_preparing = False
+            self._update_exiting = False
+            self._allow_exit = False
             self.centralWidget().setEnabled(True)
             if self._update_notice:
                 self._update_notice.setEnabled(True)
-            QMessageBox.warning(self, "更新准备失败", self.update_controller.message)
+            QMessageBox.warning(self, "更新未完成", self.update_controller.message)
 
     def _launch_update(self, session):
         from core.update_runtime import launch_installer
@@ -147,19 +149,43 @@ class MainWindow(QMainWindow):
         """关闭窗口并显式退出 Qt，避免托盘模式留下旧进程。"""
         self._allow_exit = True
         self._close_accepted = False
-        self.close()
-        if self._close_accepted:
+        try:
+            self.close()
+            if not self._close_accepted:
+                from core.software_update import UpdateState
+                if self.update_controller.state == UpdateState.FAILED:
+                    return  # closeEvent已报告具体原因并恢复界面。
+                raise RuntimeError("旧版本未能退出。请先取消已打开的安装器，再彻底退出程序后重新安装；原管理数据与备份已保留。")
             from core.diagnostic_logging import event
             event('update.application_exit_requested')
             QApplication.instance().quit()
-        else:
+        except Exception as exc:
             self._allow_exit = False
+            self.update_controller._fail(f"更新退出失败：{exc}")
+
+    def _stop_monitor_for_exit(self, event):
+        try:
+            self.media_monitor.stop(shutdown_analysis=True)
+        except Exception as exc:
+            # 必须在 Qt 事件边界拒绝关闭，不能让回调异常把窗口隐藏。
+            event.ignore()
+            self._close_accepted = False
+            self._allow_exit = False
+            self.showNormal()
+            message = f"停止素材监控失败：{exc}。请先取消已打开的安装器，再稍后重试彻底退出。"
+            if self._update_exiting or self._update_preparing:
+                self.update_controller._fail(message)
+            else:
+                QMessageBox.warning(self, "未能退出", message)
+            return False
+        return True
 
     def closeEvent(self, event):
         from gui.views.settings import _window_has_active_background_work
         if self._update_exiting:
             self._allow_exit = True
-            self.media_monitor.stop(shutdown_analysis=True)
+            if not self._stop_monitor_for_exit(event):
+                return
             self._close_accepted = True
             event.accept()
             return
@@ -183,7 +209,8 @@ class MainWindow(QMainWindow):
         if self._update_notice:
             self._update_notice.close()
         if self._allow_exit or not self._tray_available:
-            self.media_monitor.stop(shutdown_analysis=True)
+            if not self._stop_monitor_for_exit(event):
+                return
             self._close_accepted = True
             event.accept()
         else:
