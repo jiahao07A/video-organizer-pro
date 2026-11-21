@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSizePolicy,
 )
+from .flow_layout import FlowLayout
 
 try:
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -65,7 +66,7 @@ class MediaPreviewWidget(QWidget):
         layout.addLayout(prog_row)
 
         # 控制
-        ctrl = QHBoxLayout()
+        ctrl = FlowLayout(margin=0, spacing=6)
         self.play_btn = QPushButton("播放")
         self.play_btn.clicked.connect(self.toggle_play)
         self.play_btn.setEnabled(False)
@@ -86,12 +87,20 @@ class MediaPreviewWidget(QWidget):
         self.reveal_btn.clicked.connect(self.reveal_in_explorer)
         self.reveal_btn.setEnabled(False)
 
+        volume_group = QWidget()
+        volume_layout = QHBoxLayout(volume_group)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        volume_layout.addWidget(QLabel("音量"))
+        volume_layout.addWidget(self.volume_slider)
+        speed_group = QWidget()
+        speed_layout = QHBoxLayout(speed_group)
+        speed_layout.setContentsMargins(0, 0, 0, 0)
+        speed_layout.addWidget(QLabel("倍速"))
+        speed_layout.addWidget(self.speed_combo)
+
         ctrl.addWidget(self.play_btn)
-        ctrl.addWidget(QLabel("音量"))
-        ctrl.addWidget(self.volume_slider)
-        ctrl.addWidget(QLabel("倍速"))
-        ctrl.addWidget(self.speed_combo)
-        ctrl.addStretch()
+        ctrl.addWidget(volume_group)
+        ctrl.addWidget(speed_group)
         ctrl.addWidget(self.reveal_btn)
         layout.addLayout(ctrl)
 
