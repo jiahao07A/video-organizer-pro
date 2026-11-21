@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""设置目录、防抖控制器与设置页：可搜索导航 / 普通偏好自动保存 / 敏感配置明确保存。
+"""设置目录、防抖控制器与设置页：可搜索导航与统一防抖自动保存。
 
 需要 Qt，使用 offscreen 平台，不依赖真实显示器。
 """
@@ -215,19 +215,15 @@ def test_autosave_writes_settings_file(qt_app, service, tmp_path, monkeypatch):
 
 # —— 视图：敏感配置明确保存 ——
 
-def test_sensitive_api_key_requires_explicit_save(qt_app, service, silent_boxes, tmp_path, monkeypatch):
-    settings_path = tmp_path / "settings.json"
-    monkeypatch.setattr(
-        "core.video_organizer_service.get_settings_file_path",
-        lambda: str(settings_path),
-    )
+def test_api_key_survives_restart_after_debounced_autosave(qt_app, service):
+    from tests.support.qt_http import wait
+    settings_path = Path(service._data_paths.settings)
     view = SettingsView(service)
     view.api_key_input.setText("sk-sensitive")
-    # 未点保存前不落盘
-    assert not settings_path.exists()
-    view.apply_settings()
-    assert service.settings["api"]["key"] == "sk-sensitive"
+    wait(qt_app, lambda: settings_path.is_file() and not view.prefs_controller._dirty)
     assert json.loads(settings_path.read_text(encoding="utf-8"))["api"]["key"] == "sk-sensitive"
+    restarted = VideoOrganizerService(db_path=service.db.db_path)
+    assert restarted.settings["api"]["key"] == "sk-sensitive"
 
 
 # —— 视图：重命名入口唯一 ——
