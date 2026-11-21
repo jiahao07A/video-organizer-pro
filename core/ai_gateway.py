@@ -600,6 +600,12 @@ class AiRequestGateway:
             if self._cancelled(cancel_event):
                 self._failure_and_return("用户取消", retriable=False, cancelled=True)
                 return None
+            # 和聊天一样，节流让出工作线程，交给调度器等待或取消；
+            # 等候不是一次失败的 SDK 调用，也不能产生请求指标。
+            if context and not context.before_request():
+                self._failure_and_return(context.stop_reason, retriable=False)
+                self._tls.last_failure.recovery_handled = True
+                return None
             attempt += 1
             register_settings(self.settings)
             request_id = uuid.uuid4().hex
@@ -608,10 +614,6 @@ class AiRequestGateway:
             event('api.request', **request_fields)
             try:
                 with path.open("rb") as audio_file:
-                    if context and not context.before_request():
-                        self._failure_and_return(context.stop_reason, retriable=False)
-                        self._tls.last_failure.recovery_handled = True
-                        return None
                     response = use_client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,

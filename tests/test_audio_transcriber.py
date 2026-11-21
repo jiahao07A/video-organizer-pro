@@ -4,12 +4,56 @@ from pathlib import Path
 from types import SimpleNamespace
 import subprocess
 import threading
+import shutil
 
 import pytest
 
 from core.ai_gateway import AiRequestGateway
 from core.analysis_job_policy import ApiCallFailure
 from core.video_organizer_service import AudioTranscriber
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="需要 ffmpeg 来生成并提取实际媒体音轨")
+@pytest.mark.parametrize("cancel", [False, True], ids=["resume", "cancel"])
+def test_throttled_analysis_submits_audio_once_without_resending_images(tmp_path, monkeypatch, cancel):
+    from core.analysis_recovery import RecoveryContext, RecoveryDeferred
+    from core.video_organizer_service import SettingsManager, VideoOrganizerService
+    from tests.support.review_sdk_server import sdk_server
+
+    monkeypatch.setenv("VIDEO_ORGANIZER_ANALYSIS_LOG_DIR", str(tmp_path / "metrics"))
+    video = tmp_path / "sample.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "testsrc=size=64x64:rate=4", "-f", "lavfi", "-i", "sine=frequency=300",
+                    "-t", "1", "-c:v", "mpeg4", "-c:a", "aac", str(video)], check=True, timeout=20)
+    with sdk_server() as (url, calls):
+        settings = SettingsManager.deep_copy_defaults()
+        settings["api"].update(key="synthetic-review", base_url=url)
+        settings["processing"].update(request_interval=30 if cancel else 2, max_workers=1, enable_scene_detection=False,
+                                      enable_audio_transcription=True, max_frames=2,
+                                      analysis_retry={"call_extra_attempts": 0, "item_max_attempts": 1,
+                                                      "batch_rerun_enabled": False})
+        service = VideoOrganizerService(settings=settings, db_path=str(tmp_path / "test.db"))
+        if cancel:
+            # 等到音频真正被节流时，从公开入口取消，不需等待 30 秒。
+            before_request = RecoveryContext.before_request
+            def cancel_on_audio_wait(context):
+                try:
+                    return before_request(context)
+                except RecoveryDeferred:
+                    if context.task_key == "content_description":
+                        service.request_cancel_analysis()
+                    raise
+            monkeypatch.setattr(RecoveryContext, "before_request", cancel_on_audio_wait)
+        result = service.run_analysis([str(video)])
+        if cancel:
+            assert service.is_analysis_cancelled() and result["succeeded"] == 0
+            assert [path for path, _ in calls] == ["/v1/chat/completions"]
+            return
+        assert result["succeeded"] == 1 and result["failed"] == 0
+        row = service.db.get_video_by_path(str(video))
+        assert row["transcription"] == "合成转录"
+        assert [path for path, _ in calls] == ["/v1/chat/completions", "/v1/audio/transcriptions"]
+        assert b"whisper-1" in calls[1][1] and b"audio.mp3" in calls[1][1]
 
 
 def test_missing_ffmpeg_preserves_preexisting_audio(tmp_path, monkeypatch):
