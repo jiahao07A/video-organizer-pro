@@ -608,8 +608,22 @@ class MainWindow(QMainWindow):
             SettingsManager.get_setting(self.settings, "ui_preferences.theme", "dark")
         )
         new_theme = "light" if current_theme == "dark" else "dark"
+        if self.settings_page is not None:
+            picker = self.settings_page.theme_combo
+            picker.setCurrentIndex(picker.findData(new_theme))
+            if not self.settings_page.prefs_controller.flush_now():
+                QMessageBox.warning(self, "主题未应用", "设置保存未完成，请在设置页检查输入或重试。")
+            return
+        # 未打开设置页时，不为切换主题创建整个表单。写入成功后才应用到窗口。
+        import copy
+        updated = copy.deepcopy(self.settings)
+        SettingsManager.update_setting(updated, "ui_preferences.theme", new_theme)
+        try:
+            SettingsManager.save_settings(updated, self.service.db)
+        except Exception:
+            QMessageBox.warning(self, "主题未应用", "设置保存未完成，请检查数据目录或重试。")
+            return
         SettingsManager.update_setting(self.settings, "ui_preferences.theme", new_theme)
-        SettingsManager.save_settings(self.settings, self.service.db)
         self.refresh_style()
 
     def run_backup(self):
