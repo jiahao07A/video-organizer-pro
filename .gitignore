@@ -40,22 +40,13 @@ logs/*
 logs/manual-tests/*
 !logs/manual-tests/.gitkeep
 
-# Local-only scratch artifacts; specifications and verification records remain trackable.
+# Scratch仅跟踪Markdown规格及验证记录；缓存、测试素材、密钥和构建产物留在本地。
+.scratch/**
+!.scratch/**/
+!.scratch/**/*.md
+# 一次性说明草稿及探针目录仍仅供本地使用。
 .scratch/**/package-smoke*/
 .scratch/**/probe-logs/
-.scratch/**/*.exe
-.scratch/**/*.html
-.scratch/**/*.json
-.scratch/**/*.jsonl
-.scratch/**/*.png
-.scratch/**/*.ps1
-.scratch/**/*.py
-.scratch/**/*.pyz
-.scratch/**/*.pkg
-.scratch/**/*.toc
-.scratch/**/*.txt
-.scratch/**/*.xml
-.scratch/**/*.zip
 .scratch/**/issue-body.md
 .scratch/**/issue.md
 .scratch/**/merge-verification.md
@@ -67,3 +58,5 @@ logs/manual-tests/*
 .scratch/**/*-pr.md
 .scratch/**/*-result.md
 .scratch/**/*-update.md
+# 保留历史本地产品规划的既有排除。
+.scratch/experience-improvements-2026-10-16/
