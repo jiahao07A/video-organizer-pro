@@ -53,7 +53,7 @@ from core.data_directory import (
     DataPaths,
     LegacyLayoutDetected,
 )
-from core.video_catalog import VideoCatalog, VideoQuery
+from core.video_catalog import VideoCatalog, VideoQuery, configure_catalog_connection
 from core.physical_migration import (
     build_physical_migration_plan,
     _is_within_root,
@@ -343,6 +343,7 @@ class DatabaseManager:
 
     def _get_connection(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        configure_catalog_connection(conn)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -761,8 +762,7 @@ class DatabaseManager:
         escaped_root = root_key.replace("%", "\\%").replace("_", "\\_")
         rows = self.execute_query(
             "SELECT path,is_missing FROM videos WHERE "
-            "lower(replace(path,char(92),'/'))=? OR "
-            "lower(replace(path,char(92),'/')) LIKE ? ESCAPE '\\'",
+            "catalog_path_key(path)=? OR catalog_path_key(path) LIKE ? ESCAPE '\\'",
             (root_key, escaped_root + "/%"),
         )
         exclusions = [self._normalized_lookup_path(path).rstrip("/") for path in excluded_roots or []]
@@ -792,8 +792,7 @@ class DatabaseManager:
         escaped_root = root_key.replace("%", "\\%").replace("_", "\\_")
         rows = self.execute_query(
             "SELECT status,is_missing,COUNT(*) AS count FROM videos WHERE "
-            "lower(replace(path,char(92),'/'))=? OR "
-            "lower(replace(path,char(92),'/')) LIKE ? ESCAPE '\\' "
+            "catalog_path_key(path)=? OR catalog_path_key(path) LIKE ? ESCAPE '\\' "
             "GROUP BY status,is_missing",
             (root_key, escaped_root + "/%"),
         )
@@ -821,11 +820,8 @@ class DatabaseManager:
 
     def is_path_cataloged(self, path: str) -> bool:
         normalized = self._normalized_lookup_path(path)
-        return bool(self.execute_query(
-            "SELECT 1 FROM videos WHERE path=? OR "
-            "lower(replace(path, char(92), '/'))=? LIMIT 1",
-            (path, normalized),
-        ))
+        return bool(self.execute_query("SELECT 1 FROM videos WHERE path=? LIMIT 1", (path,)) or
+                    self.execute_query("SELECT 1 FROM videos WHERE catalog_path_key(path)=? LIMIT 1", (normalized,)))
 
     def set_video_missing(self, path: str, missing: bool) -> bool:
         """按规范化路径更新素材缺失状态，返回是否命中记录。"""
@@ -840,7 +836,7 @@ class DatabaseManager:
             if cursor.rowcount == 0:
                 cursor.execute(
                     "UPDATE videos SET is_missing=? WHERE "
-                    "lower(replace(path, char(92), '/'))=? AND is_missing<>?",
+                    "catalog_path_key(path)=? AND is_missing<>?",
                     (target, normalized, target),
                 )
             changed = cursor.rowcount > 0
@@ -921,54 +917,40 @@ class DatabaseManager:
     def get_video_by_path(self, path: str) -> Optional[Dict]:
         """按路径取单条视频记录；不存在则返回 None。"""
         normalized = self._normalized_lookup_path(path)
-        rows = self.execute_query(
-            "SELECT * FROM videos WHERE path = ? OR "
-            "lower(replace(path, char(92), '/')) = ? LIMIT 1",
-            (path, normalized),
-        )
+        rows = self.execute_query("SELECT * FROM videos WHERE path=? LIMIT 1", (path,)) or self.execute_query(
+            "SELECT * FROM videos WHERE catalog_path_key(path)=? LIMIT 1", (normalized,))
         if not rows:
             return None
         return self._row_to_video_dict(rows[0])
 
     @staticmethod
     def _normalized_lookup_path(path: str) -> str:
-        return os.path.normcase(os.path.abspath(str(path))).replace("\\", "/").lower()
+        absolute = os.path.normcase(os.path.abspath(str(path)))
+        return absolute.replace("\\", "/") if os.name == "nt" else absolute
 
     def get_video_statuses_by_paths(self, paths: List[str]) -> List[Dict]:
         """只读取分析目标所需的 path/status 列，避免分析前加载全库。"""
-        values = [str(path) for path in paths or [] if path]
-        rows: List[Dict] = []
-        for start in range(0, len(values), 400):
-            chunk = values[start:start + 400]
-            placeholders = ", ".join("?" for _ in chunk)
-            normalized = [self._normalized_lookup_path(path) for path in chunk]
-            rows.extend(
-                self.execute_query(
-                    f"SELECT path, status, is_missing FROM videos "
-                    f"WHERE path IN ({placeholders}) OR "
-                    f"lower(replace(path, char(92), '/')) IN ({placeholders})",
-                    tuple(chunk) + tuple(normalized),
-                )
-            )
-        return rows
+        return self._rows_by_paths(paths, "path, status, is_missing")
 
     def get_videos_by_paths(self, paths: List[str]) -> List[Dict]:
         """按路径批量读取完整视频记录，不扫描无关素材。"""
-        values = [str(path) for path in paths or [] if path]
+        return [self._row_to_video_dict(row) for row in self._rows_by_paths(paths, "*")]
+
+    def _rows_by_paths(self, paths, columns):
+        values = list(dict.fromkeys(str(path) for path in paths or () if path))
         rows = []
         for start in range(0, len(values), 400):
             chunk = values[start:start + 400]
             placeholders = ", ".join("?" for _ in chunk)
-            normalized = [self._normalized_lookup_path(path) for path in chunk]
-            rows.extend(
-                self.execute_query(
-                    f"SELECT * FROM videos "
-                    f"WHERE path IN ({placeholders}) OR "
-                    f"lower(replace(path, char(92), '/')) IN ({placeholders})",
-                    tuple(chunk) + tuple(normalized),
-                )
-            )
-        return [self._row_to_video_dict(row) for row in rows]
+            rows.extend(self.execute_query(f"SELECT {columns} FROM videos WHERE path IN ({placeholders})", tuple(chunk)))
+        seen = {self._normalized_lookup_path(row['path']) for row in rows}
+        missing = {self._normalized_lookup_path(p) for p in values} - seen
+        if missing:
+            rows.extend(self.execute_query(
+                f"SELECT {columns} FROM videos WHERE catalog_path_key(path) IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(missing), ensure_ascii=False),)))
+        return rows
+
 
     def _row_to_video_dict(self, row) -> Dict:
         d = dict(row)
