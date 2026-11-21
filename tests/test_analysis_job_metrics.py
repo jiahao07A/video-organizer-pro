@@ -97,6 +97,7 @@ def test_phase_histogram_and_resource_peaks_are_bounded_summaries():
     assert snap['resource_peak']['rss_mb'] == 20
 
 
-def test_metrics_accept_workflow_start_time():
+def test_metrics_accept_workflow_start_time(monkeypatch):
+    monkeypatch.setattr("core.analysis_job_metrics.time.time", lambda: 125.25)
     tr = new_job_metrics(started_at=100.0)
-    assert tr.snapshot()['elapsed_sec'] >= 0
+    assert tr.snapshot()["elapsed_sec"] == 25.25
