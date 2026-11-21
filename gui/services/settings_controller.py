@@ -1,67 +1,110 @@
 # -*- coding: utf-8 -*-
-"""设置控制器：普通界面偏好的防抖保存与状态反馈。
-
-职责边界：
-- 只负责把「普通偏好」写回 settings 并防抖落盘，然后发出状态信号；
-- 不负责敏感配置（API Key / 路由 / 供应商）的保存，那些仍由设置页的明确保存区处理；
-- 不改变任何配置键，最终仍调用 ``SettingsManager.save_settings``。
-"""
+"""按存储目标聚合编辑；失败目标保留待保存状态，重试不重复写成功目标。"""
 from __future__ import annotations
 
+import copy
 from PySide6.QtCore import QObject, QTimer, Signal
-
 from core.video_organizer_service import SettingsManager
 
 
 class SettingsController(QObject):
-    """聚合界面偏好的防抖保存，并对外报告保存状态。"""
-
-    #: 保存成功：为简明状态文案
     saved = Signal(str)
-    #: 保存失败：为错误文案
     save_failed = Signal(str)
-    #: 有改动待保存（用于显示「正在保存…」）
     pending = Signal()
+    target_changed = Signal(str, str)
 
-    def __init__(self, service, parent=None, debounce_ms: int = 800):
+    def __init__(self, service, parent=None, debounce_ms=800):
         super().__init__(parent)
         self.service = service
         self._debounce_ms = max(0, int(debounce_ms))
         self._dirty = False
+        self._collecting = False
+        self._collector = self._validator = self._after_save = None
+        self._targets = {}
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(self._debounce_ms)
         self._timer.timeout.connect(self.flush)
+        self.register_target("settings", "设置文件", lambda: service.settings,
+                             lambda: SettingsManager.save_settings(service.settings, service.db))
 
     @property
-    def debounce_ms(self) -> int:
+    def debounce_ms(self):
         return self._debounce_ms
 
-    def schedule_save(self, mutate=None) -> None:
-        """登记一次偏好改动并重启防抖计时。
+    def register_target(self, key, label, collector, writer):
+        self._targets[key] = dict(label=label, collector=collector, writer=writer,
+                                  saved=copy.deepcopy(collector()), state="saved")
 
-        ``mutate`` 在写盘前调用，用于把控件当前值同步进 settings。
-        """
-        if callable(mutate):
-            mutate()
+    def _collect(self):
+        if self._collecting:
+            return True
+        self._collecting = True
+        try:
+            if callable(self._collector) and self._collector() is False:
+                raise ValueError("invalid settings")
+            if callable(self._validator) and self._validator() is False:
+                raise ValueError("invalid settings")
+            return True
+        except Exception:
+            self.save_failed.emit("设置校验失败，请检查输入；编辑内容已保留。")
+            return False
+        finally:
+            self._collecting = False
+
+    def schedule_save(self, collector=None, validator=None, after_save=None):
+        if self._collecting:
+            return
+        if collector is not None:
+            self._collector = collector
+        self._validator = validator
+        self._after_save = after_save
         self._dirty = True
         self.pending.emit()
+        if self._collect():
+            for key, target in self._targets.items():
+                if target["collector"]() != target["saved"]:
+                    target["state"] = "pending"
+                    self.target_changed.emit(key, "pending")
         self._timer.start()
 
-    def flush(self) -> bool:
-        """立即保存待保存改动；单次定时器 timeout 时 isActive 已为 False。"""
+    def flush_now(self):
+        return self.flush()
+
+    def flush(self):
         self._timer.stop()
         if not self._dirty:
             return True
+        if not self._collect():
+            return False
+        failures = []
+        for key, target in self._targets.items():
+            snapshot = copy.deepcopy(target["collector"]())
+            if snapshot == target["saved"] and target["state"] != "failed":
+                continue
+            try:
+                if target["writer"]() is False:
+                    raise OSError("write failed")
+                target["saved"] = snapshot
+                target["state"] = "saved"
+            except Exception:
+                target["state"] = "failed"
+                failures.append(target["label"])
+            self.target_changed.emit(key, target["state"])
+        if failures:
+            self.save_failed.emit("、".join(failures) + "保存失败；编辑内容已保留，请重试。")
+            return False
         try:
-            SettingsManager.save_settings(self.service.settings, self.service.db)
-        except Exception as exc:  # noqa: BLE001 - 保存失败需反馈给用户
-            self.save_failed.emit(str(exc))
+            if callable(self._after_save) and self._after_save() is False:
+                raise RuntimeError("apply failed")
+        except Exception:
+            self.save_failed.emit("设置已保存，但应用失败，请重试。")
             return False
         self._dirty = False
-        self.saved.emit("界面偏好已保存")
+        self.saved.emit("设置已自动保存")
         return True
 
-    def cancel(self) -> None:
+    def cancel(self):
         self._timer.stop()
         self._dirty = False
+        self._collector = self._validator = self._after_save = None

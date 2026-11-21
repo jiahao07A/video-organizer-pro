@@ -85,13 +85,17 @@ def test_monitor_start_pause_resume_and_stop(tmp_path):
         db = Database()
 
     monitor = MediaDirectoryMonitor(Service(), _config(root))
-    assert monitor.start()
-    assert monitor.running
-    monitor.pause()
-    assert not monitor.running
-    monitor.reconfigure(_config(root))
-    assert monitor.running
-    monitor.stop(shutdown_analysis=True)
+    try:
+        assert monitor.start()
+        assert monitor.running
+        monitor.pause()
+        assert not monitor.running
+        monitor.reconfigure(_config(root))
+        assert not monitor.running
+        monitor.resume()
+        assert monitor.running
+    finally:
+        monitor.stop(shutdown_analysis=True)
     assert not monitor.running
 
 

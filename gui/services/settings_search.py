@@ -1,7 +1,8 @@
 """用界面定义补全设置索引；不读取输入值、凭据或动态状态文本。"""
 import re
+from dataclasses import replace
 from PySide6.QtWidgets import QWidget, QFormLayout, QGroupBox, QCheckBox, QPushButton, QLabel
-from gui.models.settings_catalog import SettingsEntry, SETTINGS_ENTRIES, MANUAL
+from gui.models.settings_catalog import CATEGORIES, SettingsEntry, SETTINGS_ENTRIES, MANUAL
 
 
 def build_search_index(view):
@@ -20,7 +21,7 @@ def build_search_index(view):
         key = key or "ui_search_" + str(len(entries))
         view._search_widget_map[key] = widget
         view._search_tab_by_key[key] = tab
-        category = category or {0:"analysis",1:"ai",2:"prompts",3:"everyday",4:"naming",5:"everyday",6:"everyday"}[tab]
+        category = category or CATEGORIES[tab].id
         entries.append(SettingsEntry(key,key,label,category,tuple(keywords),MANUAL,"",tab))
 
     for entry in SETTINGS_ENTRIES:
@@ -30,7 +31,7 @@ def build_search_index(view):
             add(entry.label,widget,tab,key=entry.widget_key,category=entry.category_id,keywords=entry.keywords+(entry.key,entry.effect))
     from gui.widgets.recovery_controls import FIELD_LABELS
     for field,label in FIELD_LABELS.items():
-        add(label,view.http400_settings.global_editor.fields[field],0,keywords=("400",field,"兜底","恢复"))
+        add(label,view.http400_settings.global_editor.fields[field],view._page_index_by_id["failure_handling"],keywords=("400",field,"兜底","恢复"))
     for tab in range(view.tabs.count()):
         page = view.tabs.widget(tab)
         for form in page.findChildren(QFormLayout):
@@ -62,14 +63,18 @@ def build_search_index(view):
     # 非表单布局的提示词与路由，以及折叠的400表格字段。
     local = list(getattr(view,"_local_prompt_edits",{}).values())
     if local:
-        add("标签组引导词",local[0],2,key="local_prompt",keywords=("local_prompt","局部提示词"))
+        add("标签组引导词",local[0],3,key="local_prompt",keywords=("local_prompt","局部提示词"))
     prompts = list(getattr(view,"_tag_ai_prompt_edits",{}).values())
     if prompts:
-        add("标签库 AI 模板",prompts[0],2,key="tag_ai_prompts",keywords=("待审","近义","标准词"))
+        add("标签库 AI 模板",prompts[0],3,key="tag_ai_prompts",keywords=("待审","近义","标准词"))
     for name,widget in getattr(view,"_tag_ai_prompt_edits",{}).items():
         label = {"pending_tag_ai":"待审词 AI（含批量分拣）", "synonym_audit":"近义巡检", "standard_tag_ai":"标准词 AI 助手"}.get(name,name)
-        add(label,widget,2,keywords=(name,"提示词","模板"))
+        add(label,widget,3,keywords=(name,"提示词","模板"))
     from core.model_providers import TASK_ROUTE_LABELS
     for task,widgets in view._route_widgets.items():
-        add(TASK_ROUTE_LABELS.get(task,task)+" 模型",widgets["model"],1,keywords=(task,"路由","模型"))
-    return tuple(entries)
+        add(TASK_ROUTE_LABELS.get(task,task)+" 模型",widgets["model"],view._page_index_by_id["ai_models"],keywords=(task,"路由","模型"))
+    canonical = {entry.widget_key: entry for entry in SETTINGS_ENTRIES}
+    return tuple(replace(canonical[entry.widget_key], tab_index=entry.tab_index)
+                 if entry.widget_key in canonical else replace(entry, page_id=entry.category_id,
+                     card_id=entry.category_id, scope="global", effect="仅影响后续相关操作。")
+                 for entry in entries)

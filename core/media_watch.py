@@ -140,11 +140,11 @@ class MediaDirectoryMonitor:
         with self._analysis_lock:
             return self._analysis_active or bool(self._analysis_queue)
 
-    def start(self) -> bool:
+    def start(self, *, paused: bool = False) -> bool:
         roots = [item for item in self.config["directories"] if item["enabled"]]
         if not roots:
             return False
-        self._paused_all = False
+        self._paused_all = bool(paused)
         if self._thread is not None and self._thread.is_alive():
             self._wake.set()
             return True
@@ -169,11 +169,12 @@ class MediaDirectoryMonitor:
         return True
 
     def reconfigure(self, config: Dict[str, Any]) -> None:
+        paused = self._paused_all
         self.stop()
         self.config = normalize_watch_config(config)
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self.start()
+        self.start(paused=paused)
 
     def stop(self, *, wait: bool = True, shutdown_analysis: bool = False) -> None:
         self._stop.set()

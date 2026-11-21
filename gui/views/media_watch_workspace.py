@@ -196,7 +196,7 @@ class MediaWatchWorkspace(QWidget):
         task = self._task()
         self._loading = True
         for key, combo in self.basics.items():
-            combo.setEnabled(True)
+            combo.setEnabled(task is not None)
             combo.setItemText(0, '继承默认（' + ('开启' if config[key] else '关闭') + '）')
             combo.setCurrentIndex(max(0, combo.findData(task.get(key) if task else config[key])))
         self.preset.clear()
@@ -205,7 +205,7 @@ class MediaWatchWorkspace(QWidget):
         for name in self.service.tag_config.get('global_settings', {}).get('presets', {}):
             self.preset.addItem(name, name)
         self.preset.setCurrentIndex(max(0, self.preset.findData(task.get('rename_preset') if task else config['rename_preset'])))
-        self.preset.setEnabled(True)
+        self.preset.setEnabled(task is not None)
         if task:
             effective = effective_directory_options(config, task['path'])
             self.effective_label.setText(task['path'] + ('\n自动分析：' + ('开' if effective['auto_analyze'] else '关') + ' · 自动重命名：' + ('开' if effective['auto_rename'] else '关') if effective else '\n任务已停用'))
@@ -214,10 +214,12 @@ class MediaWatchWorkspace(QWidget):
         self._loading = False
 
     def _save_basics(self, *_):
-        if self._loading:
+        if self._loading or not self.task_id:
             return
         config = load_watch_config(self.service)
-        task = next((task for task in config['directories'] if task['id'] == self.task_id), config)
+        task = next((task for task in config['directories'] if task['id'] == self.task_id), None)
+        if task is None:
+            return
         for key, combo in self.basics.items():
             if task is not config or combo.currentData() is not None:
                 task[key] = combo.currentData()

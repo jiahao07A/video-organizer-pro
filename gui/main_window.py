@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame,
     QLabel, QListWidget, QListWidgetItem, QStackedWidget,
     QStatusBar, QProgressBar, QPushButton, QComboBox, QMessageBox, QDialog,
-    QSystemTrayIcon, QMenu, QApplication
+    QSystemTrayIcon, QMenu, QApplication, QDialogButtonBox
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QStyle
@@ -225,9 +225,9 @@ class MainWindow(QMainWindow):
     def _reconfigure_media_monitor(self):
         config = SettingsManager.get_setting(self.service.settings, "processing.media_watch", {}) or {}
         self.media_monitor.reconfigure(config)
-        self._monitor_paused = False
+        self._monitor_paused = self.media_monitor._paused_all
         if hasattr(self, "monitor_action"):
-            self.monitor_action.setText("暂停素材监控")
+            self.monitor_action.setText("恢复素材监控" if self._monitor_paused else "暂停素材监控")
         if self.settings_page and self.settings_page.media_watch_page:
             self.settings_page.media_watch_page.refresh()
         if self.library_page:
@@ -479,11 +479,38 @@ class MainWindow(QMainWindow):
         return page
 
     def _open_watch_advanced(self, task_id=''):
-        settings = self._ensure_page(3)
-        self.nav_list.setCurrentRow(4)
-        settings.tabs.setCurrentWidget(settings.media_watch_page)
-        settings.media_watch_page.refresh()
-        settings.media_watch_page.target.setCurrentIndex(max(0, settings.media_watch_page.target.findData(task_id)))
+        if not task_id:
+            self.switch_page(3)
+            self.settings_page.tabs.setCurrentIndex(self.settings_page._page_index_by_id["monitoring"])
+            return
+        from .views.media_watch_advanced import MediaWatchSettingsView
+        class TaskRulesDialog(QDialog):
+            def reject(editor):
+                if editor.panel.controller.flush_now():
+                    super().reject()
+
+            def closeEvent(editor, event):
+                if editor.panel.controller.flush_now():
+                    event.accept()
+                else:
+                    event.ignore()
+
+        dialog = TaskRulesDialog(self)
+        dialog.setWindowTitle("编辑当前监控任务规则")
+        dialog.resize(920, 760)
+        layout = QVBoxLayout(dialog)
+        panel = MediaWatchSettingsView(self.service, dialog, mode="task", task_id=task_id)
+        dialog.panel = panel
+        panel.changed.connect(self._reconfigure_media_monitor)
+        layout.addWidget(panel)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        def close_editor():
+            if panel.controller.flush_now():
+                dialog.reject()
+        buttons.rejected.connect(close_editor)
+        layout.addWidget(buttons)
+        dialog.finished.connect(lambda: panel.controller.flush_now())
+        dialog.exec()
 
     def refresh_presets(self):
         self.preset_combo.blockSignals(True)

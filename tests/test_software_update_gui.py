@@ -212,8 +212,9 @@ def test_settings_tab_and_task_gate(app, tmp_path, monkeypatch, signed):
     service = VideoOrganizerService(db_path=str(tmp_path / "db.sqlite"), results_json=str(tmp_path / "results.json"))
     window = MainWindow(service)
     page = window._ensure_page(3)
-    assert page.tabs.tabText(5) == "软件更新"
+    assert page.tabs.tabText(page._page_index_by_id["system"]) == "数据与维护"
     assert page.focus_setting("software_update")
+    assert page.tabs.currentIndex() == page._page_index_by_id["system"]
     window.update_controller.release = ReleaseInfo.from_signed(*signed.encode())
     window.update_controller.state = UpdateState.READY
     window.install_update()
@@ -261,19 +262,22 @@ def test_update_installer_start_failure_is_reported_without_exit(app, tmp_path, 
     window.deleteLater()
 
 
-def test_unsaved_settings_require_successful_explicit_save(app, tmp_path, monkeypatch):
-    from core.video_organizer_service import VideoOrganizerService
+def test_update_requires_successful_autosave_flush(app, tmp_path, monkeypatch):
+    from core.video_organizer_service import SettingsManager, VideoOrganizerService
     from gui.views.settings import SettingsView
     service = VideoOrganizerService(db_path=str(tmp_path / "db.sqlite"), results_json=str(tmp_path / "results.json"))
     view = SettingsView(service)
-    view._manual_dirty = True
-    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Cancel)
+    expected = view.font_spin.value() + 1
+    view.font_spin.setValue(expected)
+    original_writer = SettingsManager.save_settings
+    monkeypatch.setattr(SettingsManager, "save_settings", lambda *args: False)
     assert not view.save_before_update()
-    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Save)
-    monkeypatch.setattr(view, "apply_settings", lambda **kwargs: False)
-    assert not view.save_before_update()
-    monkeypatch.setattr(view, "apply_settings", lambda **kwargs: True)
+    assert view.prefs_controller._dirty
+    assert view.font_spin.value() == expected
+    monkeypatch.setattr(SettingsManager, "save_settings", original_writer)
     assert view.save_before_update()
+    assert not view.prefs_controller._dirty
+    assert SettingsManager.load_settings(service.db)["ui_preferences"]["font_size"] == expected
     view.deleteLater()
     app.processEvents()
 

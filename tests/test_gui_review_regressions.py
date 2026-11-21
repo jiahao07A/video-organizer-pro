@@ -278,11 +278,10 @@ def test_settings_effective_config_summary_hides_credentials(service, views):
     views.append(view)
 
     text = view.effective_config_label.text()
-    assert "当前供应商" in text
-    assert "视频分类" in text
-    assert "标准词 AI 助手" in text
-    assert "自动 XMP 侧车：" in text
-    assert "自动 XMP 侧车：关闭" in text
+    assert "默认回退连接" in text
+    assert "实际使用" in view._route_widgets["video_classification"]["effective"].text()
+    assert "实际使用" in view._route_widgets["standard_tag_ai"]["effective"].text()
+    assert not view.auto_xmp_cb.isChecked()
     assert "secret-test-key" not in text
 
 
@@ -390,8 +389,8 @@ def test_autosave_timer_emits_success_and_clears_pending_status(service, qt_app,
     view.prefs_controller.saved.connect(saved.append)
     view.font_spin.setValue(19)
     _wait_for(qt_app, lambda: not view.prefs_controller._timer.isActive())
-    assert saved == ["界面偏好已保存"]
-    assert view.save_status_label.text() == "界面偏好已保存"
+    assert saved == ["设置已自动保存"]
+    assert view.save_status_label.text() == "设置已自动保存"
 
 
 def test_switching_to_settings_does_not_force_window_beyond_current_height(service, qt_app, views):
@@ -438,11 +437,11 @@ def test_remember_scope_autosave_snapshots_current_paths(service, tmp_path, view
     assert service.settings["ui_preferences"]["last_work_scope"] == [folder]
 
 
-def test_sensitive_controls_do_not_start_autosave(service, views):
+def test_sensitive_controls_start_unified_autosave(service, views):
     view = SettingsView(service)
     views.append(view)
     view.api_key_input.setText("test-unsaved-key")
-    assert not view.prefs_controller._timer.isActive()
+    assert view.prefs_controller._timer.isActive()
 
 
 def test_empty_scope_invalidates_inflight_page(service, tmp_path, views, monkeypatch):
@@ -497,7 +496,7 @@ def test_autosave_failure_can_retry_without_losing_pending_changes(service, view
     assert not saved
     monkeypatch.setattr(SettingsManager, "save_settings", original)
     assert view.prefs_controller.flush()
-    assert saved == ["界面偏好已保存"]
+    assert saved == ["设置已自动保存"]
 
 
 def test_large_exclusion_set_is_one_sql_parameter(service, tmp_path):

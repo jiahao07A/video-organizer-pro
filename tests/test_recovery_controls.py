@@ -313,10 +313,11 @@ def test_main_settings_save_recovery_together_and_reload(app, service, monkeypat
     panel.task_editor.inherit["fallbacks"].setChecked(False)
     panel.task_editor.inherit["primary_extra_attempts"].setChecked(False)
     panel.task_editor.fields["primary_extra_attempts"].setValue(0)
-    assert service.settings["processing"]["http400_recovery"] == before
+    assert service.settings["processing"]["http400_recovery"]["global"]["enabled"] is False
+    assert view.prefs_controller._dirty
     assert view._manual_dirty
     assert view.focus_setting("http400_recovery")
-    assert view.tabs.currentIndex() == 0
+    assert view.tabs.currentIndex() == 5
     assert view.apply_settings(silent=True)
     saved = SettingsManager.load_settings(service.db)["processing"]["http400_recovery"]
     assert saved["global"]["enabled"] is False
@@ -343,7 +344,7 @@ def test_main_settings_invalid_recovery_does_not_save(app, service, monkeypatch)
     view.close()
 
 
-def test_main_settings_failed_save_restores_previous_recovery(app, service, monkeypatch):
+def test_main_settings_failed_save_keeps_edited_recovery(app, service, monkeypatch):
     view = SettingsView(service)
     before = copy.deepcopy(service.settings["processing"]["http400_recovery"])
     view.http400_settings.global_editor.fields["request_budget"].setValue(4)
@@ -352,7 +353,9 @@ def test_main_settings_failed_save_restores_previous_recovery(app, service, monk
     monkeypatch.setattr(SettingsManager, "save_settings", fail)
     monkeypatch.setattr(QMessageBox, "critical", lambda *a: QMessageBox.Ok)
     assert view.apply_settings(silent=True) is False
-    assert service.settings["processing"]["http400_recovery"] == before
+    assert service.settings["processing"]["http400_recovery"]["global"]["request_budget"] == 4
+    assert view.http400_settings.global_editor.fields["request_budget"].value() == 4
+    assert view.prefs_controller._dirty
     view.prefs_controller.cancel()
     view.close()
 

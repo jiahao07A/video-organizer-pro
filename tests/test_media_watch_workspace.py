@@ -563,7 +563,7 @@ def test_changed_exclusion_applies_before_pending_file_registration(service, tmp
     config = normalize_watch_config({'stability_seconds': 0, 'auto_analyze': False,
         'directories': [{'path': str(tmp_path)}]})
     monitor = MediaDirectoryMonitor(service, config)
-    monkeypatch.setattr(monitor, 'start', lambda: False)
+    monkeypatch.setattr(monitor, 'start', lambda **_kwargs: False)
     try:
         monitor.notify_path(str(path))
         assert monitor._pending
